@@ -1,0 +1,19 @@
+# Binaries
+/acp-hub
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
