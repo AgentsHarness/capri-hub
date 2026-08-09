@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/benin/acp-hub/internal/hub"
 )
 
 func TestTokenEqual(t *testing.T) {
@@ -146,5 +149,66 @@ func TestBearerToken(t *testing.T) {
 	}
 	if got := bearerToken(""); got != "" {
 		t.Errorf("empty should be empty, got %q", got)
+	}
+}
+
+// TestHandleHostFramePreservesHostSeq: events frames carry host-assigned
+// seqs (seqStart = first event's seq); they must be preserved so the
+// per-host counter tracks the host's sequence exactly. Renumbering would
+// shift every event and trigger spurious FE gap-pulls / replays.
+func TestHandleHostFramePreservesHostSeq(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"events","seqStart":100,"events":[{"type":"chunk","text":"a","seq":100},{"type":"chunk","text":"b","seq":101}]}`),
+		func([]byte) error { return nil })
+
+	if got := h.LastSeq("h1"); got != 101 {
+		t.Errorf("LastSeq = %d, want 101 (host seq preserved)", got)
+	}
+	var seen []float64
+	for len(seen) < 2 {
+		select {
+		case ev := <-ch:
+			if s, ok := ev["seq"].(float64); ok {
+				seen = append(seen, s)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("only got %v", seen)
+		}
+	}
+	if seen[0] != 100 || seen[1] != 101 {
+		t.Errorf("broadcast seqs = %v, want [100 101]", seen)
+	}
+}
+
+// TestHandleHostFrameSeqLessAdvancesCounter: a seq-less events frame must
+// ADVANCE the per-host counter (RegisterEvent fallback), not reset it to
+// 1 — a reset would make the next reconnect replay the whole backlog.
+func TestHandleHostFrameSeqLessAdvancesCounter(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	// A seq-carrying frame sets the counter to 42.
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"events","seqStart":42,"events":[{"type":"chunk","text":"a","seq":42}]}`),
+		func([]byte) error { return nil })
+	if got := h.LastSeq("h1"); got != 42 {
+		t.Fatalf("LastSeq after seq frame = %d, want 42", got)
+	}
+	// A seq-less frame must advance to 43 — not reset to 1.
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"events","events":[{"type":"host_status","ready":true}]}`),
+		func([]byte) error { return nil })
+	if got := h.LastSeq("h1"); got != 43 {
+		t.Errorf("LastSeq after seq-less frame = %d, want 43", got)
 	}
 }

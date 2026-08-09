@@ -3,11 +3,15 @@
 中心化中转服务器（relay）：多 Host 配对、注册与发现、事件聚合、请求中转。
 
 ```
-Browser (acp-fe) ──HTTP/SSE──▶ acp-hub (:8787) ──SSE+HTTP──▶ acp-host × N ──stdio──▶ grok
+Browser (acp-fe) ──WS /ws/fe + HTTP /api/*──▶ acp-hub (:8787) ──QUIC(udp:8788) / WS /ws/host──▶ acp-host × N ──stdio──▶ grok
 ```
 
-Host 主动**出站**连接 Hub（适配 NAT，无需 Hub 能访问 Host）；Hub 不做
-fs/terminal 执行，只做转发。
+Host 主动**出站**连接 Hub（适配 NAT，无需 Hub 能访问 Host）；优先 QUIC（UDP 8788，
+抗丢包、连接迁移），失败自动回退 WebSocket。Hub 不做 fs/terminal 执行，只做转发。
+业务 API 仍走 HTTP 中转。
+
+**可靠性**：host 给每个事件分配单调 `seq`；hub 缓冲每 host 最近 4000 条事件，
+浏览器可经 `GET /api/events?host=X&after=SEQ` 补拉缺口，断线/丢帧最终收敛。
 
 ## 运行
 
@@ -35,6 +39,7 @@ Host 无需重新配对。
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `PORT` | `8787` | HTTP 端口 |
+| `QUIC_PORT` | `8788` | Host 传输 QUIC UDP 端口（UDP 需在云安全组放行；不放行时 host 自动回退 WS） |
 | `FE_TOKEN` | — | **前端访问 token**（也认 `ACCESS_TOKEN`）。设置后，浏览器侧接口必须携带该 token，否则 `401`。未设置时浏览器路由开放（仅适合本机开发） |
 
 生产部署示例：
@@ -49,12 +54,12 @@ FE_TOKEN=your-long-random-secret ./acp-hub
 
 - `Authorization: Bearer <FE_TOKEN>`（推荐，所有 `fetch`）
 - 或 `X-Access-Token: <FE_TOKEN>`
-- 或 `?token=<FE_TOKEN>`（`EventSource` 无法设 header，SSE 用 query）
+- 或 `?token=<FE_TOKEN>`（浏览器 WebSocket 无法设 header，`/ws/fe` 用 query）
 
 **不**校验 FE_TOKEN 的路径（Host 仍用自己的配对 Bearer）：
 
 - `GET /health`、`GET /api/info`
-- `POST /api/pair`、`GET /api/hub/stream`、`POST /api/hub/events`、`POST /api/hub/respond`
+- `POST /api/pair`、`GET /ws/host`
 
 ## 配对流程
 
@@ -72,7 +77,8 @@ FE_TOKEN=your-long-random-secret ./acp-hub
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/events` | 聚合 SSE：所有 Host 事件带 `hostId`/`hostName` 标签；hub 级事件（`hello`、`hosts_changed`）不带 hostId |
+| GET | `/ws/fe` | 聚合 live WebSocket：帧 `{v:1,type:"hello"|"events"|"ping",…}`；事件带 `hostId`/`hostName`/`seq`；`?c=1` 时 events 帧为 flate 压缩二进制；hub 级事件（`hello`、`hosts_changed`）不带 hostId |
+| GET | `/api/events` | 缺口补拉：`?host=X&after=SEQ` → 该 host 缓冲中 seq>after 的事件（升序） |
 | GET | `/api/hosts` | 注册表：`{ hosts: [...], defaultHostId }` |
 | GET | `/api/status` | 中转到默认 Host |
 | GET/POST | `/api/*`（其余） | 中转：`?host=<hostId>` 选择目标 Host，缺省用默认 Host（最近在线的） |
@@ -82,9 +88,8 @@ FE_TOKEN=your-long-random-secret ./acp-hub
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/pair` | 配对码换 token（Bearer 鉴权） |
-| GET | `/api/hub/stream?host=<id>` | Host 出站 SSE 长连接；Hub 推送 `hello`（含 `subscribers`）、`{type:"subscribers",count}`（浏览器订阅数变化）、`{type:"request", reqId, method, path, body}` |
-| POST | `/api/hub/events` | Host 批量上报事件（兼作心跳）；`host_status` 事件更新注册表 ready 状态 |
-| POST | `/api/hub/respond` | 中转请求应答 `{reqId, status, body}` |
+| GET | `/ws/host` | Host 出站 WebSocket 回退通道（`Authorization: Bearer <token>`） |
+| UDP | `:8788` | Host 主通道 QUIC：单双向流 + 4 字节长度前缀 JSON 帧；首帧 `{type:"auth",token}` 鉴权，之后同 WS 帧协议 |
 
 ### 其他
 
@@ -95,15 +100,16 @@ FE_TOKEN=your-long-random-secret ./acp-hub
 
 ## 行为细节
 
-- Host 在线状态 = stream 连接状态：断连立即离线并广播 `hosts_changed`，
+- Host 在线状态 = `/ws/host` 连接状态：断连立即离线并广播 `hosts_changed`，
   中转中的请求立即失败（503）——不会挂死浏览器。
 - 中转请求等待上限 45 分钟（对齐 Host 侧 30 分钟 prompt 超时）。
-- 事件扇出为尽力而为（慢消费者丢弃），浏览器通过 `/api/status` 与
+- 事件扇出为尽力而为（慢消费者丢弃，订阅 buffer 512），浏览器通过 `/api/status` 与
   `/api/session-updates` 重新水合，与 acp-host 本地模式一致。
-- **空闲省流量**：Hub 跟踪浏览器 `/events` 订阅数，经 Host stream 推送
-  `{type:"subscribers",count:N}`（stream 的 `hello` 也带 `subscribers`）。
+- **空闲省流量**：Hub 跟踪浏览器 `/ws/fe` 订阅数，经 Host WS 推送
+  `{v:1,type:"subscribers",count:N}`（`hello` 也带 `subscribers`）。
   Host 在 `count==0` 时暂停 bridge 事件上报，仅保留约 15s 一次的
   `host_status` 心跳；有浏览器连上后再恢复。错过的事件靠前端水合补齐。
+- Host 侧对 live 事件做异步发送队列 + chunk/thought 合并 + `seq` 编号 + 断线重放（最近 5000 条）后上行，降低丢包与帧数；重连后按 `hello.seq` 补发缺口。
 
 ## 本地单机开发
 

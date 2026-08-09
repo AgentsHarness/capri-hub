@@ -2,13 +2,13 @@
 // code → token), the host registry, event fan-out to browsers, and the
 // browser ↔ host request relay.
 //
-// Transport model (HTTP + SSE, no WebSocket dependency):
+// Transport model (WebSocket + HTTP API):
 //
-//	Browser (acp-fe) ──HTTP/SSE──▶ acp-hub ──SSE+HTTP──▶ acp-host × N ──stdio──▶ grok
+//	Browser (acp-fe) ──WS /ws/fe + HTTP /api/*──▶ acp-hub ──WS /ws/host──▶ acp-host × N ──stdio──▶ grok
 //
-// Hosts connect OUTBOUND to the hub (NAT-friendly): a long-lived SSE
-// stream carries relayed browser requests to the host; the host pushes
-// its events and request answers back via plain POSTs.
+// Hosts connect OUTBOUND to the hub (NAT-friendly): one WebSocket carries
+// relayed browser requests down and host events / responds up. Browsers
+// open /ws/fe for the aggregated live event stream; REST APIs stay on HTTP.
 package hub
 
 import (
@@ -33,6 +33,8 @@ const (
 	// RelayTimeout caps how long the hub waits for a host to answer a
 	// relayed request (mirrors the host's 30-minute prompt timeout).
 	RelayTimeout = 45 * time.Minute
+	// eventBufCap bounds per-host buffered events for gap-pull.
+	eventBufCap = 4000
 )
 
 var (
@@ -66,8 +68,9 @@ type HostInfo struct {
 	Local    bool      `json:"local,omitempty"`
 }
 
-// RelayRequest is pushed to a host over its SSE stream.
+// RelayRequest is pushed to a host over its WebSocket.
 type RelayRequest struct {
+	V      int             `json:"v"`
 	Type   string          `json:"type"` // always "request"
 	ReqID  string          `json:"reqId"`
 	Method string          `json:"method"`
@@ -75,14 +78,14 @@ type RelayRequest struct {
 	Body   json.RawMessage `json:"body,omitempty"`
 }
 
-// RelayResponse is the host's answer (POST /api/hub/respond).
+// RelayResponse is the host's answer (WS type:"respond").
 type RelayResponse struct {
 	Status int             `json:"status"`
 	Body   json.RawMessage `json:"body,omitempty"`
 }
 
-// streamConn is one host's live SSE connection (hub → host). The hub
-// writes relayed request frames to it; `done` closes on disconnect.
+// streamConn is one host's live WebSocket (hub ↔ host). The hub
+// writes relayed request / subscribers frames to it; `done` closes on disconnect.
 type streamConn struct {
 	id    int64
 	write func(payload []byte) error
@@ -98,6 +101,13 @@ type hostState struct {
 	info  HostInfo
 	token string
 	conn  *streamConn
+
+	// seq is the last event sequence number seen from this host
+	// (host-assigned, monotonic per host process). evBuf is a bounded
+	// ring of recent events (with seq injected) so browsers can pull
+	// gaps: GET /api/events?host=X&after=SEQ.
+	seq   uint64
+	evBuf []Event
 }
 
 // Hub is the relay core. All methods are safe for concurrent use.
@@ -277,8 +287,8 @@ func (h *Hub) HostIDForToken(token string) (string, bool) {
 
 // ── host connections ──────────────────────────────────────────────────
 
-// ConnectStream registers the host's outbound SSE connection; the returned
-// stop func must be called when the stream ends (it fails all pending
+// ConnectStream registers the host's outbound WebSocket; the returned
+// stop func must be called when the connection ends (it fails all pending
 // relayed requests for that host).
 func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*streamConn, func(), error) {
 	h.mu.Lock()
@@ -316,8 +326,10 @@ func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
 }
 
 // RegisterEvent accepts a host event: tags it with the host's id/name,
-// updates liveness (and ready for host_status events), then fans it out
-// to browser subscribers. Returns false for unknown hosts.
+// assigns a sequence number (host-provided when present, else hub-side),
+// buffers it for gap-pull, updates liveness (and ready for host_status
+// events), then fans it out to browser subscribers. Returns false for
+// unknown hosts.
 func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -326,6 +338,18 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 		return false
 	}
 	hs.info.LastSeen = time.Now()
+	// Host-provided seq (events frames carry seqStart); fall back to
+	// hub-side assignment for direct RegisterEvent callers (tests).
+	if s, ok := ev["seq"].(float64); ok && s > 0 {
+		hs.seq = uint64(s)
+	} else {
+		hs.seq++
+		ev["seq"] = hs.seq
+	}
+	hs.evBuf = append(hs.evBuf, ev)
+	if len(hs.evBuf) > eventBufCap {
+		hs.evBuf = hs.evBuf[len(hs.evBuf)-eventBufCap:]
+	}
 	if t, _ := ev["type"].(string); t == "host_status" {
 		if r, ok := ev["ready"].(bool); ok && r != hs.info.Ready {
 			hs.info.Ready = r
@@ -336,6 +360,47 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 	ev["hostName"] = hs.info.HostName
 	h.broadcastLocked(ev)
 	return true
+}
+
+// LastSeq returns the last event sequence number seen from hostID
+// (0 when unknown / nothing seen yet).
+func (h *Hub) LastSeq(hostID string) uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if hs := h.hosts[hostID]; hs != nil {
+		return hs.seq
+	}
+	return 0
+}
+
+// SeqByHost returns the last event seq for every known host (for the FE
+// hello frame so browsers can detect what they missed while offline).
+func (h *Hub) SeqByHost() map[string]uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]uint64, len(h.hosts))
+	for id, hs := range h.hosts {
+		out[id] = hs.seq
+	}
+	return out
+}
+
+// EventsAfter returns buffered events for hostID whose seq > after, in
+// ascending order. The returned slice shares storage with the hub buffer;
+// callers must not mutate the events.
+func (h *Hub) EventsAfter(hostID string, after uint64) []Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if hs := h.hosts[hostID]; hs != nil {
+		out := make([]Event, 0, 8)
+		for _, ev := range hs.evBuf {
+			if s, _ := ev["seq"].(float64); uint64(s) > after {
+				out = append(out, ev)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // ── request relay ─────────────────────────────────────────────────────
@@ -363,7 +428,7 @@ func (h *Hub) Dispatch(hostID, method, path string, body json.RawMessage) (Relay
 	h.pending[hostID][reqID] = pr
 	h.mu.Unlock()
 
-	payload, err := json.Marshal(RelayRequest{Type: "request", ReqID: reqID, Method: method, Path: path, Body: body})
+	payload, err := json.Marshal(RelayRequest{V: 1, Type: "request", ReqID: reqID, Method: method, Path: path, Body: body})
 	if err != nil {
 		h.dropPending(hostID, reqID)
 		return RelayResponse{}, &RelayError{Status: 500, Message: err.Error()}
@@ -474,7 +539,9 @@ func (h *Hub) DefaultHostID() string {
 // count so they can pause event upload when nobody is listening (heartbeat
 // host_status still runs on the host side).
 func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
-	ch = make(chan Event, 64)
+	// Larger than the old SSE path: WS fan-out still drops on a full buffer,
+	// but 512 absorbs short FE write stalls without losing a turn of chunks.
+	ch = make(chan Event, 512)
 	h.mu.Lock()
 	h.subscribers[ch] = struct{}{}
 	h.mu.Unlock()
@@ -495,15 +562,15 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 	}
 }
 
-// SubscriberCount is the number of live browser /events SSE clients.
+// SubscriberCount is the number of live browser /ws/fe clients.
 func (h *Hub) SubscriberCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.subscribers)
 }
 
-// notifyHostsSubscribers pushes {type:"subscribers", count:N} to every
-// online host stream. Hosts use count==0 to stop uploading bridge events
+// notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N} to every
+// online host WebSocket. Hosts use count==0 to stop uploading bridge events
 // (they still send host_status heartbeats). Writes run outside h.mu so a
 // slow host cannot stall the hub lock.
 func (h *Hub) notifyHostsSubscribers() {
@@ -519,7 +586,7 @@ func (h *Hub) notifyHostsSubscribers() {
 	if len(writes) == 0 {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{"type": "subscribers", "count": count})
+	payload, err := json.Marshal(map[string]any{"v": 1, "type": "subscribers", "count": count})
 	if err != nil {
 		return
 	}
