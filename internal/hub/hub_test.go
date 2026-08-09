@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -323,5 +324,78 @@ func TestHostsChangedBroadcast(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no hosts_changed on disconnect")
+	}
+}
+
+func TestNotifyHostsSubscribers(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	var (
+		mu     sync.Mutex
+		frames []map[string]any
+	)
+	_, stop, err := h.ConnectStream("h1", func(payload []byte) error {
+		var m map[string]any
+		if json.Unmarshal(payload, &m) != nil {
+			return nil
+		}
+		mu.Lock()
+		frames = append(frames, m)
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer stop()
+
+	if h.SubscriberCount() != 0 {
+		t.Fatalf("initial subscribers = %d, want 0", h.SubscriberCount())
+	}
+
+	_, unsub := h.Subscribe()
+	// Subscribe notifies hosts with count=1.
+	deadline := time.After(time.Second)
+	for {
+		mu.Lock()
+		n := len(frames)
+		last := map[string]any{}
+		if n > 0 {
+			last = frames[n-1]
+		}
+		mu.Unlock()
+		if last["type"] == "subscribers" && last["count"] == float64(1) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("no subscribers:1 frame, got %v", frames)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	unsub()
+	deadline = time.After(time.Second)
+	for {
+		mu.Lock()
+		var got0 bool
+		for _, f := range frames {
+			if f["type"] == "subscribers" && f["count"] == float64(0) {
+				got0 = true
+			}
+		}
+		mu.Unlock()
+		if got0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("no subscribers:0 frame after unsub, got %v", frames)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if h.SubscriberCount() != 0 {
+		t.Errorf("after unsub count = %d, want 0", h.SubscriberCount())
 	}
 }

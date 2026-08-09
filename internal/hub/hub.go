@@ -469,11 +469,16 @@ func (h *Hub) DefaultHostID() string {
 
 // Subscribe returns a buffered channel of relayed events; call the
 // returned func to unsubscribe.
+//
+// Subscribe/unsubscribe notify connected hosts of the browser subscriber
+// count so they can pause event upload when nobody is listening (heartbeat
+// host_status still runs on the host side).
 func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 	ch = make(chan Event, 64)
 	h.mu.Lock()
 	h.subscribers[ch] = struct{}{}
 	h.mu.Unlock()
+	h.notifyHostsSubscribers()
 	return ch, func() {
 		h.mu.Lock()
 		delete(h.subscribers, ch)
@@ -482,9 +487,44 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 			select {
 			case <-ch:
 			default:
-				return
+				goto drained
 			}
 		}
+	drained:
+		h.notifyHostsSubscribers()
+	}
+}
+
+// SubscriberCount is the number of live browser /events SSE clients.
+func (h *Hub) SubscriberCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subscribers)
+}
+
+// notifyHostsSubscribers pushes {type:"subscribers", count:N} to every
+// online host stream. Hosts use count==0 to stop uploading bridge events
+// (they still send host_status heartbeats). Writes run outside h.mu so a
+// slow host cannot stall the hub lock.
+func (h *Hub) notifyHostsSubscribers() {
+	h.mu.Lock()
+	count := len(h.subscribers)
+	writes := make([]func([]byte) error, 0, len(h.hosts))
+	for _, hs := range h.hosts {
+		if hs.conn != nil {
+			writes = append(writes, hs.conn.write)
+		}
+	}
+	h.mu.Unlock()
+	if len(writes) == 0 {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{"type": "subscribers", "count": count})
+	if err != nil {
+		return
+	}
+	for _, write := range writes {
+		_ = write(payload)
 	}
 }
 

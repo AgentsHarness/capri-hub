@@ -6,6 +6,7 @@
 //	  - Host 出站连接：SSE 长连接（GET /api/hub/stream）接收中转请求，
 //	    事件批量上报（POST /api/hub/events），请求应答（POST /api/hub/respond）。
 //	  - 浏览器：/events 聚合事件流（事件带 hostId），/api/* 按 ?host= 中转给对应 Host。
+//	  - 可选 FE_TOKEN：部署时设置后，浏览器侧接口必须带同一 token（Bearer / 头 / ?token=）。
 package main
 
 import (
@@ -35,25 +36,41 @@ func main() {
 		}
 	}
 
+	// Browser / FE access token. When set, browser-facing routes require it
+	// (Authorization: Bearer, X-Access-Token, or ?token= for EventSource).
+	// Host-facing routes keep their own pairing Bearer tokens.
+	feToken := strings.TrimSpace(os.Getenv("FE_TOKEN"))
+	if feToken == "" {
+		feToken = strings.TrimSpace(os.Getenv("ACCESS_TOKEN"))
+	}
+
 	h := hub.New()
 	code, exp := h.PairingCode()
 	log.Printf("[acp-hub] pairing code: %s (expires %s)", code, exp.Format("15:04:05"))
+	if feToken != "" {
+		log.Printf("[acp-hub] FE_TOKEN set — browser requests require Authorization: Bearer <token>")
+	} else {
+		log.Printf("[acp-hub] FE_TOKEN unset — browser routes are open (local/dev only)")
+	}
 	log.Printf("[acp-hub] listening on http://localhost:%d", port)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /api/info", handleInfo)
-	mux.HandleFunc("GET /api/pairing", handlePairing(h))
-	mux.HandleFunc("POST /api/pairing/rotate", handleRotate(h))
+	// Admin pairing endpoints: require FE token when configured.
+	mux.HandleFunc("GET /api/pairing", requireFEToken(feToken, handlePairing(h)))
+	mux.HandleFunc("POST /api/pairing/rotate", requireFEToken(feToken, handleRotate(h)))
+	// Host-facing: authenticate with host pairing token (not FE_TOKEN).
 	mux.HandleFunc("POST /api/pair", handlePair(h))
-	mux.HandleFunc("GET /api/hosts", handleHosts(h))
-	mux.HandleFunc("GET /events", handleBrowserSSE(h))
 	mux.HandleFunc("GET /api/hub/stream", handleHostStream(h))
 	mux.HandleFunc("POST /api/hub/events", handleHostEvents(h))
 	mux.HandleFunc("POST /api/hub/respond", handleHostRespond(h))
+	// Browser-facing: FE token gate when FE_TOKEN is set.
+	mux.HandleFunc("GET /api/hosts", requireFEToken(feToken, handleHosts(h)))
+	mux.HandleFunc("GET /events", requireFEToken(feToken, handleBrowserSSE(h)))
 	// Catch-all: relay everything else under /api/* to the selected host.
-	mux.HandleFunc("GET /api/{path...}", handleRelay(h))
-	mux.HandleFunc("POST /api/{path...}", handleRelay(h))
+	mux.HandleFunc("GET /api/{path...}", requireFEToken(feToken, handleRelay(h)))
+	mux.HandleFunc("POST /api/{path...}", requireFEToken(feToken, handleRelay(h)))
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
@@ -218,7 +235,14 @@ func handleHostStream(h *hub.Hub) http.HandlerFunc {
 		}
 		defer stop()
 		_ = conn
-		if err := write([]byte(`{"type":"hello","service":"hub"}`)); err != nil {
+		// Include current browser subscriber count so the host can pause
+		// event upload when nobody is listening (see subscribers frames).
+		hello, _ := json.Marshal(map[string]any{
+			"type":        "hello",
+			"service":     "hub",
+			"subscribers": h.SubscriberCount(),
+		})
+		if err := write(hello); err != nil {
 			return
 		}
 		<-r.Context().Done()
@@ -322,9 +346,63 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 
 // ── helpers ───────────────────────────────────────────────────────────
 
+// requireFEToken wraps a browser-facing handler. When expected is empty,
+// auth is disabled (local/dev). Otherwise the request must carry the
+// same token via Authorization: Bearer, X-Access-Token, or ?token=
+// (the last for EventSource, which cannot set headers).
+func requireFEToken(expected string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !checkFEToken(r, expected) {
+			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// checkFEToken reports whether r is allowed for browser routes.
+// Empty expected disables the gate.
+func checkFEToken(r *http.Request, expected string) bool {
+	if expected == "" {
+		return true
+	}
+	if tok := bearerToken(r.Header.Get("Authorization")); tokenEqual(tok, expected) {
+		return true
+	}
+	if tok := strings.TrimSpace(r.Header.Get("X-Access-Token")); tokenEqual(tok, expected) {
+		return true
+	}
+	// EventSource cannot send custom headers; allow query param.
+	if tok := strings.TrimSpace(r.URL.Query().Get("token")); tokenEqual(tok, expected) {
+		return true
+	}
+	return false
+}
+
+func bearerToken(auth string) string {
+	auth = strings.TrimSpace(auth)
+	const prefix = "Bearer "
+	if len(auth) >= len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+		return strings.TrimSpace(auth[len(prefix):])
+	}
+	return ""
+}
+
+func tokenEqual(a, b string) bool {
+	if a == "" || b == "" || len(a) != len(b) {
+		return false
+	}
+	// Constant-time compare to avoid timing leaks on the shared secret.
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}
+
 // authHost resolves the Bearer token to a hostId.
 func authHost(h *hub.Hub, r *http.Request) (string, bool) {
-	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
+	tok := bearerToken(r.Header.Get("Authorization"))
 	return h.HostIDForToken(tok)
 }
 
@@ -359,7 +437,7 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Access-Token")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
