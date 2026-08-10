@@ -5,7 +5,8 @@
 //	  - 配对：Host 用配对码换取 token（POST /api/pair），token 持久化在 ~/.acp-hub。
 //	  - Host 出站连接（GET /ws/host 或 QUIC UDP）：下行 request/subscribers，上行 events/respond。
 //	  - 浏览器 WebSocket（GET /ws/fe）：聚合 live 事件；/api/* 按 ?host= 中转给对应 Host。
-//	  - 可选 FE_TOKEN：部署时设置后，浏览器侧接口必须带同一 token（Bearer / 头 / ?token=）。
+//	  - 可选 FE_TOKEN：部署时设置后，浏览器侧接口必须带同一 token（Bearer / 头）。
+//	    WebSocket 优先用短期 ?ticket=（POST /api/ws-ticket）；仍兼容 ?token=。
 //	  - 可靠性：事件带 seq（host 分配），hub 缓冲每 host 最近 4000 条，
 //	    GET /api/events?host=X&after=SEQ 供缺口补拉。
 package main
@@ -21,6 +22,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,43 +59,43 @@ func main() {
 	}
 
 	// Browser / FE access token. When set, browser-facing routes require it
-	// (Authorization: Bearer, X-Access-Token, or ?token= for WebSocket).
+	// (Authorization: Bearer, X-Access-Token; WS prefers short-lived ticket).
 	// Host-facing routes keep their own pairing Bearer tokens.
 	feToken := strings.TrimSpace(os.Getenv("FE_TOKEN"))
 	if feToken == "" {
 		feToken = strings.TrimSpace(os.Getenv("ACCESS_TOKEN"))
 	}
+	if feToken == "" && envTruthy("REQUIRE_FE_TOKEN") {
+		log.Fatal("[acp-hub] FE_TOKEN is required (REQUIRE_FE_TOKEN=1). Set FE_TOKEN or unset REQUIRE_FE_TOKEN for local dev.")
+	}
+
+	corsOrigins := parseCORSOrigins(os.Getenv("CORS_ORIGINS"))
 
 	h := hub.New()
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	h.StartPairingCodeMaintainer(runCtx)
+
 	code, exp := h.PairingCode()
 	log.Printf("[acp-hub] pairing code: %s (expires %s)", code, exp.Format("15:04:05"))
 	if feToken != "" {
-		log.Printf("[acp-hub] FE_TOKEN set — browser requests require Authorization: Bearer <token>")
+		log.Printf("[acp-hub] FE_TOKEN set — browser requests require Authorization: Bearer <token> (WS: prefer POST /api/ws-ticket + ?ticket=)")
 	} else {
-		log.Printf("[acp-hub] FE_TOKEN unset — browser routes are open (local/dev only)")
+		log.Printf("[acp-hub] FE_TOKEN unset — browser routes are open (local/dev only; set REQUIRE_FE_TOKEN=1 in production)")
+	}
+	if len(corsOrigins) > 0 {
+		log.Printf("[acp-hub] CORS origins: %s", strings.Join(corsOrigins, ", "))
 	}
 	log.Printf("[acp-hub] listening on http://localhost:%d", port)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", handleHealth)
-	mux.HandleFunc("GET /api/info", handleInfo)
-	// Admin pairing endpoints: require FE token when configured.
-	mux.HandleFunc("GET /api/pairing", requireFEToken(feToken, handlePairing(h)))
-	mux.HandleFunc("POST /api/pairing/rotate", requireFEToken(feToken, handleRotate(h)))
-	// Host-facing: authenticate with host pairing token (not FE_TOKEN).
-	mux.HandleFunc("POST /api/pair", handlePair(h, newPairLimiter()))
-	mux.HandleFunc("GET /ws/host", handleHostWS(h))
-	// Browser-facing: FE token gate when FE_TOKEN is set.
-	mux.HandleFunc("GET /api/hosts", requireFEToken(feToken, handleHosts(h)))
-	mux.HandleFunc("GET /api/events", requireFEToken(feToken, handleEvents(h)))
-	mux.HandleFunc("GET /ws/fe", handleFeWS(h, feToken))
-	// Catch-all: relay everything else under /api/* to the selected host.
-	mux.HandleFunc("GET /api/{path...}", requireFEToken(feToken, handleRelay(h)))
-	mux.HandleFunc("POST /api/{path...}", requireFEToken(feToken, handleRelay(h)))
+	tickets := newFETicketStore()
+	tickets.StartCleanup(runCtx)
+	lim := newPairLimiter()
+	lim.StartCleanup(runCtx)
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           withCORS(mux),
+		Handler:           buildHandler(h, feToken, tickets, lim, corsOrigins),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -103,20 +105,91 @@ func main() {
 		}
 	}()
 
-	// QUIC transport for hosts (UDP, loss-resilient, connection-migrating).
-	qtls, err := quicTLSConfig()
+	// QUIC: production (FE_TOKEN set) requires real certs unless
+	// QUIC_ALLOW_SELF_SIGNED=1. Dev without FE_TOKEN may self-sign.
+	var quicLn *quic.Listener
+	allowSelfSigned := feToken == "" || envTruthy("QUIC_ALLOW_SELF_SIGNED")
+	qtls, err := quicTLSConfig(allowSelfSigned)
 	if err != nil {
-		log.Printf("[acp-hub] QUIC TLS 初始化失败: %v（跳过 QUIC）", err)
+		log.Printf("[acp-hub] QUIC TLS 初始化失败: %v（跳过 QUIC；Host 可走 WS）", err)
 	} else {
-		go serveQUIC(quicPort, qtls, h)
+		ln, err := listenQUIC(quicPort, qtls)
+		if err != nil {
+			log.Printf("[acp-hub] QUIC listen :%d failed: %v（跳过 QUIC）", quicPort, err)
+		} else {
+			quicLn = ln
+			mode := "cert-files"
+			if allowSelfSigned && os.Getenv("QUIC_CERT") == "" {
+				mode = "self-signed (dev)"
+			}
+			log.Printf("[acp-hub] QUIC host transport on udp://:%d (%s)", quicPort, mode)
+			go serveQUIC(ln, h)
+		}
 	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	runCancel()
+	// Stop accepting new work before draining HTTP handlers.
+	if quicLn != nil {
+		_ = quicLn.Close()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+}
+
+// buildHandler wires all HTTP routes (shared by main and integration tests).
+func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairLimiter, corsOrigins []string) http.Handler {
+	if tickets == nil {
+		tickets = newFETicketStore()
+	}
+	if lim == nil {
+		lim = newPairLimiter()
+	}
+	auth := feAuth{token: feToken, tickets: tickets}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handleHealth)
+	mux.HandleFunc("GET /api/info", handleInfo)
+	// Admin pairing endpoints: require FE token when configured.
+	mux.HandleFunc("GET /api/pairing", auth.require(handlePairing(h)))
+	mux.HandleFunc("POST /api/pairing/rotate", auth.require(handleRotate(h)))
+	// Host-facing: authenticate with host pairing token (not FE_TOKEN).
+	mux.HandleFunc("POST /api/pair", handlePair(h, lim))
+	mux.HandleFunc("GET /ws/host", handleHostWS(h))
+	// Browser-facing: FE token gate when FE_TOKEN is set.
+	mux.HandleFunc("GET /api/hosts", auth.require(handleHosts(h)))
+	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.require(handleUnpair(h)))
+	mux.HandleFunc("GET /api/events", auth.require(handleEvents(h)))
+	mux.HandleFunc("POST /api/ws-ticket", auth.require(handleWSTicket(tickets)))
+	mux.HandleFunc("GET /ws/fe", handleFeWS(h, auth))
+	// Catch-all: relay everything else under /api/* to the selected host.
+	mux.HandleFunc("GET /api/{path...}", auth.require(handleRelay(h)))
+	mux.HandleFunc("POST /api/{path...}", auth.require(handleRelay(h)))
+	return withCORS(mux, corsOrigins)
+}
+
+func envTruthy(name string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func parseCORSOrigins(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "*" {
+		return nil // nil ⇒ allow all (*)
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // ── handlers ──────────────────────────────────────────────────────────
@@ -171,10 +244,12 @@ func handleRotate(h *hub.Hub) http.HandlerFunc {
 // attacker must be throttled per IP. Normal flows are unaffected: hosts
 // pair once at startup, and re-pair retries use exponential backoff
 // (1s→30s), well under 10 attempts/minute.
+//
+// Rate limiting alone is enough — we do not sleep on failed attempts
+// (that would pin handler goroutines under flood).
 const (
-	pairRateLimit  = 10                     // attempts per window per IP
-	pairRateWindow = time.Minute            // sliding window
-	pairFailDelay  = 300 * time.Millisecond // extra delay per failed attempt
+	pairRateLimit  = 10          // attempts per window per IP
+	pairRateWindow = time.Minute // sliding window
 )
 
 // pairLimiter is a per-IP sliding-window rate limiter for /api/pair.
@@ -187,20 +262,50 @@ func newPairLimiter() *pairLimiter {
 	return &pairLimiter{hits: make(map[string][]time.Time)}
 }
 
+// StartCleanup periodically drops expired IP entries until ctx is done.
+func (l *pairLimiter) StartCleanup(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				l.mu.Lock()
+				l.pruneLocked(time.Now().Add(-pairRateWindow))
+				l.mu.Unlock()
+			}
+		}
+	}()
+}
+
+func (l *pairLimiter) pruneLocked(cutoff time.Time) {
+	for k, v := range l.hits {
+		i := 0
+		for i < len(v) && v[i].Before(cutoff) {
+			i++
+		}
+		v = v[i:]
+		if len(v) == 0 {
+			delete(l.hits, k)
+		} else {
+			l.hits[k] = v
+		}
+	}
+}
+
 // allow records a request from ip and reports whether it stays within
-// the window's budget. Stale entries are pruned on access; the map is
-// swept once it exceeds 1024 IPs so it cannot grow without bound.
+// the window's budget. Stale entries are pruned on access.
 func (l *pairLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
 	cutoff := now.Add(-pairRateWindow)
-	if len(l.hits) > 1024 {
-		for k, v := range l.hits {
-			if len(v) == 0 || v[len(v)-1].Before(cutoff) {
-				delete(l.hits, k)
-			}
-		}
+	// Opportunistic full prune when the map is large (in addition to the
+	// background cleaner).
+	if len(l.hits) > 256 {
+		l.pruneLocked(cutoff)
 	}
 	hs := l.hits[ip]
 	i := 0
@@ -209,7 +314,11 @@ func (l *pairLimiter) allow(ip string) bool {
 	}
 	hs = hs[i:]
 	if len(hs) >= pairRateLimit {
-		l.hits[ip] = hs
+		if len(hs) == 0 {
+			delete(l.hits, ip)
+		} else {
+			l.hits[ip] = hs
+		}
 		return false
 	}
 	l.hits[ip] = append(hs, now)
@@ -241,20 +350,97 @@ func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 			HostName string `json:"hostName"`
 		}
 		if err := readJSON(r, &body); err != nil || body.Code == "" || body.HostID == "" {
-			time.Sleep(pairFailDelay)
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 code 和 hostId"})
 			return
 		}
 		token, err := h.Pair(body.Code, body.HostID, body.HostName)
 		if err != nil {
-			// Small per-failure delay: slows brute force down, while a
-			// human retyping the code (or the host's backoff retry)
-			// barely notices.
-			time.Sleep(pairFailDelay)
-			writeJSON(w, 401, map[string]any{"ok": false, "error": err.Error()})
+			status := 401
+			if errors.Is(err, hub.ErrHostLimit) {
+				status = 429
+			} else if !errors.Is(err, hub.ErrCodeInvalid) {
+				status = 400
+			}
+			writeJSON(w, status, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "token": token, "hostId": body.HostID})
+	}
+}
+
+// feTicketTTL is long enough for a browser to open WS after minting,
+// short enough that a leaked ticket in access logs ages out quickly.
+const feTicketTTL = 2 * time.Minute
+
+// feTicketStore issues single-use short-lived tickets for /ws/fe so the
+// long-lived FE_TOKEN need not appear in query strings / proxy logs.
+type feTicketStore struct {
+	mu      sync.Mutex
+	tickets map[string]time.Time // ticket → expiry
+}
+
+func newFETicketStore() *feTicketStore {
+	return &feTicketStore{tickets: make(map[string]time.Time)}
+}
+
+// StartCleanup drops expired tickets until ctx is done.
+func (s *feTicketStore) StartCleanup(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.mu.Lock()
+				now := time.Now()
+				for k, exp := range s.tickets {
+					if !exp.After(now) {
+						delete(s.tickets, k)
+					}
+				}
+				s.mu.Unlock()
+			}
+		}
+	}()
+}
+
+func (s *feTicketStore) issue() (ticket string, expires time.Time) {
+	var b [24]byte
+	_, _ = rand.Read(b[:])
+	ticket = hex.EncodeToString(b[:])
+	expires = time.Now().Add(feTicketTTL)
+	s.mu.Lock()
+	s.tickets[ticket] = expires
+	s.mu.Unlock()
+	return ticket, expires
+}
+
+// consume validates and burns a ticket (single-use).
+func (s *feTicketStore) consume(ticket string) bool {
+	if ticket == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	exp, ok := s.tickets[ticket]
+	if !ok {
+		return false
+	}
+	delete(s.tickets, ticket)
+	return exp.After(time.Now())
+}
+
+func handleWSTicket(tickets *feTicketStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ticket, exp := tickets.issue()
+		writeJSON(w, 200, map[string]any{
+			"ok":        true,
+			"ticket":    ticket,
+			"expiresAt": exp,
+			"ttlSec":    int(feTicketTTL / time.Second),
+		})
 	}
 }
 
@@ -267,15 +453,39 @@ func handleHosts(h *hub.Hub) http.HandlerFunc {
 	}
 }
 
+// handleUnpair: DELETE /api/hosts/{hostId} — admin remove a paired host.
+func handleUnpair(h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID := strings.TrimSpace(r.PathValue("hostId"))
+		if hostID == "" {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 hostId"})
+			return
+		}
+		if err := h.Unpair(hostID); err != nil {
+			if errors.Is(err, hub.ErrHostUnknown) {
+				writeJSON(w, 404, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "hostId": hostID})
+	}
+}
+
 // Keepalive + half-open detection for host transports (WS and QUIC):
 // the hub pings every 25s (the host replies "pong", and also sends
 // host_status heartbeats on its own), so a healthy connection always
 // produces uplink frames. If nothing arrives for hostReadTimeout — e.g.
 // a network blackhole that never sends RST — the connection is dropped
 // instead of leaving the host "online" with every relay stuck.
+// hostWriteTimeout caps downlink writes so a half-open peer cannot pin
+// writeMu / subscriber-notify goroutines forever (WS already used 30s;
+// QUIC now matches).
 const (
 	hostPingInterval = 25 * time.Second
 	hostReadTimeout  = 90 * time.Second
+	hostWriteTimeout = 30 * time.Second
 )
 
 // handleHostWS: host outbound WebSocket. Downlink: hello / subscribers / request.
@@ -317,7 +527,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 		write := func(payload []byte) error {
 			writeMu.Lock()
 			defer writeMu.Unlock()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), hostWriteTimeout)
 			defer cancel()
 			return conn.Write(ctx, websocket.MessageText, payload)
 		}
@@ -413,7 +623,7 @@ func writeHostHello(h *hub.Hub, hostID string, write func([]byte) error) error {
 }
 
 // handleHostFrame processes one uplink frame from a host (events/respond/
-// ping). Shared by the WebSocket and QUIC transports.
+// host_status/seq_reset/ping). Shared by the WebSocket and QUIC transports.
 func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) error) {
 	var frame struct {
 		Type     string          `json:"type"`
@@ -422,6 +632,7 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 		ReqID    string          `json:"reqId"`
 		Status   int             `json:"status"`
 		Body     json.RawMessage `json:"body"`
+		Ready    bool            `json:"ready"`
 	}
 	if err := json.Unmarshal(data, &frame); err != nil {
 		log.Printf("[acp-hub] host %s bad frame: %v", hostID, err)
@@ -440,6 +651,16 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 		for _, ev := range frame.Events {
 			h.RegisterEvent(hostID, ev)
 		}
+	case "host_status":
+		// Control-plane ready heartbeat: no seq, not an event. Updates
+		// Ready + LastSeen (and hosts_changed on flip) without advancing
+		// the per-host counter or the transcript buffer.
+		h.SetHostReady(hostID, frame.Ready)
+	case "seq_reset":
+		// Host process restarted: bridge seq recounts from 1. Clear the
+		// hub watermark so new low seqs are not treated as stale and
+		// dropped by RegisterEvent's s <= last skip.
+		h.ResetHostSeq(hostID)
 	case "respond":
 		if frame.ReqID == "" {
 			return
@@ -489,9 +710,11 @@ var (
 //   - hello carries `seqs` (last event seq per host) so a reconnecting FE
 //     knows what it missed and can gap-pull via GET /api/events.
 //   - events frames are flate-compressed binary when the client asks (?c=1).
-func handleFeWS(h *hub.Hub, feToken string) http.HandlerFunc {
+//   - auth: prefer short-lived ?ticket= (from POST /api/ws-ticket); still
+//     accepts Bearer / X-Access-Token / ?token= for the long-lived FE_TOKEN.
+func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !checkFEToken(r, feToken) {
+		if !auth.check(r) {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
 		}
@@ -722,19 +945,27 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 // ── QUIC host transport ──────────────────────────────────────────────
 
 // quicTLSConfig returns a TLS config for the QUIC listener: from
-// QUIC_CERT/QUIC_KEY files when set, else a generated self-signed cert.
-// Hosts connect with InsecureSkipVerify (documented; FE never touches QUIC).
-func quicTLSConfig() (*tls.Config, error) {
+// QUIC_CERT/QUIC_KEY files when set, else a generated self-signed cert
+// when allowSelfSigned is true. Production (FE_TOKEN set) should pass
+// false so a missing cert fails closed and Hosts fall back to WS.
+// Hosts typically use InsecureSkipVerify for self-signed (documented;
+// FE never touches QUIC).
+func quicTLSConfig(allowSelfSigned bool) (*tls.Config, error) {
 	certFile := os.Getenv("QUIC_CERT")
 	keyFile := os.Getenv("QUIC_KEY")
+	// Shared ALPN so host clients can dial with the same protocol id.
+	const alpn = "acp-hub"
 	if certFile != "" && keyFile != "" {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			return nil, err
 		}
-		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+		return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{alpn}}, nil
 	}
-	// Self-sign in memory (hosts skip verification).
+	if !allowSelfSigned {
+		return nil, fmt.Errorf("QUIC_CERT/QUIC_KEY required when FE_TOKEN is set (set QUIC_ALLOW_SELF_SIGNED=1 only for lab use)")
+	}
+	// Self-sign in memory (dev / explicit allow).
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -755,24 +986,25 @@ func quicTLSConfig() (*tls.Config, error) {
 		Certificate: [][]byte{der},
 		PrivateKey:  key,
 	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{alpn}}, nil
 }
 
-// serveQUIC listens for host connections over QUIC (UDP). One
-// bidirectional stream per connection carries the same JSON frame
-// protocol as /ws/host; auth is the first frame {type:"auth", token}.
-func serveQUIC(port int, tlsConf *tls.Config, h *hub.Hub) {
+// listenQUIC opens the UDP QUIC listener for host transport.
+func listenQUIC(port int, tlsConf *tls.Config) (*quic.Listener, error) {
 	addr := fmt.Sprintf(":%d", port)
-	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{KeepAlivePeriod: 10 * time.Second})
-	if err != nil {
-		log.Printf("[acp-hub] QUIC listen %s failed: %v", addr, err)
-		return
-	}
-	log.Printf("[acp-hub] QUIC host transport on udp://%s", addr)
+	return quic.ListenAddr(addr, tlsConf, &quic.Config{KeepAlivePeriod: 10 * time.Second})
+}
+
+// serveQUIC accepts host connections over an already-open QUIC listener.
+// One bidirectional stream per connection carries the same JSON frame
+// protocol as /ws/host; auth is the first frame {type:"auth", token}.
+// Closing the listener ends the accept loop (graceful shutdown).
+func serveQUIC(ln *quic.Listener, h *hub.Hub) {
 	for {
 		conn, err := ln.Accept(context.Background())
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			// Listener closed on shutdown, or unrecoverable accept error.
+			if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "closed") {
 				return
 			}
 			log.Printf("[acp-hub] QUIC accept: %v", err)
@@ -815,7 +1047,12 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		_, err := io.ReadFull(stream, buf)
 		return buf, err
 	}
+	// Match WS hostWriteTimeout: a half-open peer must not block writes
+	// (and thus writeMu / notifyHostsSubscribers goroutines) forever.
 	write := func(payload []byte) error {
+		if err := stream.SetWriteDeadline(time.Now().Add(hostWriteTimeout)); err != nil {
+			return err
+		}
 		var lenBuf [4]byte
 		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
 		if _, err := stream.Write(lenBuf[:]); err != nil {
@@ -882,13 +1119,16 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 
 // ── helpers ───────────────────────────────────────────────────────────
 
-// requireFEToken wraps a browser-facing handler. When expected is empty,
-// auth is disabled (local/dev). Otherwise the request must carry the
-// same token via Authorization: Bearer, X-Access-Token, or ?token=
-// (the last for WebSocket, which cannot set headers in browsers).
-func requireFEToken(expected string, next http.HandlerFunc) http.HandlerFunc {
+// feAuth gates browser-facing routes. Empty token disables the gate (dev).
+// Prefer short-lived tickets for WebSocket query auth.
+type feAuth struct {
+	token   string
+	tickets *feTicketStore
+}
+
+func (a feAuth) require(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !checkFEToken(r, expected) {
+		if !a.check(r) {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
 		}
@@ -896,23 +1136,39 @@ func requireFEToken(expected string, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// checkFEToken reports whether r is allowed for browser routes.
-// Empty expected disables the gate.
-func checkFEToken(r *http.Request, expected string) bool {
-	if expected == "" {
+// check reports whether r is allowed for browser routes.
+// Order: long-lived Bearer/header, single-use ?ticket=, legacy ?token=.
+func (a feAuth) check(r *http.Request) bool {
+	if a.token == "" {
 		return true
 	}
-	if tok := bearerToken(r.Header.Get("Authorization")); tokenEqual(tok, expected) {
+	if tok := bearerToken(r.Header.Get("Authorization")); tokenEqual(tok, a.token) {
 		return true
 	}
-	if tok := strings.TrimSpace(r.Header.Get("X-Access-Token")); tokenEqual(tok, expected) {
+	if tok := strings.TrimSpace(r.Header.Get("X-Access-Token")); tokenEqual(tok, a.token) {
 		return true
 	}
-	// WebSocket cannot send custom headers from the browser; allow query param.
-	if tok := strings.TrimSpace(r.URL.Query().Get("token")); tokenEqual(tok, expected) {
+	// Prefer short-lived ticket for WebSocket (avoids FE_TOKEN in logs).
+	if a.tickets != nil {
+		if t := strings.TrimSpace(r.URL.Query().Get("ticket")); t != "" {
+			return a.tickets.consume(t)
+		}
+	}
+	// Legacy: long-lived secret in query (still accepted for back-compat).
+	if tok := strings.TrimSpace(r.URL.Query().Get("token")); tokenEqual(tok, a.token) {
 		return true
 	}
 	return false
+}
+
+// requireFEToken is kept for tests; production code uses feAuth.
+func requireFEToken(expected string, next http.HandlerFunc) http.HandlerFunc {
+	return feAuth{token: expected}.require(next)
+}
+
+// checkFEToken is kept for tests.
+func checkFEToken(r *http.Request, expected string) bool {
+	return feAuth{token: expected}.check(r)
 }
 
 func bearerToken(auth string) string {
@@ -960,15 +1216,31 @@ func readJSON(r *http.Request, dst any) error {
 	return json.Unmarshal(body, dst)
 }
 
-func withCORS(next http.Handler) http.Handler {
+// withCORS applies CORS. When origins is empty/nil, Allow-Origin is `*`
+// (dev). When set (from CORS_ORIGINS), only listed origins are reflected.
+func withCORS(next http.Handler, origins []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Access-Token")
+		if len(origins) == 0 {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else if origin := r.Header.Get("Origin"); origin != "" && corsOriginAllowed(origin, origins) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func corsOriginAllowed(origin string, allowed []string) bool {
+	for _, a := range allowed {
+		if a == origin {
+			return true
+		}
+	}
+	return false
 }

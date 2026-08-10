@@ -1,5 +1,6 @@
-# Binaries
+# Binaries (never commit built hub)
 /acp-hub
+acp-hub
 *.exe
 *.exe~
 *.dll

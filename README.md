@@ -28,11 +28,13 @@ go run ./cmd/acp-hub        # 默认 :8787（PORT 可改）
 
 也可以随时查看 / 轮换：
 
-- `GET /api/pairing` — 查看当前配对码与过期时间
-- `POST /api/pairing/rotate` — 轮换配对码（旧的立即失效）
+- `GET /api/pairing` — 查看当前配对码与过期时间（若已过期会**自动轮换**后再返回）
+- `POST /api/pairing/rotate` — 立即轮换配对码（旧的立刻失效）
+- 后台每 30s 检查过期并自动轮换，避免挂着失效码
 
-配对状态（token → host）持久化在 `~/.acp-hub/hub.json`，Hub 重启后已配对的
-Host 无需重新配对。
+配对状态（token → host）持久化在 `~/.acp-hub/hub.json`（目录 `0700`、文件 `0600`），
+Hub 重启后已配对的 Host 无需重新配对。注册表最多 `MaxHosts`（256）台；可用
+`DELETE /api/hosts/{hostId}` 解绑。
 
 ### 环境变量
 
@@ -40,21 +42,28 @@ Host 无需重新配对。
 |------|------|------|
 | `PORT` | `8787` | HTTP 端口 |
 | `QUIC_PORT` | `8788` | Host 传输 QUIC UDP 端口（UDP 需在云安全组放行；不放行时 host 自动回退 WS） |
-| `FE_TOKEN` | — | **前端访问 token**（也认 `ACCESS_TOKEN`）。设置后，浏览器侧接口必须携带该 token，否则 `401`。未设置时浏览器路由开放（仅适合本机开发） |
+| `FE_TOKEN` | — | **前端访问 token**（也认 `ACCESS_TOKEN`）。设置后浏览器侧接口必须鉴权。未设置时路由开放（仅本机开发） |
+| `REQUIRE_FE_TOKEN` | — | 设为 `1`/`true` 时，未配置 `FE_TOKEN` 则**拒绝启动**（生产推荐） |
+| `CORS_ORIGINS` | `*` | 逗号分隔允许的 Origin；空或 `*` 为放行全部。生产请写成前端真实源 |
+| `QUIC_CERT` / `QUIC_KEY` | — | QUIC TLS 证书。**设置了 `FE_TOKEN` 时默认必须提供**（禁止自签）；否则开发可用内存自签 |
+| `QUIC_ALLOW_SELF_SIGNED` | — | 设为 `1` 时即使有 `FE_TOKEN` 也允许 QUIC 自签（仅实验室） |
 
 生产部署示例：
 
 ```bash
-FE_TOKEN=your-long-random-secret go run ./cmd/acp-hub
-# 或
-FE_TOKEN=your-long-random-secret ./acp-hub
+REQUIRE_FE_TOKEN=1 \
+FE_TOKEN=your-long-random-secret \
+CORS_ORIGINS=https://your-fe.example \
+QUIC_CERT=/etc/acp/fullchain.pem QUIC_KEY=/etc/acp/privkey.pem \
+  go run ./cmd/acp-hub
 ```
 
 前端**不要**把密钥打进静态构建；用户打开页面后在门禁框输入同一密钥（存本机 `localStorage`）。请求时带上：
 
 - `Authorization: Bearer <FE_TOKEN>`（推荐，所有 `fetch`）
 - 或 `X-Access-Token: <FE_TOKEN>`
-- 或 `?token=<FE_TOKEN>`（浏览器 WebSocket 无法设 header，`/ws/fe` 用 query）
+- WebSocket：`POST /api/ws-ticket`（带 Bearer）换短期 `ticket`，再连 `/ws/fe?ticket=…`（**推荐**，避免长期密钥进 access log）
+- 兼容：`/ws/fe?token=<FE_TOKEN>`（不推荐）
 
 **不**校验 FE_TOKEN 的路径（Host 仍用自己的配对 Bearer）：
 
@@ -77,9 +86,11 @@ FE_TOKEN=your-long-random-secret ./acp-hub
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/ws/fe` | 聚合 live WebSocket：帧 `{v:1,type:"hello"|"events"|"ping",…}`；事件带 `hostId`/`hostName`/`seq`；`?c=1` 时 events 帧为 flate 压缩二进制；hub 级事件（`hello`、`hosts_changed`）不带 hostId |
+| GET | `/ws/fe` | 聚合 live WebSocket：帧 `{v:1,type:"hello"|"events"|"ping",…}`；事件带 `hostId`/`hostName`/`seq`；`?c=1` 时 events 帧为 flate 压缩二进制；鉴权优先 `?ticket=` |
+| POST | `/api/ws-ticket` | 兑换单次短期 ticket（约 2 分钟）供 `/ws/fe` 使用 |
 | GET | `/api/events` | 缺口补拉：`?host=X&after=SEQ` → 该 host 缓冲中 seq>after 的事件（升序） |
 | GET | `/api/hosts` | 注册表：`{ hosts: [...], defaultHostId }` |
+| DELETE | `/api/hosts/{hostId}` | 解绑 host：吊销 token、清 pending、从注册表移除（需 FE_TOKEN） |
 | GET | `/api/status` | 中转到默认 Host |
 | GET/POST | `/api/*`（其余） | 中转：`?host=<hostId>` 选择目标 Host，缺省用默认 Host（最近在线的） |
 
@@ -100,10 +111,11 @@ FE_TOKEN=your-long-random-secret ./acp-hub
 
 ## 行为细节
 
-- Host 在线状态 = `/ws/host` 连接状态：断连立即离线并广播 `hosts_changed`，
-  中转中的请求立即失败（503）——不会挂死浏览器。
+- Host 在线状态 = 传输连接状态：断连立即离线并广播 `hosts_changed`，
+  中转中的请求立即失败（503）——不会挂死浏览器。重连会取代旧连接并立刻 fail pending。
+- Host 断连后 **约 60s** 内仍保留事件缓冲，便于短断线时 `GET /api/events` 补拉；超时后丢弃。
 - 中转请求等待上限 45 分钟（对齐 Host 侧 30 分钟 prompt 超时）。
-- 事件扇出为尽力而为（慢消费者丢弃，订阅 buffer 512），浏览器通过 `/api/status` 与
+- 事件扇出为尽力而为（慢消费者丢弃，订阅 buffer 512），浏览器通过 `/api/events` 与
   `/api/session-updates` 重新水合，与 acp-host 本地模式一致。
 - **空闲省流量**：Hub 跟踪浏览器 `/ws/fe` 订阅数，经 Host WS 推送
   `{v:1,type:"subscribers",count:N}`（`hello` 也带 `subscribers`）。

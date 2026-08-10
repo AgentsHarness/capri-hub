@@ -3,6 +3,9 @@ package hub
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -61,10 +64,82 @@ func TestPairingFlow(t *testing.T) {
 func TestExpiredCode(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	h.mu.Lock()
+	old := h.pairingCode
 	h.codeExpires = time.Now().Add(-time.Minute)
 	h.mu.Unlock()
-	if _, err := h.Pair(h.pairingCode, "h1", "H1"); !errors.Is(err, ErrCodeInvalid) {
+	// Pair with the expired code value must still fail (does not auto-accept).
+	if _, err := h.Pair(old, "h1", "H1"); !errors.Is(err, ErrCodeInvalid) {
 		t.Errorf("expired code err = %v, want ErrCodeInvalid", err)
+	}
+}
+
+// PairingCode() must auto-rotate when the current code is past expiry so
+// admins never see a dead code advertised as current.
+func TestPairingCodeAutoRotateOnRead(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	h.mu.Lock()
+	old := h.pairingCode
+	h.codeExpires = time.Now().Add(-time.Minute)
+	h.mu.Unlock()
+
+	code, exp := h.PairingCode()
+	if code == old {
+		t.Error("PairingCode must rotate after expiry")
+	}
+	if !exp.After(time.Now()) {
+		t.Error("new code must not be already expired")
+	}
+	// New code works for Pair.
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("pair with rotated code: %v", err)
+	}
+}
+
+// After disconnect, gap-pull buffer is kept for EventBufGrace then cleared.
+// Reconnect cancels the pending clear.
+func TestEventBufGrace(t *testing.T) {
+	prev := EventBufGrace
+	EventBufGrace = 80 * time.Millisecond
+	defer func() { EventBufGrace = prev }()
+
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	_, stop, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(1)}) {
+		t.Fatal("register")
+	}
+	stop()
+	// Immediately after disconnect the buffer is still available.
+	if n := len(h.EventsAfter("h1", 0)); n != 1 {
+		t.Fatalf("evBuf right after disconnect = %d, want 1", n)
+	}
+	// After grace, cleared.
+	time.Sleep(120 * time.Millisecond)
+	if n := len(h.EventsAfter("h1", 0)); n != 0 {
+		t.Fatalf("evBuf after grace = %d, want 0", n)
+	}
+
+	// Reconnect cancels clear: disconnect → re-register buffer → reconnect before grace.
+	EventBufGrace = 200 * time.Millisecond
+	_, stop2, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(2)}) {
+		t.Fatal("register 2")
+	}
+	stop2()
+	_, stop3, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop3()
+	time.Sleep(250 * time.Millisecond)
+	if n := len(h.EventsAfter("h1", 0)); n != 1 {
+		t.Fatalf("evBuf after reconnect within grace = %d, want 1 (clear cancelled)", n)
 	}
 }
 
@@ -80,6 +155,200 @@ func TestPairingPersistence(t *testing.T) {
 	hosts := h2.ListHosts()
 	if len(hosts) != 1 || hosts[0].HostID != "h1" || hosts[0].HostName != "H1" {
 		t.Errorf("hosts after restart = %+v", hosts)
+	}
+}
+
+// Re-pair after a process restart must revoke the old token. load() has
+// to restore hostState.token (and Pair must revoke by hostId) for this.
+func TestRePairAfterRestartRevokesOldToken(t *testing.T) {
+	dir := t.TempDir()
+	h1 := NewWithDir(dir)
+	tok1 := testPair(t, h1, "h1", "H1")
+
+	h2 := NewWithDir(dir) // restart
+	code, _ := h2.PairingCode()
+	tok2, err := h2.Pair(code, "h1", "H1-new")
+	if err != nil {
+		t.Fatalf("re-pair: %v", err)
+	}
+	if _, ok := h2.HostIDForToken(tok1); ok {
+		t.Error("old token must be revoked after re-pair post-restart")
+	}
+	if hid, ok := h2.HostIDForToken(tok2); !ok || hid != "h1" {
+		t.Errorf("new token = %q,%v want h1,true", hid, ok)
+	}
+}
+
+func TestPersistFileMode(t *testing.T) {
+	dir := t.TempDir()
+	h := NewWithDir(dir)
+	_ = testPair(t, h, "h1", "H1")
+	fi, err := os.Stat(filepath.Join(dir, "hub.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := fi.Mode().Perm(); mode&0o077 != 0 {
+		t.Errorf("hub.json mode %o must not be group/other readable", mode)
+	}
+}
+
+// Concurrent Pair must not race on the shared tokens map during persist
+// marshal (go test -race) and must leave a valid hub.json.
+func TestConcurrentPairPersist(t *testing.T) {
+	dir := t.TempDir()
+	h := NewWithDir(dir)
+	code, _ := h.PairingCode()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = h.Pair(code, fmt.Sprintf("h%d", i), "H")
+		}(i)
+	}
+	wg.Wait()
+
+	b, err := os.ReadFile(filepath.Join(dir, "hub.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pf persistFile
+	if err := json.Unmarshal(b, &pf); err != nil {
+		t.Fatalf("invalid hub.json after concurrent pairs: %v", err)
+	}
+	if len(pf.Hosts) == 0 || len(pf.Tokens) == 0 {
+		t.Errorf("empty snapshot: hosts=%d tokens=%d", len(pf.Hosts), len(pf.Tokens))
+	}
+}
+
+// ConnectStream superseding an existing connection must fail in-flight
+// Dispatches immediately (not wait for RelayTimeout).
+func TestConnectStreamSupersedeFailsPending(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+
+	got := make(chan []byte, 4)
+	_, stop1, err := h.ConnectStream("h1", func(p []byte) error {
+		got <- append([]byte(nil), p...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.Dispatch("h1", "GET", "/api/status", nil)
+		done <- err
+	}()
+	select {
+	case <-got:
+	case <-time.After(time.Second):
+		t.Fatal("no request frame on first connection")
+	}
+
+	_, stop2, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop2()
+	// Stale stop must not mark the new connection offline.
+	stop1()
+
+	select {
+	case err := <-done:
+		var re *RelayError
+		if !errors.As(err, &re) || re.Status != 503 {
+			t.Errorf("dispatch err = %v, want RelayError 503", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending request not failed after host reconnect")
+	}
+	if !h.ListHosts()[0].Online {
+		t.Error("host should stay online after stale stop")
+	}
+}
+
+func TestUnpair(t *testing.T) {
+	dir := t.TempDir()
+	h := NewWithDir(dir)
+	tok := testPair(t, h, "h1", "H1")
+
+	// Online with a pending-ish stream: unpair should clear registry.
+	_, stop, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	if err := h.Unpair("h1"); err != nil {
+		t.Fatalf("Unpair: %v", err)
+	}
+	if _, ok := h.HostIDForToken(tok); ok {
+		t.Error("token must be revoked after unpair")
+	}
+	if len(h.ListHosts()) != 0 {
+		t.Errorf("hosts after unpair = %+v", h.ListHosts())
+	}
+	if err := h.Unpair("h1"); !errors.Is(err, ErrHostUnknown) {
+		t.Errorf("second Unpair err = %v, want ErrHostUnknown", err)
+	}
+
+	// Survives restart.
+	h2 := NewWithDir(dir)
+	if len(h2.ListHosts()) != 0 {
+		t.Errorf("hosts after restart = %+v, want empty", h2.ListHosts())
+	}
+	if _, ok := h2.HostIDForToken(tok); ok {
+		t.Error("token must stay revoked across restart")
+	}
+}
+
+func TestMaxHosts(t *testing.T) {
+	h := NewWithDir("")
+	code, _ := h.PairingCode()
+	// Fill to the cap without going through full MaxHosts if huge —
+	// temporarily not possible; exercise the limit by filling MaxHosts.
+	for i := 0; i < MaxHosts; i++ {
+		if _, err := h.Pair(code, fmt.Sprintf("host-%d", i), "H"); err != nil {
+			t.Fatalf("pair %d: %v", i, err)
+		}
+	}
+	if _, err := h.Pair(code, "overflow", "H"); !errors.Is(err, ErrHostLimit) {
+		t.Errorf("pair beyond cap err = %v, want ErrHostLimit", err)
+	}
+	// Re-pair of an existing host must still work.
+	if _, err := h.Pair(code, "host-0", "renamed"); err != nil {
+		t.Errorf("re-pair within cap: %v", err)
+	}
+}
+
+func TestEvBufTrimCopies(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	// Overflow the buffer; after trim, len must equal cap and equal eventBufCap
+	// (fresh backing array — not a reslice that pins a larger array).
+	for i := 1; i <= eventBufCap+10; i++ {
+		if !h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)}) {
+			t.Fatalf("register %d", i)
+		}
+	}
+	h.mu.Lock()
+	buf := h.hosts["h1"].evBuf
+	h.mu.Unlock()
+	if len(buf) != eventBufCap {
+		t.Fatalf("len = %d, want %d", len(buf), eventBufCap)
+	}
+	if cap(buf) != eventBufCap {
+		t.Errorf("cap = %d, want %d (trimmed copy, not reslice of larger array)", cap(buf), eventBufCap)
+	}
+	// Oldest kept seq is (eventBufCap+10) - eventBufCap + 1 = 11
+	if got := evSeq(buf[0]); got != 11 {
+		t.Errorf("first buffered seq = %d, want 11", got)
+	}
+	if got := evSeq(buf[len(buf)-1]); got != uint64(eventBufCap+10) {
+		t.Errorf("last buffered seq = %d, want %d", got, eventBufCap+10)
 	}
 }
 
@@ -485,9 +754,10 @@ func TestRegisterEventDoesNotMutateCallerMap(t *testing.T) {
 }
 
 // TestRegisterEventSeqRegression: a host replaying events with a stale
-// (lower) seq must not move the per-host counter backwards — that would
-// make the FE misjudge what it already saw — but the event itself must
-// still be broadcast and buffered.
+// or equal seq must not move the per-host counter backwards, must not
+// re-fan-out to FE subscribers, and must not re-append to the gap-pull
+// buffer. LastSeen is still refreshed (return true). A higher seq still
+// advances and fans out as usual.
 func TestRegisterEventSeqRegression(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
@@ -498,11 +768,14 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	if got := h.LastSeq("h1"); got != 100 {
 		t.Fatalf("LastSeq = %d, want 100", got)
 	}
+	if n := len(h.EventsAfter("h1", 0)); n != 1 {
+		t.Fatalf("evBuf len = %d, want 1 after first event", n)
+	}
 
 	ch, unsub := h.Subscribe()
 	defer unsub()
 
-	// Regressed seq: still relayed, counter must stay at 100.
+	// Regressed seq: accepted (LastSeen) but no fan-out / no buffer append.
 	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "stale", "seq": uint64(50)}) {
 		t.Fatal("register 50")
 	}
@@ -511,27 +784,171 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	}
 	select {
 	case ev := <-ch:
-		if ev["text"] != "stale" {
-			t.Errorf("regressed event not relayed as-is: %v", ev)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("regressed event should still be broadcast")
+		t.Fatalf("regressed seq must not fan out, got %v", ev)
+	case <-time.After(50 * time.Millisecond):
+		// expected: no broadcast
+	}
+	if n := len(h.EventsAfter("h1", 0)); n != 1 {
+		t.Errorf("evBuf len = %d after stale, want 1 (no re-append)", n)
 	}
 
-	// Equal seq: fine, counter stays put.
+	// Equal seq (duplicate): same — skip fan-out, counter stays put.
 	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "dup", "seq": uint64(100)}) {
 		t.Fatal("register 100 again")
 	}
 	if got := h.LastSeq("h1"); got != 100 {
 		t.Errorf("LastSeq = %d, want 100 after equal seq", got)
 	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("duplicate seq must not fan out, got %v", ev)
+	case <-time.After(50 * time.Millisecond):
+		// expected
+	}
+	if n := len(h.EventsAfter("h1", 0)); n != 1 {
+		t.Errorf("evBuf len = %d after dup, want 1", n)
+	}
 
-	// A higher seq still advances.
+	// A higher seq still advances and fans out.
 	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "next", "seq": uint64(101)}) {
 		t.Fatal("register 101")
 	}
 	if got := h.LastSeq("h1"); got != 101 {
 		t.Errorf("LastSeq = %d, want 101", got)
+	}
+	select {
+	case ev := <-ch:
+		if ev["text"] != "next" {
+			t.Errorf("fresh event = %v, want text=next", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("seq 101 should be broadcast")
+	}
+	if n := len(h.EventsAfter("h1", 0)); n != 2 {
+		t.Errorf("evBuf len = %d after 101, want 2", n)
+	}
+}
+
+// TestSetHostReady: control-plane host_status updates Ready + fires
+// hosts_changed on flip, without advancing LastSeq or buffering events.
+func TestSetHostReady(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	// Seed a sequenced event so LastSeq is non-zero.
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "x", "seq": uint64(7)}) {
+		t.Fatal("register seed")
+	}
+	if got := h.LastSeq("h1"); got != 7 {
+		t.Fatalf("LastSeq = %d, want 7", got)
+	}
+
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	if !h.SetHostReady("h1", true) {
+		t.Fatal("SetHostReady true failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
+		t.Errorf("ready not set: %+v", hosts)
+	}
+	if got := h.LastSeq("h1"); got != 7 {
+		t.Errorf("LastSeq = %d after SetHostReady, want 7 (must not advance)", got)
+	}
+	if n := len(h.EventsAfter("h1", 0)); n != 1 {
+		t.Errorf("evBuf len = %d after SetHostReady, want 1", n)
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed on ready flip")
+	}
+
+	// Same ready value: no second hosts_changed.
+	if !h.SetHostReady("h1", true) {
+		t.Fatal("SetHostReady true (noop) failed")
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("ready unchanged must not rebroadcast, got %v", ev)
+	case <-time.After(50 * time.Millisecond):
+		// expected
+	}
+
+	// Flip false → hosts_changed again.
+	if !h.SetHostReady("h1", false) {
+		t.Fatal("SetHostReady false failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Ready {
+		t.Errorf("ready should be false: %+v", hosts)
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed on ready→false")
+	}
+
+	if h.SetHostReady("nope", true) {
+		t.Error("SetHostReady for unknown host should fail")
+	}
+}
+
+// TestResetHostSeq: host process restart clears LastSeq + gap-pull buffer
+// so new low seqs fan out instead of being skipped as stale.
+func TestResetHostSeq(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "old", "seq": uint64(100)}) {
+		t.Fatal("register seed")
+	}
+	if got := h.LastSeq("h1"); got != 100 {
+		t.Fatalf("LastSeq = %d, want 100", got)
+	}
+	if n := len(h.EventsAfter("h1", 0)); n != 1 {
+		t.Fatalf("evBuf len = %d, want 1", n)
+	}
+
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	if !h.ResetHostSeq("h1") {
+		t.Fatal("ResetHostSeq failed")
+	}
+	if got := h.LastSeq("h1"); got != 0 {
+		t.Errorf("LastSeq after reset = %d, want 0", got)
+	}
+	if n := len(h.EventsAfter("h1", 0)); n != 0 {
+		t.Errorf("evBuf after reset = %d, want 0", n)
+	}
+
+	// New process seq 1 must fan out (not skipped as s <= 100).
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "new", "seq": uint64(1)}) {
+		t.Fatal("register seq 1 after reset")
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "chunk" || ev["text"] != "new" {
+			t.Errorf("fan-out = %v, want chunk/new", ev)
+		}
+		if s := evSeq(ev); s != 1 {
+			t.Errorf("seq = %d, want 1", s)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("seq 1 after reset was not broadcast")
+	}
+	if got := h.LastSeq("h1"); got != 1 {
+		t.Errorf("LastSeq = %d, want 1", got)
+	}
+
+	if h.ResetHostSeq("nope") {
+		t.Error("ResetHostSeq for unknown host should fail")
 	}
 }
 

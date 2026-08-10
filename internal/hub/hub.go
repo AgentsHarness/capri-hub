@@ -12,6 +12,7 @@
 package hub
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -30,12 +31,26 @@ import (
 const (
 	// PairingCodeTTL is how long a pairing code stays valid.
 	PairingCodeTTL = 15 * time.Minute
+	// pairingCodeCheckInterval is how often the maintainer looks for an
+	// expired pairing code to rotate.
+	pairingCodeCheckInterval = 30 * time.Second
 	// RelayTimeout caps how long the hub waits for a host to answer a
 	// relayed request (mirrors the host's 30-minute prompt timeout).
 	RelayTimeout = 45 * time.Minute
 	// eventBufCap bounds per-host buffered events for gap-pull.
 	eventBufCap = 4000
+	// MaxHosts caps the registry so unbounded pair spam cannot grow
+	// memory / hub.json without limit.
+	MaxHosts = 256
+	// Max lengths for pair fields (reject, do not truncate).
+	maxHostIDLen   = 128
+	maxHostNameLen = 256
 )
+
+// EventBufGrace is how long after a host disconnect we keep its gap-pull
+// buffer so a short blip can still be filled via GET /api/events. Zero
+// clears immediately (tests may shrink this).
+var EventBufGrace = 60 * time.Second
 
 var (
 	// ErrCodeInvalid: the pairing code is wrong or expired.
@@ -44,6 +59,8 @@ var (
 	ErrHostUnknown = errors.New("host 未配对")
 	// ErrNoHost: nothing paired at all.
 	ErrNoHost = errors.New("没有已配对的 host")
+	// ErrHostLimit: registry is full (see MaxHosts).
+	ErrHostLimit = errors.New("已达 host 数量上限")
 )
 
 // RelayError carries an HTTP status code for relay failures.
@@ -107,6 +124,9 @@ type hostState struct {
 	// gaps: GET /api/events?host=X&after=SEQ.
 	seq   uint64
 	evBuf []Event
+	// evBufEpoch is bumped on disconnect (schedule clear) and reconnect
+	// (cancel clear). A delayed clear only runs if the epoch still matches.
+	evBufEpoch uint64
 }
 
 // Hub is the relay core. All methods are safe for concurrent use.
@@ -183,28 +203,58 @@ func (h *Hub) load() {
 	if json.Unmarshal(b, &pf) != nil {
 		return
 	}
-	for tok, hid := range pf.Tokens {
-		h.tokens[tok] = hid
-	}
 	for hid, ph := range pf.Hosts {
-		h.hosts[hid] = &hostState{
-			info: HostInfo{HostID: ph.HostID, HostName: ph.HostName, Ready: ph.Ready},
+		id := ph.HostID
+		if id == "" {
+			id = hid
+		}
+		h.hosts[id] = &hostState{
+			info: HostInfo{HostID: id, HostName: ph.HostName, Ready: ph.Ready},
+		}
+	}
+	// Restore tokens and hostState.token so re-pair after restart can
+	// revoke the previous credential (delete by hs.token + by hostId).
+	for tok, hid := range pf.Tokens {
+		if tok == "" || hid == "" {
+			continue
+		}
+		h.tokens[tok] = hid
+		if hs := h.hosts[hid]; hs != nil {
+			// Last token wins as the "current" field; revokeTokensForHost
+			// still clears every map entry for the hostId.
+			hs.token = tok
+		} else {
+			// Orphan token without a hosts entry — synthesize a minimal host
+			// so the token remains usable and re-pair can still revoke it.
+			h.hosts[hid] = &hostState{
+				info:  HostInfo{HostID: hid},
+				token: tok,
+			}
 		}
 	}
 }
 
-// snapshotLocked returns the persistence snapshot; the caller must hold
-// h.mu (it reads h.tokens / h.hosts directly). Cheap: no I/O.
+// snapshotLocked returns a deep copy of the persistence snapshot; the
+// caller must hold h.mu. The copy is safe to marshal after releasing the
+// lock — never alias h.tokens / live host maps.
 func (h *Hub) snapshotLocked() persistFile {
-	pf := persistFile{Tokens: h.tokens, Hosts: make(map[string]persistHost)}
+	pf := persistFile{
+		Tokens: make(map[string]string, len(h.tokens)),
+		Hosts:  make(map[string]persistHost, len(h.hosts)),
+	}
+	for tok, hid := range h.tokens {
+		pf.Tokens[tok] = hid
+	}
 	for hid, hs := range h.hosts {
 		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Ready: hs.info.Ready}
 	}
 	return pf
 }
 
-// writePersist writes a snapshot to disk (atomic tmp+rename). It never
-// takes h.mu: slow or flaky disk must not stall the whole hub.
+// writePersist writes a snapshot to disk (unique temp + rename, mode 0600).
+// It never takes h.mu: slow or flaky disk must not stall the whole hub.
+// Concurrent callers each get their own temp file so they cannot clobber
+// one another's .tmp or race on rename.
 func (h *Hub) writePersist(pf persistFile) {
 	if h.dataFile == "" {
 		return
@@ -214,32 +264,61 @@ func (h *Hub) writePersist(pf persistFile) {
 		return
 	}
 	dir := filepath.Dir(h.dataFile)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		log.Printf("[acp-hub] persist mkdir: %v", err)
 		return
 	}
-	tmp := h.dataFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.CreateTemp(dir, "hub-*.tmp")
+	if err != nil {
+		log.Printf("[acp-hub] persist temp: %v", err)
+		return
+	}
+	tmpName := f.Name()
+	// Tokens live in this file — never world/group readable.
+	_ = f.Chmod(0o600)
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpName)
 		log.Printf("[acp-hub] persist write: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, h.dataFile); err != nil {
-		log.Printf("[acp-hub] persist rename: %v", err)
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		log.Printf("[acp-hub] persist close: %v", err)
+		return
 	}
+	if err := os.Rename(tmpName, h.dataFile); err != nil {
+		_ = os.Remove(tmpName)
+		log.Printf("[acp-hub] persist rename: %v", err)
+		return
+	}
+	_ = os.Chmod(h.dataFile, 0o600)
 }
 
 // ── pairing ───────────────────────────────────────────────────────────
 
-// PairingCode returns the current pairing code and its expiry.
+// PairingCode returns the current pairing code and its expiry. If the
+// code has already expired it is rotated first so callers never see a
+// dead code advertised as current.
 func (h *Hub) PairingCode() (code string, expiresAt time.Time) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.pairingCode, h.codeExpires
+	return h.ensureFreshPairingCode()
 }
 
 func (h *Hub) rotateCode() {
 	h.pairingCode = randomString(codeAlphabet, 6)
 	h.codeExpires = time.Now().Add(PairingCodeTTL)
+}
+
+// ensureFreshPairingCode rotates when expired; returns the live code.
+func (h *Hub) ensureFreshPairingCode() (code string, expiresAt time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if time.Now().After(h.codeExpires) {
+		h.rotateCode()
+		log.Printf("[acp-hub] pairing code auto-rotated (expired): %s (expires %s)",
+			h.pairingCode, h.codeExpires.Format("15:04:05"))
+	}
+	return h.pairingCode, h.codeExpires
 }
 
 // RotatePairingCode replaces the pairing code (old one stops working).
@@ -251,9 +330,28 @@ func (h *Hub) RotatePairingCode() (code string, expiresAt time.Time) {
 	return h.pairingCode, h.codeExpires
 }
 
+// StartPairingCodeMaintainer periodically rotates expired pairing codes
+// until ctx is cancelled. Safe to call once per Hub.
+func (h *Hub) StartPairingCodeMaintainer(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(pairingCodeCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.ensureFreshPairingCode()
+			}
+		}
+	}()
+}
+
 // Pair exchanges a pairing code for a host token. Re-pairing an existing
-// hostId revokes its previous token. State is snapshotted under the lock
-// but written to disk outside it, so flaky storage never stalls the hub.
+// hostId revokes every previous token for that host (not only hs.token),
+// so a restart that left multiple map entries cannot keep old credentials
+// alive. State is snapshotted under the lock but written to disk outside
+// it, so flaky storage never stalls the hub.
 func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 	h.mu.Lock()
 	if strings.ToUpper(strings.TrimSpace(code)) != h.pairingCode {
@@ -265,16 +363,30 @@ func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 		return "", ErrCodeInvalid
 	}
 	hostID = strings.TrimSpace(hostID)
+	hostName = strings.TrimSpace(hostName)
 	if hostID == "" {
 		h.mu.Unlock()
 		return "", errors.New("hostId 不能为空")
 	}
+	if len(hostID) > maxHostIDLen {
+		h.mu.Unlock()
+		return "", fmt.Errorf("hostId 过长（上限 %d）", maxHostIDLen)
+	}
+	if len(hostName) > maxHostNameLen {
+		h.mu.Unlock()
+		return "", fmt.Errorf("hostName 过长（上限 %d）", maxHostNameLen)
+	}
 	if hs, ok := h.hosts[hostID]; ok {
-		// Revoke the previous token so the old one stops working.
-		delete(h.tokens, hs.token)
+		// Revoke every token for this hostId (covers multi-token legacy
+		// after a pre-fix restart load).
+		h.revokeTokensForHostLocked(hostID)
 		hs.info.HostName = hostName
 		hs.info.LastSeen = time.Now()
 	} else {
+		if len(h.hosts) >= MaxHosts {
+			h.mu.Unlock()
+			return "", ErrHostLimit
+		}
 		h.hosts[hostID] = &hostState{
 			info: HostInfo{HostID: hostID, HostName: hostName, LastSeen: time.Now()},
 		}
@@ -297,6 +409,51 @@ func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 	return token, nil
 }
 
+// Unpair removes a host from the registry: revokes all its tokens, fails
+// in-flight relayed requests, drops its stream registration, and persists.
+// An active transport is left to close itself (auth is already revoked;
+// further events/dispatches for this hostId fail).
+func (h *Hub) Unpair(hostID string) error {
+	hostID = strings.TrimSpace(hostID)
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return ErrHostUnknown
+	}
+	h.revokeTokensForHostLocked(hostID)
+	h.failPendingLocked(hostID)
+	hs.conn = nil
+	hs.evBuf = nil
+	delete(h.hosts, hostID)
+	var snap persistFile
+	persist := h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
+	h.broadcastLocked(hostsChanged())
+	h.mu.Unlock()
+
+	if persist {
+		h.writePersist(snap)
+	}
+	log.Printf("[acp-hub] host unpaired: %s", hostID)
+	return nil
+}
+
+// revokeTokensForHostLocked removes every token → hostID mapping and
+// clears hostState.token. Caller must hold h.mu.
+func (h *Hub) revokeTokensForHostLocked(hostID string) {
+	for tok, hid := range h.tokens {
+		if hid == hostID {
+			delete(h.tokens, tok)
+		}
+	}
+	if hs := h.hosts[hostID]; hs != nil {
+		hs.token = ""
+	}
+}
+
 // HostIDForToken resolves a host token to its hostId.
 func (h *Hub) HostIDForToken(token string) (string, bool) {
 	h.mu.Lock()
@@ -307,9 +464,13 @@ func (h *Hub) HostIDForToken(token string) (string, bool) {
 
 // ── host connections ──────────────────────────────────────────────────
 
-// ConnectStream registers the host's outbound WebSocket; the returned
-// stop func must be called when the connection ends (it fails all pending
-// relayed requests for that host).
+// ConnectStream registers the host's outbound stream; the returned stop
+// func must be called when the connection ends (it fails all pending
+// relayed requests for that host when this conn is still current).
+//
+// If the host already has a live stream, the new connection supersedes
+// it: in-flight pending requests are failed immediately so they do not
+// hang until RelayTimeout (the old stop is a no-op once superseded).
 func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*streamConn, func(), error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -317,6 +478,13 @@ func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*s
 	if hs == nil {
 		return nil, nil, ErrHostUnknown
 	}
+	// Supersede: fail requests that were written to the previous stream
+	// (or still waiting) — the old connection's stop will not clear them.
+	if hs.conn != nil {
+		h.failPendingLocked(hostID)
+	}
+	// Cancel any pending grace-period buffer clear from a prior disconnect.
+	hs.evBufEpoch++
 	conn := &streamConn{id: h.nextConnID.Add(1), write: write}
 	hs.conn = conn
 	hs.info.Online = true
@@ -327,25 +495,49 @@ func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*s
 
 func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
 	if hs == nil || hs.conn != conn {
+		h.mu.Unlock()
 		return // superseded by a newer connection
 	}
 	hs.conn = nil
 	hs.info.Online = false
-	// Drop the event replay buffer: a disconnected host cannot be gap-pulled
-	// meaningfully (its events are stale after reconnect anyway), and the
-	// retained slices would leak up to eventBufCap events per dead host.
-	hs.evBuf = nil
+	// Keep evBuf for EventBufGrace so short disconnects can still be
+	// gap-pulled; schedule a clear that no-ops if the host reconnects.
+	hs.evBufEpoch++
+	epoch := hs.evBufEpoch
+	h.failPendingLocked(hostID)
+	h.broadcastLocked(hostsChanged())
+	grace := EventBufGrace
+	h.mu.Unlock()
+
+	if grace <= 0 {
+		h.mu.Lock()
+		if hs := h.hosts[hostID]; hs != nil && hs.conn == nil && hs.evBufEpoch == epoch {
+			hs.evBuf = nil
+		}
+		h.mu.Unlock()
+		return
+	}
+	time.AfterFunc(grace, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		hs := h.hosts[hostID]
+		if hs == nil || hs.conn != nil || hs.evBufEpoch != epoch {
+			return
+		}
+		hs.evBuf = nil
+	})
+}
+
+// failPendingLocked closes and drops every pending request for hostID.
+// Caller must hold h.mu.
+func (h *Hub) failPendingLocked(hostID string) {
 	for reqID, pr := range h.pending[hostID] {
 		close(pr.done)
 		delete(h.pending[hostID], reqID)
 	}
-	if len(h.pending[hostID]) == 0 {
-		delete(h.pending, hostID)
-	}
-	h.broadcastLocked(hostsChanged())
+	delete(h.pending, hostID)
 }
 
 // evSeq normalizes an event's seq across Go-native (uint64, direct
@@ -366,11 +558,58 @@ func evSeq(ev Event) uint64 {
 	return 0
 }
 
+// SetHostReady updates Ready from a control-plane host_status frame (no
+// seq). Always refreshes LastSeen; if ready flips, updates Ready and
+// broadcasts hosts_changed. Returns false for unknown hosts. Does not
+// advance the per-host event seq or touch the transcript buffer.
+func (h *Hub) SetHostReady(hostID string, ready bool) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		return false
+	}
+	hs.info.LastSeen = time.Now()
+	if ready != hs.info.Ready {
+		hs.info.Ready = ready
+		h.broadcastLocked(hostsChanged())
+	}
+	return true
+}
+
+// ResetHostSeq clears the per-host event counter and gap-pull buffer.
+// Used when a host process restarts: bridge seq restarts at 1 while the
+// hub still holds the previous process's LastSeq — without a reset, the
+// hub would skip fan-out for every new event with s <= old LastSeq.
+// Does not change Ready/Online or fire hosts_changed.
+func (h *Hub) ResetHostSeq(hostID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		return false
+	}
+	prev := hs.seq
+	hs.seq = 0
+	hs.evBuf = nil
+	hs.info.LastSeen = time.Now()
+	if prev > 0 {
+		log.Printf("[acp-hub] host %s seq reset (was %d) — host process restart", hostID, prev)
+	}
+	return true
+}
+
 // RegisterEvent accepts a host event: tags it with the host's id/name,
 // assigns a sequence number (host-provided when present, else hub-side),
 // buffers it for gap-pull, updates liveness (and ready for host_status
 // events), then fans it out to browser subscribers. Returns false for
 // unknown hosts.
+//
+// When the host provides a seq s > 0 that is not strictly greater than
+// the already-seen max (s <= hs.seq), LastSeen is still refreshed but
+// the event is neither buffered nor broadcast — reconnect residual +
+// replay must not re-fan-out duplicates to the FE. The counter never
+// regresses.
 func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 	if ev == nil {
 		// A malformed frame (e.g. {"events":[null]}) must never panic the
@@ -396,23 +635,30 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 	// Host-provided seq (events frames carry per-event seq); fall back to
 	// hub-side assignment for direct RegisterEvent callers (tests).
 	if s := evSeq(cp); s > 0 {
-		// A reconnecting host may replay old events with stale seqs; the
-		// counter must never move backwards or the FE would misread a
-		// seq regression as "already seen" and skip a real gap-pull.
-		if s < hs.seq {
-			log.Printf("[acp-hub] host %s event seq regressed: got %d, last %d (event still relayed)", hostID, s, hs.seq)
+		// Skip fan-out for duplicate/stale seqs (reconnect residual +
+		// replay). Counter must never move backwards.
+		if s <= hs.seq {
+			if s < hs.seq {
+				log.Printf("[acp-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, s, hs.seq)
+			}
+			return true
 		}
-		if s > hs.seq {
-			hs.seq = s
-		}
+		hs.seq = s
 	} else {
 		hs.seq++
 		cp["seq"] = hs.seq
 	}
 	hs.evBuf = append(hs.evBuf, cp)
 	if len(hs.evBuf) > eventBufCap {
-		hs.evBuf = hs.evBuf[len(hs.evBuf)-eventBufCap:]
+		// Copy into a fresh slice so the discarded prefix (and its Event
+		// maps) are not retained by the underlying array — a plain reslice
+		// would pin up to eventBufCap extra events until the next realloc.
+		n := eventBufCap
+		trimmed := make([]Event, n)
+		copy(trimmed, hs.evBuf[len(hs.evBuf)-n:])
+		hs.evBuf = trimmed
 	}
+	// Back-compat: old hosts still send host_status inside events frames.
 	if t, _ := cp["type"].(string); t == "host_status" {
 		if r, ok := cp["ready"].(bool); ok && r != hs.info.Ready {
 			hs.info.Ready = r
@@ -699,6 +945,11 @@ func (h *Hub) broadcastLocked(ev Event) {
 		select {
 		case ch <- ev:
 		default:
+			// Slow FE /ws/fe: drop this event for that subscriber only.
+			// Host-assigned seqs may then look gapped on that client
+			// (e.g. 1 then 3). Expected: FE uses GET /api/events?after=
+			// gap-pull and (hostId,seq) dedup; do not block the hub
+			// lock or invent continuous seqs here.
 		}
 	}
 }
