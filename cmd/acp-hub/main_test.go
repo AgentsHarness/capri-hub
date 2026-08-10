@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -185,6 +186,56 @@ func TestHandleHostFramePreservesHostSeq(t *testing.T) {
 	}
 	if seen[0] != 100 || seen[1] != 101 {
 		t.Errorf("broadcast seqs = %v, want [100 101]", seen)
+	}
+}
+
+// TestPairLimiter: the sliding window must allow pairRateLimit attempts
+// per IP per minute, reject beyond that, not affect other IPs, and open
+// up again after the window elapses.
+func TestPairLimiter(t *testing.T) {
+	l := newPairLimiter()
+	for i := 0; i < pairRateLimit; i++ {
+		if !l.allow("1.2.3.4") {
+			t.Fatalf("attempt %d should be allowed", i+1)
+		}
+	}
+	if l.allow("1.2.3.4") {
+		t.Error("attempt beyond the limit must be rejected")
+	}
+	if !l.allow("5.6.7.8") {
+		t.Error("a different IP must not be affected")
+	}
+
+	// Age all recorded hits out of the window.
+	l.mu.Lock()
+	old := time.Now().Add(-pairRateWindow - time.Second)
+	for ip, hs := range l.hits {
+		for i := range hs {
+			hs[i] = old
+		}
+		l.hits[ip] = hs
+	}
+	l.mu.Unlock()
+	if !l.allow("1.2.3.4") {
+		t.Error("IP must be allowed again after the window elapses")
+	}
+}
+
+// TestHandleRelayRejectsOversizeBody: a relay body over the 5MB cap must
+// be rejected with 413, not silently truncated and forwarded to the host
+// as broken JSON.
+func TestHandleRelayRejectsOversizeBody(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	handler := handleRelay(h)
+	body := make([]byte, (5<<20)+1)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/prompt", bytes.NewReader(body)))
+	if rr.Code != 413 {
+		t.Fatalf("status = %d, want 413 (body %d bytes > 5MB)", rr.Code, len(body))
 	}
 }
 

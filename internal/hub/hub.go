@@ -85,11 +85,10 @@ type RelayResponse struct {
 }
 
 // streamConn is one host's live WebSocket (hub ↔ host). The hub
-// writes relayed request / subscribers frames to it; `done` closes on disconnect.
+// writes relayed request / subscribers frames to it.
 type streamConn struct {
 	id    int64
 	write func(payload []byte) error
-	done  chan struct{}
 }
 
 type pendingReq struct {
@@ -194,13 +193,21 @@ func (h *Hub) load() {
 	}
 }
 
-func (h *Hub) save() {
-	if h.dataFile == "" {
-		return
-	}
+// snapshotLocked returns the persistence snapshot; the caller must hold
+// h.mu (it reads h.tokens / h.hosts directly). Cheap: no I/O.
+func (h *Hub) snapshotLocked() persistFile {
 	pf := persistFile{Tokens: h.tokens, Hosts: make(map[string]persistHost)}
 	for hid, hs := range h.hosts {
 		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Ready: hs.info.Ready}
+	}
+	return pf
+}
+
+// writePersist writes a snapshot to disk (atomic tmp+rename). It never
+// takes h.mu: slow or flaky disk must not stall the whole hub.
+func (h *Hub) writePersist(pf persistFile) {
+	if h.dataFile == "" {
+		return
 	}
 	b, err := json.Marshal(pf)
 	if err != nil {
@@ -245,18 +252,21 @@ func (h *Hub) RotatePairingCode() (code string, expiresAt time.Time) {
 }
 
 // Pair exchanges a pairing code for a host token. Re-pairing an existing
-// hostId revokes its previous token.
+// hostId revokes its previous token. State is snapshotted under the lock
+// but written to disk outside it, so flaky storage never stalls the hub.
 func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if strings.ToUpper(strings.TrimSpace(code)) != h.pairingCode {
+		h.mu.Unlock()
 		return "", ErrCodeInvalid
 	}
 	if time.Now().After(h.codeExpires) {
+		h.mu.Unlock()
 		return "", ErrCodeInvalid
 	}
 	hostID = strings.TrimSpace(hostID)
 	if hostID == "" {
+		h.mu.Unlock()
 		return "", errors.New("hostId 不能为空")
 	}
 	if hs, ok := h.hosts[hostID]; ok {
@@ -272,7 +282,17 @@ func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 	token := randomToken()
 	h.tokens[token] = hostID
 	h.hosts[hostID].token = token
-	h.save()
+	// Snapshot while holding the lock; write the file after releasing it.
+	var snap persistFile
+	persist := h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
+	h.mu.Unlock()
+
+	if persist {
+		h.writePersist(snap)
+	}
 	log.Printf("[acp-hub] host paired: %s (%s)", hostID, hostName)
 	return token, nil
 }
@@ -297,7 +317,7 @@ func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*s
 	if hs == nil {
 		return nil, nil, ErrHostUnknown
 	}
-	conn := &streamConn{id: h.nextConnID.Add(1), write: write, done: make(chan struct{})}
+	conn := &streamConn{id: h.nextConnID.Add(1), write: write}
 	hs.conn = conn
 	hs.info.Online = true
 	hs.info.LastSeen = time.Now()
@@ -314,7 +334,10 @@ func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
 	}
 	hs.conn = nil
 	hs.info.Online = false
-	close(conn.done)
+	// Drop the event replay buffer: a disconnected host cannot be gap-pulled
+	// meaningfully (its events are stale after reconnect anyway), and the
+	// retained slices would leak up to eventBufCap events per dead host.
+	hs.evBuf = nil
 	for reqID, pr := range h.pending[hostID] {
 		close(pr.done)
 		delete(h.pending[hostID], reqID)
@@ -325,12 +348,44 @@ func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
 	h.broadcastLocked(hostsChanged())
 }
 
+// evSeq normalizes an event's seq across Go-native (uint64, direct
+// RegisterEvent callers) and JSON-decoded (float64, wire frames) values.
+func evSeq(ev Event) uint64 {
+	switch s := ev["seq"].(type) {
+	case float64:
+		if s > 0 {
+			return uint64(s)
+		}
+	case uint64:
+		return s
+	case int:
+		if s > 0 {
+			return uint64(s)
+		}
+	}
+	return 0
+}
+
 // RegisterEvent accepts a host event: tags it with the host's id/name,
 // assigns a sequence number (host-provided when present, else hub-side),
 // buffers it for gap-pull, updates liveness (and ready for host_status
 // events), then fans it out to browser subscribers. Returns false for
 // unknown hosts.
 func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
+	if ev == nil {
+		// A malformed frame (e.g. {"events":[null]}) must never panic the
+		// process — the QUIC path runs without net/http's recover.
+		return false
+	}
+	// Shallow-copy before tagging/buffering/broadcast: the caller's map
+	// must never gain injected keys, and the same map must not be shared
+	// between the replay buffer, every subscriber channel, and
+	// EventsAfter callers (one consumer mutating it would leak into all
+	// the others).
+	cp := make(Event, len(ev))
+	for k, v := range ev {
+		cp[k] = v
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
@@ -338,27 +393,35 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 		return false
 	}
 	hs.info.LastSeen = time.Now()
-	// Host-provided seq (events frames carry seqStart); fall back to
+	// Host-provided seq (events frames carry per-event seq); fall back to
 	// hub-side assignment for direct RegisterEvent callers (tests).
-	if s, ok := ev["seq"].(float64); ok && s > 0 {
-		hs.seq = uint64(s)
+	if s := evSeq(cp); s > 0 {
+		// A reconnecting host may replay old events with stale seqs; the
+		// counter must never move backwards or the FE would misread a
+		// seq regression as "already seen" and skip a real gap-pull.
+		if s < hs.seq {
+			log.Printf("[acp-hub] host %s event seq regressed: got %d, last %d (event still relayed)", hostID, s, hs.seq)
+		}
+		if s > hs.seq {
+			hs.seq = s
+		}
 	} else {
 		hs.seq++
-		ev["seq"] = hs.seq
+		cp["seq"] = hs.seq
 	}
-	hs.evBuf = append(hs.evBuf, ev)
+	hs.evBuf = append(hs.evBuf, cp)
 	if len(hs.evBuf) > eventBufCap {
 		hs.evBuf = hs.evBuf[len(hs.evBuf)-eventBufCap:]
 	}
-	if t, _ := ev["type"].(string); t == "host_status" {
-		if r, ok := ev["ready"].(bool); ok && r != hs.info.Ready {
+	if t, _ := cp["type"].(string); t == "host_status" {
+		if r, ok := cp["ready"].(bool); ok && r != hs.info.Ready {
 			hs.info.Ready = r
 			h.broadcastLocked(hostsChanged())
 		}
 	}
-	ev["hostId"] = hostID
-	ev["hostName"] = hs.info.HostName
-	h.broadcastLocked(ev)
+	cp["hostId"] = hostID
+	cp["hostName"] = hs.info.HostName
+	h.broadcastLocked(cp)
 	return true
 }
 
@@ -394,7 +457,7 @@ func (h *Hub) EventsAfter(hostID string, after uint64) []Event {
 	if hs := h.hosts[hostID]; hs != nil {
 		out := make([]Event, 0, 8)
 		for _, ev := range hs.evBuf {
-			if s, _ := ev["seq"].(float64); uint64(s) > after {
+			if evSeq(ev) > after {
 				out = append(out, ev)
 			}
 		}
@@ -440,6 +503,14 @@ func (h *Hub) Dispatch(hostID, method, path string, body json.RawMessage) (Relay
 
 	timer := time.NewTimer(RelayTimeout)
 	defer timer.Stop()
+	// A response that already arrived must win over a concurrently
+	// firing timeout: select would otherwise pick the timer branch at
+	// random and drop an answer that is already here.
+	select {
+	case resp := <-pr.resp:
+		return resp, nil
+	default:
+	}
 	select {
 	case resp := <-pr.resp:
 		return resp, nil
@@ -539,10 +610,24 @@ func (h *Hub) DefaultHostID() string {
 // count so they can pause event upload when nobody is listening (heartbeat
 // host_status still runs on the host side).
 func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
+	ch, unsub, _ := h.TrySubscribe(0) // 0 = unlimited
+	return ch, unsub
+}
+
+// TrySubscribe is Subscribe with a subscriber cap: when max > 0 and the
+// hub already has max live browser subscribers, it returns ok=false
+// instead of registering another. Each subscriber costs a 512-event
+// channel plus the caller's goroutines, so the /ws/fe endpoint uses this
+// as a resource guard when it is open to unauthenticated clients.
+func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool) {
 	// Larger than the old SSE path: WS fan-out still drops on a full buffer,
 	// but 512 absorbs short FE write stalls without losing a turn of chunks.
 	ch = make(chan Event, 512)
 	h.mu.Lock()
+	if max > 0 && len(h.subscribers) >= max {
+		h.mu.Unlock()
+		return nil, nil, false
+	}
 	h.subscribers[ch] = struct{}{}
 	h.mu.Unlock()
 	h.notifyHostsSubscribers()
@@ -559,7 +644,7 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 		}
 	drained:
 		h.notifyHostsSubscribers()
-	}
+	}, true
 }
 
 // SubscriberCount is the number of live browser /ws/fe clients.
@@ -590,8 +675,14 @@ func (h *Hub) notifyHostsSubscribers() {
 	if err != nil {
 		return
 	}
+	// Fire-and-forget per host: writes carry a multi-second timeout each,
+	// so one half-open host must not stall the caller (subscribe /
+	// unsubscribe) — the count frames are absolute notifications, a
+	// briefly delayed one is harmless.
 	for _, write := range writes {
-		_ = write(payload)
+		go func(w func([]byte) error) {
+			_ = w(payload)
+		}(write)
 	}
 }
 

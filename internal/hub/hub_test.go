@@ -399,3 +399,215 @@ func TestNotifyHostsSubscribers(t *testing.T) {
 		t.Errorf("after unsub count = %d, want 0", h.SubscriberCount())
 	}
 }
+
+// TestEventsAfterBothSeqTypes: hub-side (uint64, direct callers) and
+// wire-decoded (float64) seqs must both be pullable via EventsAfter.
+func TestEventsAfterBothSeqTypes(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	// Direct caller: seq stored as uint64.
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "a", "seq": uint64(1)}) {
+		t.Fatal("register 1")
+	}
+	// JSON-decoded style: float64.
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "b", "seq": float64(2)}) {
+		t.Fatal("register 2")
+	}
+	// Seq-less event: hub assigns its own (uint64, seq 3).
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "c"}) {
+		t.Fatal("register 3")
+	}
+
+	evs := h.EventsAfter("h1", 1)
+	if len(evs) != 2 {
+		t.Fatalf("EventsAfter(1) = %d events, want 2: %v", len(evs), evs)
+	}
+	if evSeq(evs[0]) != 2 || evSeq(evs[1]) != 3 {
+		t.Errorf("seqs = %v, %v; want 2, 3", evSeq(evs[0]), evSeq(evs[1]))
+	}
+	if evSeq(evs[0]) != 2 {
+		t.Errorf("first event text = %v", evs[0])
+	}
+}
+
+// TestRegisterEventNilEvent: a nil event must be rejected, not panic.
+func TestRegisterEventNilEvent(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	if h.RegisterEvent("h1", nil) {
+		t.Error("nil event should be rejected")
+	}
+}
+
+// TestRegisterEventDoesNotMutateCallerMap: RegisterEvent must never add
+// injected keys (seq/hostId/hostName) to the caller's map — the injected
+// copies are what get buffered and broadcast.
+func TestRegisterEventDoesNotMutateCallerMap(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	ev := Event{"type": "chunk", "text": "x"}
+	if !h.RegisterEvent("h1", ev) {
+		t.Fatal("RegisterEvent failed")
+	}
+	if _, ok := ev["seq"]; ok {
+		t.Error("caller map mutated: seq injected")
+	}
+	if _, ok := ev["hostId"]; ok {
+		t.Error("caller map mutated: hostId injected")
+	}
+	if _, ok := ev["hostName"]; ok {
+		t.Error("caller map mutated: hostName injected")
+	}
+	// The buffered/broadcast copy must carry the injected tags.
+	select {
+	case got := <-ch:
+		if got["type"] != "chunk" || got["text"] != "x" {
+			t.Errorf("broadcast event = %v, want chunk/x", got)
+		}
+		if got["hostId"] != "h1" || got["hostName"] != "H1" {
+			t.Errorf("broadcast event tags = %v/%v", got["hostId"], got["hostName"])
+		}
+		if _, ok := got["seq"]; !ok {
+			t.Error("broadcast event missing hub-assigned seq")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no event received")
+	}
+	// Mutating the broadcast copy must not leak into the replay buffer.
+	evs := h.EventsAfter("h1", 0)
+	if len(evs) != 1 || evs[0]["text"] != "x" {
+		t.Fatalf("EventsAfter = %v, want the tagged copy", evs)
+	}
+}
+
+// TestRegisterEventSeqRegression: a host replaying events with a stale
+// (lower) seq must not move the per-host counter backwards — that would
+// make the FE misjudge what it already saw — but the event itself must
+// still be broadcast and buffered.
+func TestRegisterEventSeqRegression(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "fresh", "seq": uint64(100)}) {
+		t.Fatal("register 100")
+	}
+	if got := h.LastSeq("h1"); got != 100 {
+		t.Fatalf("LastSeq = %d, want 100", got)
+	}
+
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	// Regressed seq: still relayed, counter must stay at 100.
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "stale", "seq": uint64(50)}) {
+		t.Fatal("register 50")
+	}
+	if got := h.LastSeq("h1"); got != 100 {
+		t.Errorf("LastSeq = %d, want 100 (counter must not regress)", got)
+	}
+	select {
+	case ev := <-ch:
+		if ev["text"] != "stale" {
+			t.Errorf("regressed event not relayed as-is: %v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("regressed event should still be broadcast")
+	}
+
+	// Equal seq: fine, counter stays put.
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "dup", "seq": uint64(100)}) {
+		t.Fatal("register 100 again")
+	}
+	if got := h.LastSeq("h1"); got != 100 {
+		t.Errorf("LastSeq = %d, want 100 after equal seq", got)
+	}
+
+	// A higher seq still advances.
+	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "next", "seq": uint64(101)}) {
+		t.Fatal("register 101")
+	}
+	if got := h.LastSeq("h1"); got != 101 {
+		t.Errorf("LastSeq = %d, want 101", got)
+	}
+}
+
+// TestSubscribeNotBlockedBySlowHost: subscriber-count notifications are
+// written per host in the background, so a slow/half-open host (write
+// timeouts of tens of seconds) must not stall subscribe/unsubscribe.
+func TestSubscribeNotBlockedBySlowHost(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	release := make(chan struct{})
+	_, stop, err := h.ConnectStream("h1", func([]byte) error {
+		<-release // simulate a host whose write never completes in time
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer stop()
+	defer close(release)
+
+	done := make(chan struct{})
+	go func() {
+		ch, unsub := h.Subscribe()
+		defer unsub()
+		_ = ch
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Subscribe blocked on a slow host notification write")
+	}
+}
+
+// TestTrySubscribeCap: TrySubscribe must reject registration beyond the
+// cap (resource guard for the open /ws/fe endpoint), free a slot on
+// unsubscribe, and treat max=0 as unlimited (Subscribe keeps working).
+func TestTrySubscribeCap(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+
+	ch1, unsub1, ok := h.TrySubscribe(2)
+	if !ok || ch1 == nil {
+		t.Fatalf("first subscribe: ok=%v ch=%v", ok, ch1)
+	}
+	defer unsub1()
+	ch2, unsub2, ok := h.TrySubscribe(2)
+	if !ok || ch2 == nil {
+		t.Fatalf("second subscribe: ok=%v ch=%v", ok, ch2)
+	}
+	defer unsub2()
+	if h.SubscriberCount() != 2 {
+		t.Errorf("count = %d, want 2", h.SubscriberCount())
+	}
+
+	if ch, unsub, ok := h.TrySubscribe(2); ok {
+		unsub()
+		t.Fatalf("third subscribe beyond cap must fail (ch=%v)", ch)
+	}
+	if h.SubscriberCount() != 2 {
+		t.Errorf("count after rejected subscribe = %d, want 2", h.SubscriberCount())
+	}
+
+	// Unsubscribing frees a slot.
+	unsub1()
+	if _, _, ok := h.TrySubscribe(2); !ok {
+		t.Error("subscribe after unsub must succeed")
+	}
+	if h.SubscriberCount() != 2 {
+		t.Errorf("count after refill = %d, want 2", h.SubscriberCount())
+	}
+
+	// max=0 means unlimited.
+	if _, unsub, ok := h.TrySubscribe(0); !ok {
+		t.Error("TrySubscribe(0) must always succeed")
+	} else {
+		unsub()
+	}
+}

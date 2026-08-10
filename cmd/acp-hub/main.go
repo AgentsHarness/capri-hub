@@ -81,7 +81,7 @@ func main() {
 	mux.HandleFunc("GET /api/pairing", requireFEToken(feToken, handlePairing(h)))
 	mux.HandleFunc("POST /api/pairing/rotate", requireFEToken(feToken, handleRotate(h)))
 	// Host-facing: authenticate with host pairing token (not FE_TOKEN).
-	mux.HandleFunc("POST /api/pair", handlePair(h))
+	mux.HandleFunc("POST /api/pair", handlePair(h, newPairLimiter()))
 	mux.HandleFunc("GET /ws/host", handleHostWS(h))
 	// Browser-facing: FE token gate when FE_TOKEN is set.
 	mux.HandleFunc("GET /api/hosts", requireFEToken(feToken, handleHosts(h)))
@@ -166,19 +166,91 @@ func handleRotate(h *hub.Hub) http.HandlerFunc {
 	}
 }
 
-func handlePair(h *hub.Hub) http.HandlerFunc {
+// Brute-force guard for POST /api/pair: the pairing code is 6 chars from
+// a 32-char alphabet (32^6 ≈ 1.07e9) and lives for 15 minutes, so an
+// attacker must be throttled per IP. Normal flows are unaffected: hosts
+// pair once at startup, and re-pair retries use exponential backoff
+// (1s→30s), well under 10 attempts/minute.
+const (
+	pairRateLimit  = 10                     // attempts per window per IP
+	pairRateWindow = time.Minute            // sliding window
+	pairFailDelay  = 300 * time.Millisecond // extra delay per failed attempt
+)
+
+// pairLimiter is a per-IP sliding-window rate limiter for /api/pair.
+type pairLimiter struct {
+	mu   sync.Mutex
+	hits map[string][]time.Time
+}
+
+func newPairLimiter() *pairLimiter {
+	return &pairLimiter{hits: make(map[string][]time.Time)}
+}
+
+// allow records a request from ip and reports whether it stays within
+// the window's budget. Stale entries are pruned on access; the map is
+// swept once it exceeds 1024 IPs so it cannot grow without bound.
+func (l *pairLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-pairRateWindow)
+	if len(l.hits) > 1024 {
+		for k, v := range l.hits {
+			if len(v) == 0 || v[len(v)-1].Before(cutoff) {
+				delete(l.hits, k)
+			}
+		}
+	}
+	hs := l.hits[ip]
+	i := 0
+	for i < len(hs) && hs[i].Before(cutoff) {
+		i++
+	}
+	hs = hs[i:]
+	if len(hs) >= pairRateLimit {
+		l.hits[ip] = hs
+		return false
+	}
+	l.hits[ip] = append(hs, now)
+	return true
+}
+
+// clientIP returns the client's IP without the port. The hub is
+// deployed/run directly; no proxy forwarding headers are trusted.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Rate-limit before parsing the body: a flood of malformed
+		// attempts must cost the same as valid ones.
+		if !lim.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", strconv.Itoa(int(pairRateWindow/time.Second)))
+			writeJSON(w, 429, map[string]any{"ok": false, "error": "尝试过于频繁，请稍后再试"})
+			return
+		}
 		var body struct {
 			Code     string `json:"code"`
 			HostID   string `json:"hostId"`
 			HostName string `json:"hostName"`
 		}
 		if err := readJSON(r, &body); err != nil || body.Code == "" || body.HostID == "" {
+			time.Sleep(pairFailDelay)
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 code 和 hostId"})
 			return
 		}
 		token, err := h.Pair(body.Code, body.HostID, body.HostName)
 		if err != nil {
+			// Small per-failure delay: slows brute force down, while a
+			// human retyping the code (or the host's backoff retry)
+			// barely notices.
+			time.Sleep(pairFailDelay)
 			writeJSON(w, 401, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
@@ -194,6 +266,17 @@ func handleHosts(h *hub.Hub) http.HandlerFunc {
 		})
 	}
 }
+
+// Keepalive + half-open detection for host transports (WS and QUIC):
+// the hub pings every 25s (the host replies "pong", and also sends
+// host_status heartbeats on its own), so a healthy connection always
+// produces uplink frames. If nothing arrives for hostReadTimeout — e.g.
+// a network blackhole that never sends RST — the connection is dropped
+// instead of leaving the host "online" with every relay stuck.
+const (
+	hostPingInterval = 25 * time.Second
+	hostReadTimeout  = 90 * time.Second
+)
 
 // handleHostWS: host outbound WebSocket. Downlink: hello / subscribers / request.
 // Uplink: events / respond / ping.
@@ -228,6 +311,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 		// relayed body plus envelope, and a tighter limit would kill the
 		// connection on large responses (e.g. fs/read-file of a big log).
 		conn.SetReadLimit(32 << 20)
+		defer conn.Close(websocket.StatusNormalClosure, "")
 
 		var writeMu sync.Mutex
 		write := func(payload []byte) error {
@@ -238,28 +322,80 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 			return conn.Write(ctx, websocket.MessageText, payload)
 		}
 
+		// hello must reach the host BEFORE ConnectStream registers it:
+		// once registered, Dispatch may push a relayed request into the
+		// stream, and a host that has not acked hello yet would miss it.
+		// hello carries the subscriber count, so the host is never blind
+		// to subscriber state either.
+		if err := writeHostHello(h, hostID, write); err != nil {
+			return
+		}
 		_, stop, err := h.ConnectStream(hostID, write)
 		if err != nil {
 			_ = conn.Close(websocket.StatusPolicyViolation, err.Error())
 			return
 		}
 		defer stop()
-		defer conn.Close(websocket.StatusNormalClosure, "")
-
-		if err := writeHostHello(h, hostID, write); err != nil {
-			return
-		}
 		log.Printf("[acp-hub] host %s connected (ws)", hostID)
 
 		ctx := r.Context()
+		frames := make(chan hostReadFrame, 16)
+		readCtx, cancelRead := context.WithCancel(ctx)
+		defer cancelRead()
+		go func() {
+			for {
+				_, data, err := conn.Read(readCtx)
+				if err != nil {
+					select {
+					case frames <- hostReadFrame{err: err}:
+					case <-readCtx.Done():
+					}
+					return
+				}
+				select {
+				case frames <- hostReadFrame{data: data}:
+				case <-readCtx.Done():
+					return
+				}
+			}
+		}()
+
+		ping := time.NewTicker(hostPingInterval)
+		defer ping.Stop()
+		idle := time.NewTimer(hostReadTimeout)
+		defer idle.Stop()
 		for {
-			_, data, err := conn.Read(ctx)
-			if err != nil {
+			select {
+			case f := <-frames:
+				if f.err != nil {
+					return
+				}
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(hostReadTimeout)
+				handleHostFrame(h, hostID, f.data, write)
+			case <-ping.C:
+				frame, _ := json.Marshal(map[string]any{"v": 1, "type": "ping", "ts": time.Now().Unix()})
+				_ = write(frame)
+			case <-idle.C:
+				log.Printf("[acp-hub] host %s: no uplink for %s, dropping", hostID, hostReadTimeout)
+				return
+			case <-ctx.Done():
 				return
 			}
-			handleHostFrame(h, hostID, data, write)
 		}
 	}
+}
+
+// hostReadFrame is one uplink frame (or terminal read error) delivered
+// from the host WebSocket reader goroutine.
+type hostReadFrame struct {
+	data []byte
+	err  error
 }
 
 // writeHostHello sends the hub hello (subscribers + last host seq) down a
@@ -321,10 +457,38 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 	}
 }
 
+// maxFESubscribers caps concurrent browser /ws/fe connections: each one
+// costs a 512-event channel plus two goroutines, and with FE_TOKEN unset
+// the endpoint is open to anyone. Excess connections get WS close 1013
+// (Try Again Later).
+const maxFESubscribers = 256
+
+// minCompressSize: event frames below this size skip flate compression —
+// the flate header + sync marker overhead is not worth it, and browsers
+// get to skip a decompression step.
+const minCompressSize = 256
+
+// Pooled flate writers/buffers for the compressed /ws/fe path: under
+// chunk storms writeEventsFrame runs per frame, and a fresh
+// flate.Writer + bytes.Buffer per frame would hammer the GC.
+// flate.Writer.Reset re-targets a writer after Close, so pooled writers
+// are fully reusable.
+var (
+	flateWriterPool = sync.Pool{
+		New: func() any {
+			fw, _ := flate.NewWriter(io.Discard, flate.BestSpeed)
+			return fw
+		},
+	}
+	flateBufPool = sync.Pool{
+		New: func() any { return new(bytes.Buffer) },
+	}
+)
+
 // handleFeWS: aggregated live event stream for browsers.
-// - hello carries `seqs` (last event seq per host) so a reconnecting FE
-//   knows what it missed and can gap-pull via GET /api/events.
-// - events frames are flate-compressed binary when the client asks (?c=1).
+//   - hello carries `seqs` (last event seq per host) so a reconnecting FE
+//     knows what it missed and can gap-pull via GET /api/events.
+//   - events frames are flate-compressed binary when the client asks (?c=1).
 func handleFeWS(h *hub.Hub, feToken string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !checkFEToken(r, feToken) {
@@ -343,6 +507,15 @@ func handleFeWS(h *hub.Hub, feToken string) http.HandlerFunc {
 		}
 		conn.SetReadLimit(1 << 20)
 		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		// Resource guard: reject (1013 Try Again Later) once the
+		// subscriber cap is reached instead of degrading under load.
+		ch, unsub, ok := h.TrySubscribe(maxFESubscribers)
+		if !ok {
+			_ = conn.Close(websocket.StatusTryAgainLater, "too many subscribers")
+			return
+		}
+		defer unsub()
 
 		var writeMu sync.Mutex
 		writeFrame := func(b []byte, binary bool) error {
@@ -368,19 +541,35 @@ func handleFeWS(h *hub.Hub, feToken string) http.HandlerFunc {
 			if err != nil {
 				return err
 			}
-			if !compress {
+			// Tiny frames compress poorly (flate header + sync marker);
+			// send them raw and let the browser skip decompression.
+			if !compress || len(b) < minCompressSize {
 				return writeFrame(b, false)
 			}
-			// flate (deflate-raw) — browsers decompress via DecompressionStream.
-			var buf bytes.Buffer
-			fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
-			if _, err := fw.Write(b); err != nil {
-				return err
+			// flate (deflate-raw) — browsers decompress via
+			// DecompressionStream. Writer/buffer come from sync.Pool
+			// (see flateWriterPool / flateBufPool above).
+			fw := flateWriterPool.Get().(*flate.Writer)
+			buf := flateBufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			fw.Reset(buf)
+			_, werr := fw.Write(b)
+			cerr := fw.Close()
+			flateWriterPool.Put(fw)
+			if werr != nil {
+				flateBufPool.Put(buf)
+				return werr
 			}
-			if err := fw.Close(); err != nil {
-				return err
+			if cerr != nil {
+				flateBufPool.Put(buf)
+				return cerr
 			}
-			return writeFrame(buf.Bytes(), true)
+			// writeFrame consumes the slice synchronously; only after it
+			// returns is the buffer safe to hand back to the pool.
+			err = writeFrame(buf.Bytes(), true)
+			buf.Reset()
+			flateBufPool.Put(buf)
+			return err
 		}
 
 		if err := writeJSONFrame(map[string]any{
@@ -394,22 +583,39 @@ func handleFeWS(h *hub.Hub, feToken string) http.HandlerFunc {
 			return
 		}
 
-		ch, unsub := h.Subscribe()
-		defer unsub()
-
 		// Writer: batch events to cut frame overhead under chunk storms.
+		// Instead of a free-running 25ms ticker (which wakes up to flush
+		// nothing when idle), the flush timer is armed only when an
+		// event arrives and stopped once the batch is flushed.
 		batch := make([]hub.Event, 0, 16)
+		const flushInterval = 25 * time.Millisecond
+		var (
+			flushTimer *time.Timer
+			flushCh    <-chan time.Time // nil ⇒ the select case stays disabled
+		)
 		flush := func() error {
 			if len(batch) == 0 {
 				return nil
 			}
 			evs := batch
 			batch = make([]hub.Event, 0, 16)
+			if flushTimer != nil {
+				flushTimer.Stop()
+				select {
+				case <-flushTimer.C:
+				default:
+				}
+				flushTimer = nil
+				flushCh = nil
+			}
 			return writeEventsFrame(evs)
 		}
+		defer func() {
+			if flushTimer != nil {
+				flushTimer.Stop()
+			}
+		}()
 
-		ticker := time.NewTicker(25 * time.Millisecond)
-		defer ticker.Stop()
 		ping := time.NewTicker(10 * time.Second)
 		defer ping.Stop()
 
@@ -436,7 +642,7 @@ func handleFeWS(h *hub.Hub, feToken string) http.HandlerFunc {
 				if err := writeJSONFrame(map[string]any{"v": 1, "type": "ping", "ts": time.Now().Unix()}); err != nil {
 					return
 				}
-			case <-ticker.C:
+			case <-flushCh:
 				if err := flush(); err != nil {
 					return
 				}
@@ -450,6 +656,11 @@ func handleFeWS(h *hub.Hub, feToken string) http.HandlerFunc {
 					if err := flush(); err != nil {
 						return
 					}
+				} else if flushTimer == nil {
+					// Arm the flush: if no further events arrive within
+					// flushInterval, send what we have.
+					flushTimer = time.NewTimer(flushInterval)
+					flushCh = flushTimer.C
 				}
 			}
 		}
@@ -469,11 +680,19 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 				return
 			}
 		}
+		const maxRelayBody = 5 << 20
 		var body json.RawMessage
 		if r.Body != nil {
-			b, err := io.ReadAll(io.LimitReader(r.Body, 5<<20))
+			// Read one byte past the cap so an over-limit body is
+			// rejected (413) instead of silently truncated into broken
+			// JSON that the host then fails to parse.
+			b, err := io.ReadAll(io.LimitReader(r.Body, maxRelayBody+1))
 			if err != nil {
 				writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			if len(b) > maxRelayBody {
+				writeJSON(w, 413, map[string]any{"ok": false, "error": "请求体过大（上限 5MB）"})
 				return
 			}
 			body = b
@@ -488,8 +707,14 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 			}
 			return
 		}
+		// Guard against malformed host responses (e.g. missing/zero
+		// status): net/http panics on WriteHeader(0), killing the request.
+		status := resp.Status
+		if status < 100 || status > 599 {
+			status = 502
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(resp.Status)
+		w.WriteHeader(status)
 		_, _ = w.Write(resp.Body)
 	}
 }
@@ -558,6 +783,14 @@ func serveQUIC(port int, tlsConf *tls.Config, h *hub.Hub) {
 }
 
 func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
+	// A panic in a bare goroutine (no net/http recover) would kill the
+	// whole hub; contain it and drop just this connection.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[acp-hub] quic conn panic recovered: %v", r)
+			_ = conn.CloseWithError(1, "internal error")
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	// The host opens the stream; we accept it.
 	stream, err := conn.AcceptStream(ctx)
@@ -618,21 +851,30 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		return write(payload)
 	}
 
+	// hello before ConnectStream registration: a relayed request must
+	// never be pushed into a stream the host has not acked yet (see
+	// handleHostWS for the same ordering on the WebSocket transport).
+	if err := writeHostHello(h, hostID, wsafe); err != nil {
+		return
+	}
 	_, stop, err := h.ConnectStream(hostID, wsafe)
 	if err != nil {
 		return
 	}
 	defer stop()
-
-	if err := writeHostHello(h, hostID, wsafe); err != nil {
-		return
-	}
 	log.Printf("[acp-hub] host %s connected (quic %s)", hostID, conn.RemoteAddr())
 
+	// Idle detection aligned with the WS transport (hostReadTimeout):
+	// the read deadline is reset before every frame, so a host that
+	// stops sending is dropped silently instead of lingering "online"
+	// with every relay stuck.
 	for {
+		if err := stream.SetReadDeadline(time.Now().Add(hostReadTimeout)); err != nil {
+			return
+		}
 		data, err := readFrame()
 		if err != nil {
-			return
+			return // includes the silent read-timeout close
 		}
 		handleHostFrame(h, hostID, data, wsafe)
 	}
