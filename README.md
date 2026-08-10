@@ -147,3 +147,7 @@ cd acp-host && HUB_URL=http://<hub>:8787 HUB_PAIR_CODE=<code> go run ./cmd/acp-h
 # 终端 M（前端指向 Hub；密钥在页面上输入，勿写进构建）
 cd acp-fe && VITE_PROXY_TARGET=http://localhost:8787 npm run dev
 ```
+
+## 友情链接
+
+- [Linux.do](https://linux.do)
