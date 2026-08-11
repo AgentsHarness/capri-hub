@@ -405,6 +405,7 @@ func TestDispatchAndRespond(t *testing.T) {
 
 	type frame struct {
 		ReqID  string          `json:"reqId"`
+		HostID string          `json:"hostId"`
 		Method string          `json:"method"`
 		Path   string          `json:"path"`
 		Body   json.RawMessage `json:"body"`
@@ -436,7 +437,7 @@ func TestDispatchAndRespond(t *testing.T) {
 	}()
 
 	f := <-got
-	if f.ReqID == "" || f.Method != "POST" || f.Path != "/api/prompt" {
+	if f.ReqID == "" || f.HostID != "h1" || f.Method != "POST" || f.Path != "/api/prompt" {
 		t.Fatalf("relay frame = %+v", f)
 	}
 	if string(f.Body) != string(body) {

@@ -90,6 +90,7 @@ type RelayRequest struct {
 	V      int             `json:"v"`
 	Type   string          `json:"type"` // always "request"
 	ReqID  string          `json:"reqId"`
+	HostID string          `json:"hostId"` // 目标 host，host 端据此校验请求归属
 	Method string          `json:"method"`
 	Path   string          `json:"path"`
 	Body   json.RawMessage `json:"body,omitempty"`
@@ -737,7 +738,7 @@ func (h *Hub) Dispatch(hostID, method, path string, body json.RawMessage) (Relay
 	h.pending[hostID][reqID] = pr
 	h.mu.Unlock()
 
-	payload, err := json.Marshal(RelayRequest{V: 1, Type: "request", ReqID: reqID, Method: method, Path: path, Body: body})
+	payload, err := json.Marshal(RelayRequest{V: 1, Type: "request", ReqID: reqID, HostID: hostID, Method: method, Path: path, Body: body})
 	if err != nil {
 		h.dropPending(hostID, reqID)
 		return RelayResponse{}, &RelayError{Status: 500, Message: err.Error()}
