@@ -162,6 +162,7 @@ func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairL
 	// Browser-facing: FE token gate when FE_TOKEN is set.
 	mux.HandleFunc("GET /api/hosts", auth.require(handleHosts(h)))
 	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.require(handleUnpair(h)))
+	mux.HandleFunc("POST /api/hosts/{hostId}/rename", auth.require(handleRenameHost(h)))
 	mux.HandleFunc("GET /api/events", auth.require(handleEvents(h)))
 	mux.HandleFunc("POST /api/ws-ticket", auth.require(handleWSTicket(tickets)))
 	mux.HandleFunc("GET /ws/fe", handleFeWS(h, auth))
@@ -470,6 +471,34 @@ func handleUnpair(h *hub.Hub) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "hostId": hostID})
+	}
+}
+
+// handleRenameHost: POST /api/hosts/{hostId}/rename {hostName} — update
+// a paired host's display name without touching its token/connection.
+func handleRenameHost(h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID := strings.TrimSpace(r.PathValue("hostId"))
+		if hostID == "" {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 hostId"})
+			return
+		}
+		var body struct {
+			HostName string `json:"hostName"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "请求体不是合法 JSON"})
+			return
+		}
+		if err := h.RenameHost(hostID, body.HostName); err != nil {
+			if errors.Is(err, hub.ErrHostUnknown) {
+				writeJSON(w, 404, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "hostId": hostID, "hostName": body.HostName})
 	}
 }
 

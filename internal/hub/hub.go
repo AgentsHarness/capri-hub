@@ -442,6 +442,44 @@ func (h *Hub) Unpair(hostID string) error {
 	return nil
 }
 
+// RenameHost updates a paired host's display name only — no token
+// revocation, no connection teardown (unlike re-pairing via /api/pair,
+// which would kick the host offline). Broadcasts hosts_changed so
+// browsers refresh the registry live.
+func (h *Hub) RenameHost(hostID, hostName string) error {
+	hostID = strings.TrimSpace(hostID)
+	hostName = strings.TrimSpace(hostName)
+	if hostID == "" {
+		return errors.New("hostId 不能为空")
+	}
+	if hostName == "" {
+		return errors.New("hostName 不能为空")
+	}
+	if len(hostName) > maxHostNameLen {
+		return fmt.Errorf("hostName 过长（上限 %d）", maxHostNameLen)
+	}
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return ErrHostUnknown
+	}
+	hs.info.HostName = hostName
+	var snap persistFile
+	persist := h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
+	h.broadcastLocked(hostsChanged())
+	h.mu.Unlock()
+
+	if persist {
+		h.writePersist(snap)
+	}
+	log.Printf("[acp-hub] host renamed: %s → %s", hostID, hostName)
+	return nil
+}
+
 // revokeTokensForHostLocked removes every token → hostID mapping and
 // clears hostState.token. Caller must hold h.mu.
 func (h *Hub) revokeTokensForHostLocked(hostID string) {
