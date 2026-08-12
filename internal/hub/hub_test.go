@@ -1029,3 +1029,79 @@ func TestTrySubscribeCap(t *testing.T) {
 		unsub()
 	}
 }
+
+// ── browser prefs (pins / todos) ──────────────────────────────────────
+
+func TestPrefsRoundtripAndPersist(t *testing.T) {
+	dir := t.TempDir()
+	h := NewWithDir(dir)
+	doc := BrowserPrefs{
+		PinnedWorkspaces: []string{"/home/u/a", "/home/u/b"},
+		PinnedSessions:   []string{"s1"},
+		Todos:            map[string]string{"s1": "todo", "s2": "completed"},
+	}
+	if err := h.SetPrefs(doc); err != nil {
+		t.Fatalf("SetPrefs: %v", err)
+	}
+	got := h.Prefs()
+	if len(got.PinnedWorkspaces) != 2 || got.PinnedSessions[0] != "s1" || got.Todos["s2"] != "completed" {
+		t.Errorf("Prefs = %+v, want the stored doc", got)
+	}
+	// Returned docs must be deep copies: mutating one cannot touch the store.
+	got.PinnedWorkspaces[0] = "MUTATED"
+	got.Todos["s1"] = "completed"
+	again := h.Prefs()
+	if again.PinnedWorkspaces[0] != "/home/u/a" || again.Todos["s1"] != "todo" {
+		t.Errorf("Prefs is not a deep copy: %+v", again)
+	}
+	// A fresh Hub on the same dir reloads the doc from prefs.json.
+	h2 := NewWithDir(dir)
+	reloaded := h2.Prefs()
+	if reloaded.PinnedWorkspaces[0] != "/home/u/a" || reloaded.Todos["s2"] != "completed" {
+		t.Errorf("reloaded Prefs = %+v, want the persisted doc", reloaded)
+	}
+	// Replace semantics: SetPrefs overwrites the whole doc.
+	if err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"only"}}); err != nil {
+		t.Fatalf("SetPrefs replace: %v", err)
+	}
+	got = h.Prefs()
+	if len(got.PinnedWorkspaces) != 0 || len(got.Todos) != 0 || got.PinnedSessions[0] != "only" {
+		t.Errorf("Prefs after replace = %+v", got)
+	}
+}
+
+func TestPrefsEmptyDoc(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	p := h.Prefs()
+	if p.PinnedWorkspaces == nil || p.PinnedSessions == nil || p.Todos == nil {
+		t.Errorf("empty doc must have non-nil containers: %+v", p)
+	}
+}
+
+// SetPrefs must broadcast prefs_changed to browser subscribers so other
+// browsers apply the edit live (one-end sync).
+func TestPrefsBroadcast(t *testing.T) {
+	h := NewWithDir("") // no disk, still broadcasts
+	ch, unsub := h.Subscribe()
+	defer unsub()
+	doc := BrowserPrefs{PinnedSessions: []string{"s1"}, Todos: map[string]string{"s1": "todo"}}
+	if err := h.SetPrefs(doc); err != nil {
+		t.Fatalf("SetPrefs: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "prefs_changed" {
+			t.Errorf("broadcast type = %v, want prefs_changed", ev["type"])
+		}
+		params, _ := ev["params"].(map[string]any)
+		prefs, ok := params["prefs"].(BrowserPrefs)
+		if !ok {
+			t.Fatalf("broadcast params.prefs = %T, want BrowserPrefs", params["prefs"])
+		}
+		if len(prefs.PinnedSessions) != 1 || prefs.PinnedSessions[0] != "s1" || prefs.Todos["s1"] != "todo" {
+			t.Errorf("broadcast prefs = %+v, want the stored doc", prefs)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no prefs_changed broadcast received")
+	}
+}

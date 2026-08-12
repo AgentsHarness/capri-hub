@@ -164,6 +164,8 @@ func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairL
 	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.require(handleUnpair(h)))
 	mux.HandleFunc("POST /api/hosts/{hostId}/rename", auth.require(handleRenameHost(h)))
 	mux.HandleFunc("GET /api/events", auth.require(handleEvents(h)))
+	mux.HandleFunc("GET /api/prefs", auth.require(handlePrefsGet(h)))
+	mux.HandleFunc("PUT /api/prefs", auth.require(handlePrefsPut(h)))
 	mux.HandleFunc("POST /api/ws-ticket", auth.require(handleWSTicket(tickets)))
 	mux.HandleFunc("GET /ws/fe", handleFeWS(h, auth))
 	// Catch-all: relay everything else under /api/* to the selected host.
@@ -199,10 +201,15 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "service": "acp-hub"})
 }
 
+// version is stamped at build time via
+// go build -ldflags "-X main.version=<git-sha>-<timestamp>".
+// Fallback below is used for plain `go run` / `go build`.
+var version = "0.1.3"
+
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"service": "acp-hub",
-		"version": "0.4.0-ws-quic",
+		"version": version,
 		"modes":   []string{"pair", "host-ws", "host-quic", "relay", "fe-ws"},
 	})
 }
@@ -451,6 +458,37 @@ func handleHosts(h *hub.Hub) http.HandlerFunc {
 			"hosts":         h.ListHosts(),
 			"defaultHostId": h.DefaultHostID(),
 		})
+	}
+}
+
+// handlePrefsGet: GET /api/prefs — the browser prefs document (pinned
+// workspaces / sessions + per-session todo status), persisted by the hub
+// in prefs.json. One shared document for all browsers; the FE merges it
+// with its localStorage cache on boot.
+func handlePrefsGet(h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"ok": true, "prefs": h.Prefs()})
+	}
+}
+
+// handlePrefsPut: PUT /api/prefs {prefs: {...}} — replace the browser
+// prefs document. The FE writes its whole doc on every change
+// (debounced client-side), so this is a simple idempotent replace. The
+// doc is small (pins + todos), no size cap is enforced.
+func handlePrefsPut(h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Prefs *hub.BrowserPrefs `json:"prefs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prefs == nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 prefs 字段"})
+			return
+		}
+		if err := h.SetPrefs(*body.Prefs); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
 	}
 }
 
@@ -1249,7 +1287,7 @@ func readJSON(r *http.Request, dst any) error {
 // (dev). When set (from CORS_ORIGINS), only listed origins are reflected.
 func withCORS(next http.Handler, origins []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Access-Token")
 		if len(origins) == 0 {
 			w.Header().Set("Access-Control-Allow-Origin", "*")

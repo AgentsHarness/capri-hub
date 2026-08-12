@@ -63,6 +63,20 @@ var (
 	ErrHostLimit = errors.New("已达 host 数量上限")
 )
 
+// BrowserPrefs is the durable UI preferences for host conversations:
+// pinned workspaces (cwd paths), pinned sessions, and per-session todo
+// status ('todo' / 'completed'; absence = no record). The hub keeps ONE
+// such document (prefs.json) for all browsers; the FE mirrors it in
+// localStorage (offline cache) and writes it here (debounced) so
+// pins/todos survive browser data clearing. Records are keyed by
+// sessionId/cwd only — session ids are host-assigned UUIDs, so a doc is
+// effectively per host conversation without an explicit hostId scope.
+type BrowserPrefs struct {
+	PinnedWorkspaces []string          `json:"pinnedWorkspaces"`
+	PinnedSessions   []string          `json:"pinnedSessions"`
+	Todos            map[string]string `json:"todos,omitempty"`
+}
+
 // RelayError carries an HTTP status code for relay failures.
 type RelayError struct {
 	Status  int
@@ -147,6 +161,10 @@ type Hub struct {
 	nextConnID atomic.Int64
 
 	dataFile string
+	// prefsFile holds the browser prefs document (prefs.json, sibling of
+	// hub.json). Written on SetPrefs only.
+	prefsFile string
+	prefs     BrowserPrefs
 }
 
 // codeAlphabet avoids look-alike characters (no I/L/O/0/1).
@@ -165,10 +183,13 @@ func NewWithDir(dir string) *Hub {
 		hosts:       make(map[string]*hostState),
 		subscribers: make(map[chan Event]struct{}),
 		pending:     make(map[string]map[string]*pendingReq),
+		prefs:       BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
 	}
 	if dir != "" {
 		h.dataFile = filepath.Join(dir, "hub.json")
 		h.load()
+		h.prefsFile = filepath.Join(dir, "prefs.json")
+		h.loadPrefs()
 	}
 	h.rotateCode()
 	return h
@@ -264,36 +285,134 @@ func (h *Hub) writePersist(pf persistFile) {
 	if err != nil {
 		return
 	}
-	dir := filepath.Dir(h.dataFile)
+	if err := writeFileAtomic(h.dataFile, b); err != nil {
+		log.Printf("[acp-hub] persist: %v", err)
+	}
+}
+
+// writeFileAtomic writes b to path via unique temp + rename (mode 0600).
+// Shared by hub.json (pairing state — secrets live here, never world
+// readable) and prefs.json. Same concurrency contract as writePersist:
+// never called while holding h.mu, and concurrent callers get their own
+// temp file so renames cannot race.
+func writeFileAtomic(path string, b []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		log.Printf("[acp-hub] persist mkdir: %v", err)
-		return
+		return fmt.Errorf("mkdir: %w", err)
 	}
 	f, err := os.CreateTemp(dir, "hub-*.tmp")
 	if err != nil {
-		log.Printf("[acp-hub] persist temp: %v", err)
-		return
+		return fmt.Errorf("temp: %w", err)
 	}
 	tmpName := f.Name()
-	// Tokens live in this file — never world/group readable.
+	// Tokens live in hub.json — never world/group readable.
 	_ = f.Chmod(0o600)
 	if _, err := f.Write(b); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpName)
-		log.Printf("[acp-hub] persist write: %v", err)
-		return
+		return fmt.Errorf("write: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		log.Printf("[acp-hub] persist close: %v", err)
-		return
+		return fmt.Errorf("close: %w", err)
 	}
-	if err := os.Rename(tmpName, h.dataFile); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
-		log.Printf("[acp-hub] persist rename: %v", err)
+		return fmt.Errorf("rename: %w", err)
+	}
+	_ = os.Chmod(path, 0o600)
+	return nil
+}
+
+// ── browser preferences (pins / todos) ────────────────────────────────
+
+// loadPrefs reads prefs.json into h.prefs. A missing file starts empty;
+// an unreadable one is ignored (rebuilt on the next write).
+func (h *Hub) loadPrefs() {
+	b, err := os.ReadFile(h.prefsFile)
+	if err != nil {
 		return
 	}
-	_ = os.Chmod(h.dataFile, 0o600)
+	var raw BrowserPrefs
+	if json.Unmarshal(b, &raw) != nil {
+		log.Printf("[acp-hub] prefs: ignoring unreadable %s", h.prefsFile)
+		return
+	}
+	h.prefs = sanitizePrefs(raw)
+}
+
+// sanitizePrefs normalizes a decoded doc (nil slices → empty, nil todos →
+// empty map) so callers never see nil containers.
+func sanitizePrefs(p BrowserPrefs) BrowserPrefs {
+	if p.PinnedWorkspaces == nil {
+		p.PinnedWorkspaces = []string{}
+	}
+	if p.PinnedSessions == nil {
+		p.PinnedSessions = []string{}
+	}
+	if p.Todos == nil {
+		p.Todos = map[string]string{}
+	}
+	return p
+}
+
+// clonePrefs deep-copies a doc so stored state is never aliased by
+// callers mutating what they received.
+func clonePrefs(p BrowserPrefs) BrowserPrefs {
+	todos := make(map[string]string, len(p.Todos))
+	for k, v := range p.Todos {
+		todos[k] = v
+	}
+	return sanitizePrefs(BrowserPrefs{
+		PinnedWorkspaces: append([]string(nil), p.PinnedWorkspaces...),
+		PinnedSessions:   append([]string(nil), p.PinnedSessions...),
+		Todos:            todos,
+	})
+}
+
+// Prefs returns a deep copy of the browser prefs doc (empty when the hub
+// has never received one).
+func (h *Hub) Prefs() BrowserPrefs {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return clonePrefs(h.prefs)
+}
+
+// SetPrefs replaces the browser prefs doc and persists it to prefs.json.
+// The snapshot is taken under the lock; the file write runs outside it
+// (same pattern as pairing state). The doc is small (pins + todos), so
+// no size cap is enforced. Every accepted doc is broadcast to browser
+// subscribers as `prefs_changed` (hub-level event, no hostId) so OTHER
+// browsers apply the change live — one end's edit syncs to every end.
+func (h *Hub) SetPrefs(prefs BrowserPrefs) error {
+	cp := sanitizePrefs(clonePrefs(prefs))
+	h.mu.Lock()
+	persist := h.prefsFile != ""
+	var payload []byte
+	if persist {
+		b, err := json.Marshal(cp)
+		if err != nil {
+			h.mu.Unlock()
+			return fmt.Errorf("marshal prefs: %w", err)
+		}
+		payload = b
+	}
+	h.prefs = cp
+	h.broadcastLocked(prefsChanged(cp))
+	h.mu.Unlock()
+
+	if persist {
+		if err := writeFileAtomic(h.prefsFile, payload); err != nil {
+			log.Printf("[acp-hub] prefs persist: %v", err)
+		}
+	}
+	return nil
+}
+
+// prefsChanged builds the prefs broadcast event (hub-level, no hostId —
+// browsers apply it regardless of the selected host).
+func prefsChanged(prefs BrowserPrefs) Event {
+	return Event{"type": "prefs_changed", "params": map[string]any{"prefs": prefs}}
 }
 
 // ── pairing ───────────────────────────────────────────────────────────
