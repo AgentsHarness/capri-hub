@@ -1,10 +1,10 @@
-// Package hub implements the acp-hub relay core: host pairing (pairing
+// Package hub implements the capri-hub relay core: host pairing (pairing
 // code → token), the host registry, event fan-out to browsers, and the
 // browser ↔ host request relay.
 //
 // Transport model (WebSocket + HTTP API):
 //
-//	Browser (acp-fe) ──WS /ws/fe + HTTP /api/*──▶ acp-hub ──WS /ws/host──▶ acp-host × N ──stdio──▶ grok
+//	Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──WS /ws/host──▶ capri-host × N ──stdio──▶ grok
 //
 // Hosts connect OUTBOUND to the hub (NAT-friendly): one WebSocket carries
 // relayed browser requests down and host events / responds up. Browsers
@@ -170,7 +170,7 @@ type Hub struct {
 // codeAlphabet avoids look-alike characters (no I/L/O/0/1).
 const codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
-// New returns a Hub that persists pairing state under ~/.acp-hub.
+// New returns a Hub that persists pairing state under ~/.capri-hub.
 func New() *Hub {
 	return NewWithDir(defaultDataDir())
 }
@@ -200,7 +200,7 @@ func defaultDataDir() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".acp-hub")
+	return filepath.Join(home, ".capri-hub")
 }
 
 // ── persistence ───────────────────────────────────────────────────────
@@ -286,7 +286,7 @@ func (h *Hub) writePersist(pf persistFile) {
 		return
 	}
 	if err := writeFileAtomic(h.dataFile, b); err != nil {
-		log.Printf("[acp-hub] persist: %v", err)
+		log.Printf("[capri-hub] persist: %v", err)
 	}
 }
 
@@ -335,7 +335,7 @@ func (h *Hub) loadPrefs() {
 	}
 	var raw BrowserPrefs
 	if json.Unmarshal(b, &raw) != nil {
-		log.Printf("[acp-hub] prefs: ignoring unreadable %s", h.prefsFile)
+		log.Printf("[capri-hub] prefs: ignoring unreadable %s", h.prefsFile)
 		return
 	}
 	h.prefs = sanitizePrefs(raw)
@@ -403,7 +403,7 @@ func (h *Hub) SetPrefs(prefs BrowserPrefs) error {
 
 	if persist {
 		if err := writeFileAtomic(h.prefsFile, payload); err != nil {
-			log.Printf("[acp-hub] prefs persist: %v", err)
+			log.Printf("[capri-hub] prefs persist: %v", err)
 		}
 	}
 	return nil
@@ -435,7 +435,7 @@ func (h *Hub) ensureFreshPairingCode() (code string, expiresAt time.Time) {
 	defer h.mu.Unlock()
 	if time.Now().After(h.codeExpires) {
 		h.rotateCode()
-		log.Printf("[acp-hub] pairing code auto-rotated (expired): %s (expires %s)",
+		log.Printf("[capri-hub] pairing code auto-rotated (expired): %s (expires %s)",
 			h.pairingCode, h.codeExpires.Format("15:04:05"))
 	}
 	return h.pairingCode, h.codeExpires
@@ -446,7 +446,7 @@ func (h *Hub) RotatePairingCode() (code string, expiresAt time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rotateCode()
-	log.Printf("[acp-hub] pairing code rotated: %s (expires %s)", h.pairingCode, h.codeExpires.Format("15:04:05"))
+	log.Printf("[capri-hub] pairing code rotated: %s (expires %s)", h.pairingCode, h.codeExpires.Format("15:04:05"))
 	return h.pairingCode, h.codeExpires
 }
 
@@ -525,7 +525,7 @@ func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 	if persist {
 		h.writePersist(snap)
 	}
-	log.Printf("[acp-hub] host paired: %s (%s)", hostID, hostName)
+	log.Printf("[capri-hub] host paired: %s (%s)", hostID, hostName)
 	return token, nil
 }
 
@@ -557,7 +557,7 @@ func (h *Hub) Unpair(hostID string) error {
 	if persist {
 		h.writePersist(snap)
 	}
-	log.Printf("[acp-hub] host unpaired: %s", hostID)
+	log.Printf("[capri-hub] host unpaired: %s", hostID)
 	return nil
 }
 
@@ -595,7 +595,7 @@ func (h *Hub) RenameHost(hostID, hostName string) error {
 	if persist {
 		h.writePersist(snap)
 	}
-	log.Printf("[acp-hub] host renamed: %s → %s", hostID, hostName)
+	log.Printf("[capri-hub] host renamed: %s → %s", hostID, hostName)
 	return nil
 }
 
@@ -766,7 +766,7 @@ func (h *Hub) ResetHostSeq(hostID string) bool {
 	hs.evBuf = nil
 	hs.info.LastSeen = time.Now()
 	if prev > 0 {
-		log.Printf("[acp-hub] host %s seq reset (was %d) — host process restart", hostID, prev)
+		log.Printf("[capri-hub] host %s seq reset (was %d) — host process restart", hostID, prev)
 	}
 	return true
 }
@@ -811,7 +811,7 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 		// replay). Counter must never move backwards.
 		if s <= hs.seq {
 			if s < hs.seq {
-				log.Printf("[acp-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, s, hs.seq)
+				log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, s, hs.seq)
 			}
 			return true
 		}

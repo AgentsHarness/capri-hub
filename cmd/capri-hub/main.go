@@ -1,8 +1,8 @@
-// acp-hub: 中心化中转服务器（relay）。
+// capri-hub: 中心化中转服务器（relay）。
 //
-//		Browser (acp-fe) ──WS /ws/fe + HTTP /api/*──▶ acp-hub ──QUIC/WS /ws/host──▶ acp-host × N ──stdio──▶ grok
+//		Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──QUIC/WS /ws/host──▶ capri-host × N ──stdio──▶ grok
 //
-//	  - 配对：Host 用配对码换取 token（POST /api/pair），token 持久化在 ~/.acp-hub。
+//	  - 配对：Host 用配对码换取 token（POST /api/pair），token 持久化在 ~/.capri-hub。
 //	  - Host 出站连接（GET /ws/host 或 QUIC UDP）：下行 request/subscribers，上行 events/respond。
 //	  - 浏览器 WebSocket（GET /ws/fe）：聚合 live 事件；/api/* 按 ?host= 中转给对应 Host。
 //	  - 可选 FE_TOKEN：部署时设置后，浏览器侧接口必须带同一 token（Bearer / 头）。
@@ -39,7 +39,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/benin/acp-hub/internal/hub"
+	"github.com/AgentsHarness/capri-hub/internal/hub"
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 )
@@ -66,7 +66,7 @@ func main() {
 		feToken = strings.TrimSpace(os.Getenv("ACCESS_TOKEN"))
 	}
 	if feToken == "" && envTruthy("REQUIRE_FE_TOKEN") {
-		log.Fatal("[acp-hub] FE_TOKEN is required (REQUIRE_FE_TOKEN=1). Set FE_TOKEN or unset REQUIRE_FE_TOKEN for local dev.")
+		log.Fatal("[capri-hub] FE_TOKEN is required (REQUIRE_FE_TOKEN=1). Set FE_TOKEN or unset REQUIRE_FE_TOKEN for local dev.")
 	}
 
 	corsOrigins := parseCORSOrigins(os.Getenv("CORS_ORIGINS"))
@@ -77,16 +77,16 @@ func main() {
 	h.StartPairingCodeMaintainer(runCtx)
 
 	code, exp := h.PairingCode()
-	log.Printf("[acp-hub] pairing code: %s (expires %s)", code, exp.Format("15:04:05"))
+	log.Printf("[capri-hub] pairing code: %s (expires %s)", code, exp.Format("15:04:05"))
 	if feToken != "" {
-		log.Printf("[acp-hub] FE_TOKEN set — browser requests require Authorization: Bearer <token> (WS: prefer POST /api/ws-ticket + ?ticket=)")
+		log.Printf("[capri-hub] FE_TOKEN set — browser requests require Authorization: Bearer <token> (WS: prefer POST /api/ws-ticket + ?ticket=)")
 	} else {
-		log.Printf("[acp-hub] FE_TOKEN unset — browser routes are open (local/dev only; set REQUIRE_FE_TOKEN=1 in production)")
+		log.Printf("[capri-hub] FE_TOKEN unset — browser routes are open (local/dev only; set REQUIRE_FE_TOKEN=1 in production)")
 	}
 	if len(corsOrigins) > 0 {
-		log.Printf("[acp-hub] CORS origins: %s", strings.Join(corsOrigins, ", "))
+		log.Printf("[capri-hub] CORS origins: %s", strings.Join(corsOrigins, ", "))
 	}
-	log.Printf("[acp-hub] listening on http://localhost:%d", port)
+	log.Printf("[capri-hub] listening on http://localhost:%d", port)
 
 	tickets := newFETicketStore()
 	tickets.StartCleanup(runCtx)
@@ -101,7 +101,7 @@ func main() {
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[acp-hub] server: %v", err)
+			log.Fatalf("[capri-hub] server: %v", err)
 		}
 	}()
 
@@ -111,18 +111,18 @@ func main() {
 	allowSelfSigned := feToken == "" || envTruthy("QUIC_ALLOW_SELF_SIGNED")
 	qtls, err := quicTLSConfig(allowSelfSigned)
 	if err != nil {
-		log.Printf("[acp-hub] QUIC TLS 初始化失败: %v（跳过 QUIC；Host 可走 WS）", err)
+		log.Printf("[capri-hub] QUIC TLS 初始化失败: %v（跳过 QUIC；Host 可走 WS）", err)
 	} else {
 		ln, err := listenQUIC(quicPort, qtls)
 		if err != nil {
-			log.Printf("[acp-hub] QUIC listen :%d failed: %v（跳过 QUIC）", quicPort, err)
+			log.Printf("[capri-hub] QUIC listen :%d failed: %v（跳过 QUIC）", quicPort, err)
 		} else {
 			quicLn = ln
 			mode := "cert-files"
 			if allowSelfSigned && os.Getenv("QUIC_CERT") == "" {
 				mode = "self-signed (dev)"
 			}
-			log.Printf("[acp-hub] QUIC host transport on udp://:%d (%s)", quicPort, mode)
+			log.Printf("[capri-hub] QUIC host transport on udp://:%d (%s)", quicPort, mode)
 			go serveQUIC(ln, h)
 		}
 	}
@@ -198,17 +198,17 @@ func parseCORSOrigins(raw string) []string {
 // ── handlers ──────────────────────────────────────────────────────────
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "acp-hub"})
+	writeJSON(w, 200, map[string]any{"ok": true, "service": "capri-hub"})
 }
 
 // version is stamped at build time via
 // go build -ldflags "-X main.version=<git-sha>-<timestamp>".
 // Fallback below is used for plain `go run` / `go build`.
-var version = "0.1.5"
+var version = "0.2.0"
 
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
-		"service": "acp-hub",
+		"service": "capri-hub",
 		"version": version,
 		"modes":   []string{"pair", "host-ws", "host-quic", "relay", "fe-ws"},
 	})
@@ -580,7 +580,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 			InsecureSkipVerify: true,
 		})
 		if err != nil {
-			log.Printf("[acp-hub] host ws accept: %v", err)
+			log.Printf("[capri-hub] host ws accept: %v", err)
 			return
 		}
 		// Long-lived relay; prompts can run tens of minutes. 32MB matches
@@ -613,7 +613,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 			return
 		}
 		defer stop()
-		log.Printf("[acp-hub] host %s connected (ws)", hostID)
+		log.Printf("[capri-hub] host %s connected (ws)", hostID)
 
 		ctx := r.Context()
 		frames := make(chan hostReadFrame, 16)
@@ -652,7 +652,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 				// must not interleave with the current connection's seq
 				// space — drop the stale transport on its next frame.
 				if !h.IsCurrentConn(hostID, sc) {
-					log.Printf("[acp-hub] host %s: superseded ws connection dropped", hostID)
+					log.Printf("[capri-hub] host %s: superseded ws connection dropped", hostID)
 					return
 				}
 				if !idle.Stop() {
@@ -667,7 +667,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 				frame, _ := json.Marshal(map[string]any{"v": 1, "type": "ping", "ts": time.Now().Unix()})
 				_ = write(frame)
 			case <-idle.C:
-				log.Printf("[acp-hub] host %s: no uplink for %s, dropping", hostID, hostReadTimeout)
+				log.Printf("[capri-hub] host %s: no uplink for %s, dropping", hostID, hostReadTimeout)
 				return
 			case <-ctx.Done():
 				return
@@ -710,7 +710,7 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 		Ready    bool            `json:"ready"`
 	}
 	if err := json.Unmarshal(data, &frame); err != nil {
-		log.Printf("[acp-hub] host %s bad frame: %v", hostID, err)
+		log.Printf("[capri-hub] host %s bad frame: %v", hostID, err)
 		return
 	}
 	switch frame.Type {
@@ -741,7 +741,7 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 			return
 		}
 		if !h.Respond(hostID, frame.ReqID, hub.RelayResponse{Status: frame.Status, Body: frame.Body}) {
-			log.Printf("[acp-hub] host %s respond unknown reqId %s", hostID, frame.ReqID)
+			log.Printf("[capri-hub] host %s respond unknown reqId %s", hostID, frame.ReqID)
 		}
 	case "ping":
 		pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
@@ -800,7 +800,7 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 			InsecureSkipVerify: true,
 		})
 		if err != nil {
-			log.Printf("[acp-hub] fe ws accept: %v", err)
+			log.Printf("[capri-hub] fe ws accept: %v", err)
 			return
 		}
 		conn.SetReadLimit(1 << 20)
@@ -1029,7 +1029,7 @@ func quicTLSConfig(allowSelfSigned bool) (*tls.Config, error) {
 	certFile := os.Getenv("QUIC_CERT")
 	keyFile := os.Getenv("QUIC_KEY")
 	// Shared ALPN so host clients can dial with the same protocol id.
-	const alpn = "acp-hub"
+	const alpn = "capri-hub"
 	if certFile != "" && keyFile != "" {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
@@ -1047,7 +1047,7 @@ func quicTLSConfig(allowSelfSigned bool) (*tls.Config, error) {
 	}
 	tmpl := x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      pkix.Name{CommonName: "acp-hub"},
+		Subject:      pkix.Name{CommonName: "capri-hub"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().AddDate(10, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -1082,7 +1082,7 @@ func serveQUIC(ln *quic.Listener, h *hub.Hub) {
 			if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "closed") {
 				return
 			}
-			log.Printf("[acp-hub] QUIC accept: %v", err)
+			log.Printf("[capri-hub] QUIC accept: %v", err)
 			continue
 		}
 		go serveQUICConn(conn, h)
@@ -1094,7 +1094,7 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	// whole hub; contain it and drop just this connection.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[acp-hub] quic conn panic recovered: %v", r)
+			log.Printf("[capri-hub] quic conn panic recovered: %v", r)
 			_ = conn.CloseWithError(1, "internal error")
 		}
 	}()
@@ -1174,7 +1174,7 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		return
 	}
 	defer stop()
-	log.Printf("[acp-hub] host %s connected (quic %s)", hostID, conn.RemoteAddr())
+	log.Printf("[capri-hub] host %s connected (quic %s)", hostID, conn.RemoteAddr())
 
 	// Idle detection aligned with the WS transport (hostReadTimeout):
 	// the read deadline is reset before every frame, so a host that
@@ -1191,7 +1191,7 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		// Superseded connection: drop the stale transport on its next
 		// frame (see the WS transport for the same guard).
 		if !h.IsCurrentConn(hostID, sc) {
-			log.Printf("[acp-hub] host %s: superseded quic connection dropped", hostID)
+			log.Printf("[capri-hub] host %s: superseded quic connection dropped", hostID)
 			return
 		}
 		handleHostFrame(h, hostID, data, wsafe)

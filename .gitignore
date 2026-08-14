@@ -1,5 +1,5 @@
 # Binaries (never commit built hub)
-/acp-hub
+/capri-hub
 acp-hub
 *.exe
 *.exe~
@@ -18,3 +18,4 @@ acp-hub
 !.vscode/extensions.json
 .idea
 .DS_Store
+/bin/

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-hub/internal/hub"
+	"github.com/AgentsHarness/capri-hub/internal/hub"
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 )
@@ -570,7 +570,7 @@ func TestIntegrationQUICHostAuthAndEvent(t *testing.T) {
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, udpAddr.String(), &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"acp-hub"},
+		NextProtos:         []string{"capri-hub"},
 	}, nil)
 	if err != nil {
 		t.Fatalf("quic dial: %v", err)

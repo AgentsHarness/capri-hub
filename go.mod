@@ -1,4 +1,4 @@
-module github.com/benin/acp-hub
+module github.com/AgentsHarness/capri-hub
 
 go 1.26.2
 
