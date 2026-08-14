@@ -204,7 +204,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // version is stamped at build time via
 // go build -ldflags "-X main.version=<git-sha>-<timestamp>".
 // Fallback below is used for plain `go run` / `go build`.
-var version = "0.1.3"
+var version = "0.1.5"
 
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
@@ -607,7 +607,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 		if err := writeHostHello(h, hostID, write); err != nil {
 			return
 		}
-		_, stop, err := h.ConnectStream(hostID, write)
+		sc, stop, err := h.ConnectStream(hostID, write)
 		if err != nil {
 			_ = conn.Close(websocket.StatusPolicyViolation, err.Error())
 			return
@@ -645,6 +645,14 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 			select {
 			case f := <-frames:
 				if f.err != nil {
+					return
+				}
+				// Superseded connection (host reconnected, or a second
+				// host process paired under the same hostId): its uplink
+				// must not interleave with the current connection's seq
+				// space — drop the stale transport on its next frame.
+				if !h.IsCurrentConn(hostID, sc) {
+					log.Printf("[acp-hub] host %s: superseded ws connection dropped", hostID)
 					return
 				}
 				if !idle.Stop() {
@@ -1161,7 +1169,7 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	if err := writeHostHello(h, hostID, wsafe); err != nil {
 		return
 	}
-	_, stop, err := h.ConnectStream(hostID, wsafe)
+	sc, stop, err := h.ConnectStream(hostID, wsafe)
 	if err != nil {
 		return
 	}
@@ -1179,6 +1187,12 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		data, err := readFrame()
 		if err != nil {
 			return // includes the silent read-timeout close
+		}
+		// Superseded connection: drop the stale transport on its next
+		// frame (see the WS transport for the same guard).
+		if !h.IsCurrentConn(hostID, sc) {
+			log.Printf("[acp-hub] host %s: superseded quic connection dropped", hostID)
+			return
 		}
 		handleHostFrame(h, hostID, data, wsafe)
 	}
