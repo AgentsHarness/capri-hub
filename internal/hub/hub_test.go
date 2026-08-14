@@ -1105,3 +1105,51 @@ func TestPrefsBroadcast(t *testing.T) {
 		t.Fatal("no prefs_changed broadcast received")
 	}
 }
+
+// TestIsCurrentConn: IsCurrentConn must track the live stream — false for
+// unknown hosts, disconnected conns, and superseded conns; a stale stop
+// must not revive an old conn.
+func TestIsCurrentConn(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+
+	// Unknown host / no live conn.
+	if h.IsCurrentConn("nope", &streamConn{}) {
+		t.Error("unknown host must not have a current conn")
+	}
+	if h.IsCurrentConn("h1", &streamConn{}) {
+		t.Error("host with no live conn must not have a current conn")
+	}
+	conn1, stop1, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.IsCurrentConn("h1", conn1) {
+		t.Error("live conn must be current")
+	}
+	if h.IsCurrentConn("h1", &streamConn{}) {
+		t.Error("unregistered conn must not be current")
+	}
+
+	stop1()
+	if h.IsCurrentConn("h1", conn1) {
+		t.Error("disconnected conn must not be current")
+	}
+
+	conn2, stop2, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop2()
+	if !h.IsCurrentConn("h1", conn2) {
+		t.Error("new conn must be current after supersede")
+	}
+	if h.IsCurrentConn("h1", conn1) {
+		t.Error("superseded conn must not be current")
+	}
+	// Stale stop must not revive conn1 as current.
+	stop1()
+	if !h.IsCurrentConn("h1", conn2) {
+		t.Error("stale stop must not affect the current conn")
+	}
+}

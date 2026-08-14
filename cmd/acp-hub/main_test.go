@@ -770,3 +770,164 @@ func TestHandleHostFrameSeqReset(t *testing.T) {
 		}
 	}
 }
+
+// A superseded host connection must stop feeding the hub: after a second
+// connection for the same hostId registers, events uplinked on the old
+// one are ignored (never fanned out to the FE) and the old transport is
+// dropped by the hub on its next frame.
+func TestIntegrationSupersededHostConnIgnoredAndDropped(t *testing.T) {
+	h := hub.NewWithDir("")
+	tickets := newFETicketStore()
+	lim := newPairLimiter()
+	const secret = "int-secret"
+	srv := httptest.NewServer(buildHandler(h, secret, tickets, lim, nil))
+	defer srv.Close()
+
+	// Pair host
+	code, _ := h.PairingCode()
+	pairBody, _ := json.Marshal(map[string]string{"code": code, "hostId": "h1", "hostName": "H1"})
+	resp, err := http.Post(srv.URL+"/api/pair", "application/json", bytes.NewReader(pairBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pairRes struct {
+		OK    bool   `json:"ok"`
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&pairRes)
+	resp.Body.Close()
+	if !pairRes.OK || pairRes.Token == "" {
+		t.Fatalf("pair: %+v", pairRes)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dialHost := func(name string) *websocket.Conn {
+		t.Helper()
+		c, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
+			HTTPHeader: http.Header{"Authorization": []string{"Bearer " + pairRes.Token}},
+		})
+		if err != nil {
+			t.Fatalf("%s dial: %v", name, err)
+		}
+		c.SetReadLimit(1 << 20)
+		_, raw, err := c.Read(ctx)
+		if err != nil {
+			t.Fatalf("%s hello: %v", name, err)
+		}
+		var hello map[string]any
+		if json.Unmarshal(raw, &hello) != nil || hello["type"] != "hello" {
+			t.Fatalf("%s hello frame = %s", name, raw)
+		}
+		return c
+	}
+
+	conn1 := dialHost("conn1")
+	defer conn1.Close(websocket.StatusNormalClosure, "")
+
+	// FE subscriber
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/ws-ticket", nil)
+	req.Header.Set("Authorization", "Bearer "+secret)
+	tr, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ticketRes struct {
+		Ticket string `json:"ticket"`
+	}
+	_ = json.NewDecoder(tr.Body).Decode(&ticketRes)
+	tr.Body.Close()
+	if ticketRes.Ticket == "" {
+		t.Fatal("empty ticket")
+	}
+	feConn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/fe?ticket="+ticketRes.Ticket, nil)
+	if err != nil {
+		t.Fatalf("fe ws dial: %v", err)
+	}
+	defer feConn.Close(websocket.StatusNormalClosure, "")
+	feConn.SetReadLimit(1 << 20)
+	_, feHello, err := feConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("fe hello: %v", err)
+	}
+	var feH map[string]any
+	if json.Unmarshal(feHello, &feH) != nil || feH["type"] != "hello" {
+		t.Fatalf("fe hello = %s", feHello)
+	}
+
+	sendEvents := func(c *websocket.Conn, seq int, text string) {
+		t.Helper()
+		frame, _ := json.Marshal(map[string]any{
+			"v": 1, "type": "events", "seqStart": seq,
+			"events": []map[string]any{{"type": "chunk", "text": text, "seq": seq}},
+		})
+		if err := c.Write(ctx, websocket.MessageText, frame); err != nil {
+			t.Fatalf("write seq %d: %v", seq, err)
+		}
+	}
+
+	// Collect FE chunk events until want is seen; assert never contains bad.
+	waitFEChunk := func(want, bad int, text string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			rctx, rcancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			_, raw, err := feConn.Read(rctx)
+			rcancel()
+			if err != nil {
+				continue
+			}
+			var frame map[string]any
+			if json.Unmarshal(raw, &frame) != nil {
+				continue
+			}
+			if frame["type"] != "events" {
+				continue
+			}
+			evs, _ := frame["events"].([]any)
+			for _, evAny := range evs {
+				ev, _ := evAny.(map[string]any)
+				if ev == nil || ev["type"] != "chunk" {
+					continue
+				}
+				seq, _ := ev["seq"].(float64)
+				if int(seq) == bad {
+					t.Fatalf("FE received event seq %d from superseded connection", bad)
+				}
+				if int(seq) == want && ev["text"] == text {
+					return
+				}
+			}
+		}
+		t.Fatalf("FE never received event seq %d (%s)", want, text)
+	}
+
+	// conn1 event seq 1 reaches the FE.
+	sendEvents(conn1, 1, "first")
+	waitFEChunk(1, -1, "first")
+
+	// conn2 supersedes conn1.
+	conn2 := dialHost("conn2")
+	defer conn2.Close(websocket.StatusNormalClosure, "")
+
+	// conn1 uplink after supersede: ignored, and the hub drops conn1.
+	sendEvents(conn1, 2, "stale")
+	// Drain buffered frames (e.g. a subscribers frame) until the hub's
+	// close arrives.
+	closed := false
+	drainDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(drainDeadline) && !closed {
+		rctx, rcancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		_, _, rerr := conn1.Read(rctx)
+		rcancel()
+		closed = rerr != nil
+	}
+	if !closed {
+		t.Error("hub should close the superseded connection")
+	}
+
+	// FE must never see seq 2; conn2's seq 3 must arrive.
+	sendEvents(conn2, 3, "fresh")
+	waitFEChunk(3, 2, "fresh")
+}

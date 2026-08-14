@@ -688,6 +688,20 @@ func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
 	})
 }
 
+// IsCurrentConn reports whether connID is the host's live stream.
+// Transport loops check it before processing each uplink frame: after a
+// reconnect — or a duplicate host process pairing under the same hostId
+// — the superseded connection must not keep feeding the hub, or its
+// events would interleave with the new connection's seq space (both
+// count from 1) and the stale-seq gate would drop events from whichever
+// arrives later. The stale transport drops itself on its next frame.
+func (h *Hub) IsCurrentConn(hostID string, conn *streamConn) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	return hs != nil && hs.conn == conn
+}
+
 // failPendingLocked closes and drops every pending request for hostID.
 // Caller must hold h.mu.
 func (h *Hub) failPendingLocked(hostID string) {
