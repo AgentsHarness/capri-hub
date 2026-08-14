@@ -1,9 +1,9 @@
-# acp-hub
+# capri-hub
 
 中心化中转服务器（relay）：多 Host 配对、注册与发现、事件聚合、请求中转。
 
 ```
-Browser (acp-fe) ──WS /ws/fe + HTTP /api/*──▶ acp-hub (:8787) ──QUIC(udp:8788) / WS /ws/host──▶ acp-host × N ──stdio──▶ grok
+Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub (:8787) ──QUIC(udp:8788) / WS /ws/host──▶ capri-host × N ──stdio──▶ grok
 ```
 
 Host 主动**出站**连接 Hub（适配 NAT，无需 Hub 能访问 Host）；优先 QUIC（UDP 8788，
@@ -80,7 +80,7 @@ QUIC_CERT=/etc/acp/fullchain.pem QUIC_KEY=/etc/acp/privkey.pem \
 
 ## API
 
-### 浏览器侧（acp-fe）
+### 浏览器侧（capri-fe）
 
 设置了 `FE_TOKEN` 时，下列接口均需携带访问 token（见上）。
 
@@ -116,7 +116,7 @@ QUIC_CERT=/etc/acp/fullchain.pem QUIC_KEY=/etc/acp/privkey.pem \
 - Host 断连后 **约 60s** 内仍保留事件缓冲，便于短断线时 `GET /api/events` 补拉；超时后丢弃。
 - 中转请求等待上限 45 分钟（对齐 Host 侧 30 分钟 prompt 超时）。
 - 事件扇出为尽力而为（慢消费者丢弃，订阅 buffer 512），浏览器通过 `/api/events` 与
-  `/api/session-updates` 重新水合，与 acp-host 本地模式一致。
+  `/api/session-updates` 重新水合，与 capri-host 本地模式一致。
 - **空闲省流量**：Hub 跟踪浏览器 `/ws/fe` 订阅数，经 Host WS 推送
   `{v:1,type:"subscribers",count:N}`（`hello` 也带 `subscribers`）。
   Host 在 `count==0` 时暂停 bridge 事件上报，仅保留约 15s 一次的
@@ -125,7 +125,7 @@ QUIC_CERT=/etc/acp/fullchain.pem QUIC_KEY=/etc/acp/privkey.pem \
 
 ## 本地单机开发
 
-前端直连 `acp-host` 即可，**不必**启动 Hub：
+前端直连 `capri-host` 即可，**不必**启动 Hub：
 
 ```bash
 # 终端 1
