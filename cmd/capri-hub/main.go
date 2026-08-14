@@ -204,7 +204,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // version is stamped at build time via
 // go build -ldflags "-X main.version=<git-sha>-<timestamp>".
 // Fallback below is used for plain `go run` / `go build`.
-var version = "0.2.0"
+var version = "dev"
 
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{

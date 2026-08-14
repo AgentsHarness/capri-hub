@@ -45,7 +45,7 @@ jobs:
           ext=""
           [ "$GOOS" = "windows" ] && ext=".exe"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/capri-hub-${GOOS}-${GOARCH}${ext}" ./cmd/capri-hub
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/capri-hub-${GOOS}-${GOARCH}${ext}" ./cmd/capri-hub
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
