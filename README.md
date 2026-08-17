@@ -32,6 +32,10 @@ Hub **不执行**任何命令，只做配对、发现和转发。
 
 只在一台机器上用？不必起 Hub，直接跑 [capri-host](https://github.com/AgentsHarness/capri-host) 即可。
 
+## 截图
+
+![Capri Hub 界面](docs/screenshot.png)
+
 ## 部署
 
 需要 Go 1.26+，或从 [Releases](https://github.com/AgentsHarness/capri-hub/releases) 下载二进制。
