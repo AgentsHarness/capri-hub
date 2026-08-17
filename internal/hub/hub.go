@@ -63,18 +63,25 @@ var (
 	ErrHostLimit = errors.New("已达 host 数量上限")
 )
 
+// FePrefs is the FE-side appearance preferences (e.g. scrollback toolcall
+// group folding). The hub stores and relays the map verbatim — it never
+// interprets keys/values, so the FE can extend it without a hub release.
+type FePrefs map[string]any
+
 // BrowserPrefs is the durable UI preferences for host conversations:
-// pinned workspaces (cwd paths), pinned sessions, and per-session todo
-// status ('todo' / 'completed'; absence = no record). The hub keeps ONE
-// such document (prefs.json) for all browsers; the FE mirrors it in
-// localStorage (offline cache) and writes it here (debounced) so
-// pins/todos survive browser data clearing. Records are keyed by
-// sessionId/cwd only — session ids are host-assigned UUIDs, so a doc is
-// effectively per host conversation without an explicit hostId scope.
+// pinned workspaces (cwd paths), pinned sessions, per-session todo
+// status ('todo' / 'completed'; absence = no record) and FE-side
+// appearance prefs (fePrefs). The hub keeps ONE such document
+// (prefs.json) for all browsers; the FE mirrors it in localStorage
+// (offline cache) and writes it here (debounced) so pins/todos survive
+// browser data clearing. Records are keyed by sessionId/cwd only — session
+// ids are host-assigned UUIDs, so a doc is effectively per host
+// conversation without an explicit hostId scope.
 type BrowserPrefs struct {
 	PinnedWorkspaces []string          `json:"pinnedWorkspaces"`
 	PinnedSessions   []string          `json:"pinnedSessions"`
 	Todos            map[string]string `json:"todos,omitempty"`
+	FePrefs          FePrefs           `json:"fePrefs,omitempty"`
 }
 
 // RelayError carries an HTTP status code for relay failures.
@@ -363,10 +370,15 @@ func clonePrefs(p BrowserPrefs) BrowserPrefs {
 	for k, v := range p.Todos {
 		todos[k] = v
 	}
+	fePrefs := make(FePrefs, len(p.FePrefs))
+	for k, v := range p.FePrefs {
+		fePrefs[k] = v
+	}
 	return sanitizePrefs(BrowserPrefs{
 		PinnedWorkspaces: append([]string(nil), p.PinnedWorkspaces...),
 		PinnedSessions:   append([]string(nil), p.PinnedSessions...),
 		Todos:            todos,
+		FePrefs:          fePrefs,
 	})
 }
 

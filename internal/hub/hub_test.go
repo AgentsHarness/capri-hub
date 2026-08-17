@@ -1039,6 +1039,7 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 		PinnedWorkspaces: []string{"/home/u/a", "/home/u/b"},
 		PinnedSessions:   []string{"s1"},
 		Todos:            map[string]string{"s1": "todo", "s2": "completed"},
+		FePrefs:          FePrefs{"collapseToolGroups": false},
 	}
 	if err := h.SetPrefs(doc); err != nil {
 		t.Fatalf("SetPrefs: %v", err)
@@ -1047,17 +1048,23 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 	if len(got.PinnedWorkspaces) != 2 || got.PinnedSessions[0] != "s1" || got.Todos["s2"] != "completed" {
 		t.Errorf("Prefs = %+v, want the stored doc", got)
 	}
+	if got.FePrefs["collapseToolGroups"] != false {
+		t.Errorf("Prefs.FePrefs = %+v, want collapseToolGroups=false", got.FePrefs)
+	}
 	// Returned docs must be deep copies: mutating one cannot touch the store.
 	got.PinnedWorkspaces[0] = "MUTATED"
 	got.Todos["s1"] = "completed"
+	got.FePrefs["collapseToolGroups"] = true
 	again := h.Prefs()
-	if again.PinnedWorkspaces[0] != "/home/u/a" || again.Todos["s1"] != "todo" {
+	if again.PinnedWorkspaces[0] != "/home/u/a" || again.Todos["s1"] != "todo" ||
+		again.FePrefs["collapseToolGroups"] != false {
 		t.Errorf("Prefs is not a deep copy: %+v", again)
 	}
 	// A fresh Hub on the same dir reloads the doc from prefs.json.
 	h2 := NewWithDir(dir)
 	reloaded := h2.Prefs()
-	if reloaded.PinnedWorkspaces[0] != "/home/u/a" || reloaded.Todos["s2"] != "completed" {
+	if reloaded.PinnedWorkspaces[0] != "/home/u/a" || reloaded.Todos["s2"] != "completed" ||
+		reloaded.FePrefs["collapseToolGroups"] != false {
 		t.Errorf("reloaded Prefs = %+v, want the persisted doc", reloaded)
 	}
 	// Replace semantics: SetPrefs overwrites the whole doc.
@@ -1067,6 +1074,9 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 	got = h.Prefs()
 	if len(got.PinnedWorkspaces) != 0 || len(got.Todos) != 0 || got.PinnedSessions[0] != "only" {
 		t.Errorf("Prefs after replace = %+v", got)
+	}
+	if len(got.FePrefs) != 0 {
+		t.Errorf("Prefs.FePrefs after replace = %+v, want empty", got.FePrefs)
 	}
 }
 
