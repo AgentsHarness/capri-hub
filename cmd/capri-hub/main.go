@@ -664,8 +664,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 				idle.Reset(hostReadTimeout)
 				handleHostFrame(h, hostID, f.data, write)
 			case <-ping.C:
-				frame, _ := json.Marshal(map[string]any{"v": 1, "type": "ping", "ts": time.Now().Unix()})
-				_ = write(frame)
+				_ = writeHostPing(h, write)
 			case <-idle.C:
 				log.Printf("[capri-hub] host %s: no uplink for %s, dropping", hostID, hostReadTimeout)
 				return
@@ -695,6 +694,25 @@ func writeHostHello(h *hub.Hub, hostID string, write func([]byte) error) error {
 		"seq":         h.LastSeq(hostID),
 	})
 	return write(hello)
+}
+
+// writeHostPing sends the hub→host liveness ping. It also RE-ASSERTS the
+// browser subscriber count: the count drives whether the host uploads
+// bridge events at all, and an edge-triggered `subscribers` frame can be
+// lost (write error, superseded connection) — which would leave the host
+// paused while a browser sits watching a frozen page. Piggy-backing the
+// absolute value on the ping makes the state self-healing within one ping
+// interval. `subsGen` lets the host discard an out-of-order delivery.
+func writeHostPing(h *hub.Hub, write func([]byte) error) error {
+	count, gen := h.SubscribersState()
+	frame, err := json.Marshal(map[string]any{
+		"v": 1, "type": "ping", "ts": time.Now().Unix(),
+		"subscribers": count, "subsGen": gen,
+	})
+	if err != nil {
+		return err
+	}
+	return write(frame)
 }
 
 // handleHostFrame processes one uplink frame from a host (events/respond/
@@ -995,7 +1013,7 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 			}
 			body = b
 		}
-		resp, err := h.Dispatch(hostID, r.Method, r.URL.Path, body)
+		resp, err := h.Dispatch(r.Context(), hostID, r.Method, r.URL.Path, body)
 		if err != nil {
 			var re *hub.RelayError
 			if errors.As(err, &re) {
@@ -1175,6 +1193,28 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	}
 	defer stop()
 	log.Printf("[capri-hub] host %s connected (quic %s)", hostID, conn.RemoteAddr())
+
+	// Hub→host ping loop. The WebSocket transport has always had one; QUIC
+	// did not, so this connection had no hub-side liveness probe and — more
+	// importantly — no periodic re-assert of the browser subscriber count
+	// (see writeHostPing), leaving a lost `subscribers` frame uncorrected
+	// for the life of the connection.
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		t := time.NewTicker(hostPingInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-pingDone:
+				return
+			case <-t.C:
+				if err := writeHostPing(h, wsafe); err != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	// Idle detection aligned with the WS transport (hostReadTimeout):
 	// the read deadline is reset before every frame, so a host that

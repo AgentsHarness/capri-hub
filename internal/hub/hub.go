@@ -39,6 +39,11 @@ const (
 	RelayTimeout = 45 * time.Minute
 	// eventBufCap bounds per-host buffered events for gap-pull.
 	eventBufCap = 4000
+	// evBufHighWater is where RegisterEvent compacts the buffer back down
+	// to eventBufCap. Compacting on every overflow instead would copy the
+	// whole buffer per event (see RegisterEvent); the slack makes it
+	// amortized O(1) at the cost of at most 2× the buffer.
+	evBufHighWater = 2 * eventBufCap
 	// MaxHosts caps the registry so unbounded pair spam cannot grow
 	// memory / hub.json without limit.
 	MaxHosts = 256
@@ -166,6 +171,12 @@ type Hub struct {
 
 	nextReq    atomic.Int64
 	nextConnID atomic.Int64
+	// subsGen stamps every subscriber-count frame so hosts can discard an
+	// out-of-order delivery (see notifyHostsSubscribers).
+	subsGen atomic.Uint64
+	// lastNotifiedSubs is the count carried by the last notification
+	// (nil = never notified), used to skip no-op resends.
+	lastNotifiedSubs *int
 
 	dataFile string
 	// prefsFile holds the browser prefs document (prefs.json, sibling of
@@ -833,13 +844,21 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 		cp["seq"] = hs.seq
 	}
 	hs.evBuf = append(hs.evBuf, cp)
-	if len(hs.evBuf) > eventBufCap {
-		// Copy into a fresh slice so the discarded prefix (and its Event
-		// maps) are not retained by the underlying array — a plain reslice
-		// would pin up to eventBufCap extra events until the next realloc.
-		n := eventBufCap
-		trimmed := make([]Event, n)
-		copy(trimmed, hs.evBuf[len(hs.evBuf)-n:])
+	if len(hs.evBuf) > evBufHighWater {
+		// Amortized compaction. A naive "trim to eventBufCap on every
+		// overflow" reallocates an eventBufCap-element slice and copies
+		// it PER EVENT once the buffer is full — 4000 pointer copies plus
+		// a ~32KB allocation for every chunk event, all while holding the
+		// global h.mu, which serializes the entire hub behind a memcpy
+		// during a streaming turn. Compacting only at the high-water mark
+		// makes the copy amortized O(1) per event (one copy per
+		// eventBufCap events) at the cost of bounded extra memory.
+		//
+		// The copy itself (rather than a plain reslice) is still required:
+		// a reslice keeps the whole backing array — and every dropped
+		// Event map in it — reachable until the next append reallocates.
+		trimmed := make([]Event, eventBufCap, evBufHighWater)
+		copy(trimmed, hs.evBuf[len(hs.evBuf)-eventBufCap:])
 		hs.evBuf = trimmed
 	}
 	// Back-compat: old hosts still send host_status inside events frames.
@@ -884,23 +903,40 @@ func (h *Hub) SeqByHost() map[string]uint64 {
 func (h *Hub) EventsAfter(hostID string, after uint64) []Event {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if hs := h.hosts[hostID]; hs != nil {
-		out := make([]Event, 0, 8)
-		for _, ev := range hs.evBuf {
-			if evSeq(ev) > after {
-				out = append(out, ev)
-			}
-		}
-		return out
+	hs := h.hosts[hostID]
+	if hs == nil {
+		return nil
 	}
-	return nil
+	// evBuf is append-only in strictly increasing seq order (RegisterEvent
+	// drops anything <= the watermark), so the cut point can be found by
+	// binary search instead of scanning up to evBufHighWater events under
+	// the global lock on every reconnect gap-pull.
+	i := sort.Search(len(hs.evBuf), func(i int) bool {
+		return evSeq(hs.evBuf[i]) > after
+	})
+	if i >= len(hs.evBuf) {
+		return nil
+	}
+	out := make([]Event, len(hs.evBuf)-i)
+	copy(out, hs.evBuf[i:])
+	return out
 }
 
 // ── request relay ─────────────────────────────────────────────────────
 
 // Dispatch relays a browser request to a host and waits for its answer.
 // The host must have a live stream; otherwise a *RelayError is returned.
-func (h *Hub) Dispatch(hostID, method, path string, body json.RawMessage) (RelayResponse, error) {
+//
+// ctx is the BROWSER's request context. When it is cancelled (tab closed,
+// navigation, mobile network drop) the wait is abandoned and the pending
+// slot freed immediately. Without that, an abandoned request pinned a
+// goroutine, a pending map entry and a 45-minute timer (RelayTimeout) for
+// the full timeout — a flaky client retrying prompts accumulates them until
+// the hub runs out of room. Cancelling the WAIT deliberately does NOT
+// cancel the host-side work: the prompt keeps running on the agent (that is
+// the point of the server-authoritative design) and its output still
+// reaches browsers over the event stream.
+func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body json.RawMessage) (RelayResponse, error) {
 	reqID := fmt.Sprintf("%d", h.nextReq.Add(1))
 
 	h.mu.Lock()
@@ -946,6 +982,11 @@ func (h *Hub) Dispatch(hostID, method, path string, body json.RawMessage) (Relay
 		return resp, nil
 	case <-pr.done:
 		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
+	case <-ctx.Done():
+		// Browser gone: stop waiting and release the pending slot. The host
+		// keeps executing; its late respond simply finds no pending entry.
+		h.dropPending(hostID, reqID)
+		return RelayResponse{}, &RelayError{Status: 499, Message: "客户端已取消"}
 	case <-timer.C:
 		h.dropPending(hostID, reqID)
 		return RelayResponse{}, &RelayError{Status: 504, Message: "中继超时"}
@@ -1084,13 +1125,33 @@ func (h *Hub) SubscriberCount() int {
 	return len(h.subscribers)
 }
 
-// notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N} to every
-// online host WebSocket. Hosts use count==0 to stop uploading bridge events
-// (they still send host_status heartbeats). Writes run outside h.mu so a
-// slow host cannot stall the hub lock.
+// notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N, gen:G} to
+// every online host WebSocket. Hosts use count==0 to stop uploading bridge
+// events (they still send host_status heartbeats). Writes run outside h.mu so
+// a slow host cannot stall the hub lock.
+//
+// `gen` is a hub-monotonic generation stamp and it is load-bearing: the
+// frames are ABSOLUTE state, they are written from one fire-and-forget
+// goroutine per host, and a slow write can therefore deliver them OUT OF
+// ORDER. Without the stamp a browser refresh (unsubscribe → count 0,
+// resubscribe → count 1, microseconds apart) can land as 1 then 0, leaving
+// the host convinced nobody is watching: it stops uploading bridge events
+// while host_status heartbeats keep it "online", so the freshly reloaded
+// page shows a live-looking but permanently frozen session. Hosts keep the
+// highest gen seen and ignore anything older.
+//
+// A count that has not changed since the last notification is not resent
+// (browser churn on a multi-tab hub is otherwise a per-host write storm);
+// a lost frame is repaired by the periodic re-assert on the host ping.
 func (h *Hub) notifyHostsSubscribers() {
 	h.mu.Lock()
 	count := len(h.subscribers)
+	if h.lastNotifiedSubs != nil && *h.lastNotifiedSubs == count {
+		h.mu.Unlock()
+		return
+	}
+	h.lastNotifiedSubs = &count
+	gen := h.subsGen.Add(1)
 	writes := make([]func([]byte) error, 0, len(h.hosts))
 	for _, hs := range h.hosts {
 		if hs.conn != nil {
@@ -1101,19 +1162,33 @@ func (h *Hub) notifyHostsSubscribers() {
 	if len(writes) == 0 {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{"v": 1, "type": "subscribers", "count": count})
+	payload, err := json.Marshal(map[string]any{
+		"v": 1, "type": "subscribers", "count": count, "gen": gen,
+	})
 	if err != nil {
 		return
 	}
 	// Fire-and-forget per host: writes carry a multi-second timeout each,
 	// so one half-open host must not stall the caller (subscribe /
-	// unsubscribe) — the count frames are absolute notifications, a
-	// briefly delayed one is harmless.
+	// unsubscribe). Ordering across goroutines is handled by `gen`.
 	for _, write := range writes {
 		go func(w func([]byte) error) {
 			_ = w(payload)
 		}(write)
 	}
+}
+
+// SubscribersState returns the live browser subscriber count together with
+// a fresh monotonic generation stamp, for transports that re-assert the
+// count on their periodic host ping. Re-asserting makes the subscriber
+// count self-healing: a `subscribers` frame lost to a write error or a
+// superseded connection is corrected within one ping interval instead of
+// leaving the host paused until the next browser connect/disconnect.
+func (h *Hub) SubscribersState() (count int, gen uint64) {
+	h.mu.Lock()
+	count = len(h.subscribers)
+	h.mu.Unlock()
+	return count, h.subsGen.Add(1)
 }
 
 // Broadcast fans an event out to browser subscribers (drops for slow

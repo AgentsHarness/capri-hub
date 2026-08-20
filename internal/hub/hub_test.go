@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -239,7 +240,7 @@ func TestConnectStreamSupersedeFailsPending(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := h.Dispatch("h1", "GET", "/api/status", nil)
+		_, err := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
 		done <- err
 	}()
 	select {
@@ -327,28 +328,213 @@ func TestMaxHosts(t *testing.T) {
 func TestEvBufTrimCopies(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
-	// Overflow the buffer; after trim, len must equal cap and equal eventBufCap
-	// (fresh backing array — not a reslice that pins a larger array).
-	for i := 1; i <= eventBufCap+10; i++ {
+	// The buffer compacts at evBufHighWater (amortized: compacting on
+	// every overflow would copy the whole buffer per event under h.mu).
+	// Invariants: it never grows past the high-water mark, and each
+	// compaction produces a FRESH array — never a reslice, which would
+	// pin the dropped Event maps until the next reallocation.
+	total := evBufHighWater + 10
+	for i := 1; i <= total; i++ {
 		if !h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)}) {
 			t.Fatalf("register %d", i)
+		}
+		h.mu.Lock()
+		n := len(h.hosts["h1"].evBuf)
+		h.mu.Unlock()
+		if n > evBufHighWater {
+			t.Fatalf("evBuf len = %d after %d events, must stay <= %d", n, i, evBufHighWater)
 		}
 	}
 	h.mu.Lock()
 	buf := h.hosts["h1"].evBuf
 	h.mu.Unlock()
-	if len(buf) != eventBufCap {
-		t.Fatalf("len = %d, want %d", len(buf), eventBufCap)
+	// Compaction ran at event evBufHighWater+1, leaving eventBufCap
+	// entries; the remaining events appended into the spare capacity.
+	wantLen := eventBufCap + (total - evBufHighWater - 1)
+	if len(buf) != wantLen {
+		t.Fatalf("len = %d, want %d", len(buf), wantLen)
 	}
-	if cap(buf) != eventBufCap {
-		t.Errorf("cap = %d, want %d (trimmed copy, not reslice of larger array)", cap(buf), eventBufCap)
+	if cap(buf) != evBufHighWater {
+		t.Errorf("cap = %d, want %d (fresh compacted array, not a reslice)", cap(buf), evBufHighWater)
 	}
-	// Oldest kept seq is (eventBufCap+10) - eventBufCap + 1 = 11
-	if got := evSeq(buf[0]); got != 11 {
-		t.Errorf("first buffered seq = %d, want 11", got)
+	wantFirst := uint64(evBufHighWater + 1 - eventBufCap + 1)
+	if got := evSeq(buf[0]); got != wantFirst {
+		t.Errorf("first buffered seq = %d, want %d", got, wantFirst)
 	}
-	if got := evSeq(buf[len(buf)-1]); got != uint64(eventBufCap+10) {
-		t.Errorf("last buffered seq = %d, want %d", got, eventBufCap+10)
+	if got := evSeq(buf[len(buf)-1]); got != uint64(total) {
+		t.Errorf("last buffered seq = %d, want %d", got, total)
+	}
+	// EventsAfter (binary search over the compacted buffer) must agree.
+	if evs := h.EventsAfter("h1", uint64(total-3)); len(evs) != 3 {
+		t.Errorf("EventsAfter(total-3) = %d events, want 3", len(evs))
+	}
+	if evs := h.EventsAfter("h1", uint64(total)); len(evs) != 0 {
+		t.Errorf("EventsAfter(total) = %d events, want 0", len(evs))
+	}
+	if evs := h.EventsAfter("h1", 0); len(evs) != wantLen {
+		t.Errorf("EventsAfter(0) = %d events, want %d (whole buffer)", len(evs), wantLen)
+	}
+}
+
+// TestEventsAfterBinarySearch pins the gap-pull cut point at every
+// boundary: EventsAfter is the reconnect catch-up path, so an off-by-one
+// there either re-delivers a seen event or silently loses one.
+func TestEventsAfterBinarySearch(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	for i := 1; i <= 10; i++ {
+		h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+	}
+	for after := uint64(0); after <= 11; after++ {
+		evs := h.EventsAfter("h1", after)
+		want := 0
+		if after < 10 {
+			want = int(10 - after)
+		}
+		if len(evs) != want {
+			t.Fatalf("EventsAfter(%d) = %d events, want %d", after, len(evs), want)
+		}
+		for i, ev := range evs {
+			if got, exp := evSeq(ev), after+uint64(i)+1; got != exp {
+				t.Fatalf("EventsAfter(%d)[%d] seq = %d, want %d", after, i, got, exp)
+			}
+		}
+	}
+	if evs := h.EventsAfter("nope", 0); evs != nil {
+		t.Errorf("EventsAfter for unknown host = %v, want nil", evs)
+	}
+}
+
+// TestSubscribersGenMonotonic guards the ordering stamp that keeps a host
+// from acting on a stale subscriber count (see notifyHostsSubscribers): a
+// browser refresh delivers count 0 and count 1 microseconds apart from two
+// separate goroutines, and applying them out of order silently pauses the
+// host's event upload while the page sits there looking connected.
+func TestSubscribersGenMonotonic(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+
+	var mu sync.Mutex
+	var frames [][]byte
+	_, stop, err := h.ConnectStream("h1", func(p []byte) error {
+		mu.Lock()
+		frames = append(frames, append([]byte(nil), p...))
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer stop()
+
+	_, un1 := h.Subscribe()
+	_, un2 := h.Subscribe()
+	un2()
+	un1()
+
+	countSubs := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, f := range frames {
+			var m map[string]any
+			if json.Unmarshal(f, &m) == nil && m["type"] == "subscribers" {
+				n++
+			}
+		}
+		return n
+	}
+	// Counts change 1→2→1→0, so four notifications are expected. Wait for
+	// all of them: stopping early would leave the terminal count=0 frame in
+	// flight and make the "highest gen wins" assertion below racy.
+	const wantFrames = 4
+	deadline := time.Now().Add(5 * time.Second)
+	for countSubs() < wantFrames && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Frames are written from one goroutine per host, so they genuinely DO
+	// arrive out of order — that is the bug `gen` exists for, so this test
+	// must not assert write ordering. What must hold is that every frame is
+	// stamped, stamps are unique, and the HIGHEST stamp carries the true
+	// final count: a host that keeps the highest gen therefore converges to
+	// the real state no matter how the frames were interleaved.
+	seenGen := map[float64]bool{}
+	var maxGen float64
+	maxGenCount := -1.0
+	for _, f := range frames {
+		var m map[string]any
+		if json.Unmarshal(f, &m) != nil || m["type"] != "subscribers" {
+			continue
+		}
+		gen, ok := m["gen"].(float64)
+		if !ok {
+			t.Fatalf("subscribers frame missing gen: %s", f)
+		}
+		if seenGen[gen] {
+			t.Fatalf("duplicate gen %v — stamps must be unique: %s", gen, f)
+		}
+		seenGen[gen] = true
+		count, ok := m["count"].(float64)
+		if !ok {
+			t.Fatalf("subscribers frame missing count: %s", f)
+		}
+		if gen > maxGen {
+			maxGen, maxGenCount = gen, count
+		}
+	}
+	if len(seenGen) < wantFrames {
+		t.Fatalf("expected %d subscribers frames for the 0→1→2→1→0 churn, got %d", wantFrames, len(seenGen))
+	}
+	if maxGenCount != 0 {
+		t.Fatalf("highest gen (%v) carries count=%v, want 0 — a gen-gating host "+
+			"would converge to the wrong subscriber state", maxGen, maxGenCount)
+	}
+	// SubscribersState (the ping re-assert path) shares the counter, so a
+	// re-assert can never be mistaken for a stale frame.
+	c, g1 := h.SubscribersState()
+	if c != 0 {
+		t.Errorf("count = %d, want 0 after all unsubscribes", c)
+	}
+	_, g2 := h.SubscribersState()
+	if float64(g1) <= maxGen || g2 <= g1 {
+		t.Errorf("SubscribersState gens must continue the sequence: %d, %d after %v", g1, g2, maxGen)
+	}
+}
+
+// TestSubscribersNoRedundantNotify: an unchanged count is not re-broadcast
+// (multi-tab churn would otherwise be a per-host write storm).
+func TestSubscribersNoRedundantNotify(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	var mu sync.Mutex
+	subsFrames := 0
+	_, stop, err := h.ConnectStream("h1", func(p []byte) error {
+		var m map[string]any
+		if json.Unmarshal(p, &m) == nil && m["type"] == "subscribers" {
+			mu.Lock()
+			subsFrames++
+			mu.Unlock()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer stop()
+	// Counts go 1,2,1,0 — four genuine changes, so at most four frames.
+	_, un1 := h.Subscribe()
+	_, un2 := h.Subscribe()
+	un2()
+	un1()
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	got := subsFrames
+	mu.Unlock()
+	if got > 4 {
+		t.Errorf("got %d subscribers frames for 4 count changes — redundant notifies", got)
 	}
 }
 
@@ -432,7 +618,7 @@ func TestDispatchAndRespond(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		resp, err := h.Dispatch("h1", "POST", "/api/prompt", body)
+		resp, err := h.Dispatch(context.Background(), "h1", "POST", "/api/prompt", body)
 		done <- result{resp, err}
 	}()
 
@@ -461,12 +647,12 @@ func TestDispatchAndRespond(t *testing.T) {
 func TestDispatchOffline(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-	_, err := h.Dispatch("h1", "POST", "/api/prompt", nil)
+	_, err := h.Dispatch(context.Background(), "h1", "POST", "/api/prompt", nil)
 	var re *RelayError
 	if !errors.As(err, &re) || re.Status != 503 {
 		t.Errorf("offline dispatch err = %v, want RelayError 503", err)
 	}
-	if _, err := h.Dispatch("nope", "POST", "/api/prompt", nil); !errors.As(err, &re) || re.Status != 404 {
+	if _, err := h.Dispatch(context.Background(), "nope", "POST", "/api/prompt", nil); !errors.As(err, &re) || re.Status != 404 {
 		t.Errorf("unknown host dispatch err = %v, want 404", err)
 	}
 }
@@ -485,7 +671,7 @@ func TestDispatchFailsOnDisconnect(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		resp, err := h.Dispatch("h1", "GET", "/api/status", nil)
+		resp, err := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
 		done <- result{resp, err}
 	}()
 	time.Sleep(50 * time.Millisecond) // let the request register
@@ -1161,5 +1347,69 @@ func TestIsCurrentConn(t *testing.T) {
 	stop1()
 	if !h.IsCurrentConn("h1", conn2) {
 		t.Error("stale stop must not affect the current conn")
+	}
+}
+
+// TestDispatchAbandonedByBrowser: when the browser's request context is
+// cancelled the relay must stop waiting AND free the pending slot. Before
+// this, an abandoned request (closed tab, mobile network drop) pinned a
+// goroutine, a pending entry and a RelayTimeout-long (45 min) timer, so a
+// client retrying prompts steadily accumulated them.
+func TestDispatchAbandonedByBrowser(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	// A host that accepts the request and never answers.
+	_, stop, err := h.ConnectStream("h1", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, e := h.Dispatch(ctx, "h1", "POST", "/api/prompt", nil)
+		done <- e
+	}()
+
+	// Wait for the request to be registered as pending.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.mu.Lock()
+		n := len(h.pending["h1"])
+		h.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("request never became pending")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	cancel() // browser goes away
+	select {
+	case e := <-done:
+		var re *RelayError
+		if !errors.As(e, &re) || re.Status != 499 {
+			t.Fatalf("err = %v, want *RelayError{Status:499}", e)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Dispatch kept waiting after the browser cancelled — it would hold the slot for RelayTimeout")
+	}
+
+	// The pending slot must be gone, not left for the 45-minute timer.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		h.mu.Lock()
+		n := len(h.pending["h1"])
+		h.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending entry leaked after cancellation (%d left)", n)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
