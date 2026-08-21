@@ -612,12 +612,18 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 			return conn.Write(ctx, websocket.MessageText, payload)
 		}
 
+		// Uplink flate negotiation (T2): the host asks for compression with
+		// the X-Hub-Deflate: 1 header (or ?deflate=1); the hello echoes
+		// "deflate":true to confirm. Only then may the host send
+		// compressed (binary) frames. See internal/hub/PROTOCOL.md.
+		upDeflate := r.Header.Get("X-Hub-Deflate") == "1" || r.URL.Query().Get("deflate") == "1"
+
 		// hello must reach the host BEFORE ConnectStream registers it:
 		// once registered, Dispatch may push a relayed request into the
 		// stream, and a host that has not acked hello yet would miss it.
 		// hello carries the subscriber count, so the host is never blind
 		// to subscriber state either.
-		if err := writeHostHello(h, hostID, write); err != nil {
+		if err := writeHostHello(h, hostID, upDeflate, write); err != nil {
 			return
 		}
 		sc, stop, err := h.ConnectStream(hostID, write)
@@ -634,13 +640,27 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 		defer cancelRead()
 		go func() {
 			for {
-				_, data, err := conn.Read(readCtx)
+				typ, data, err := conn.Read(readCtx)
 				if err != nil {
 					select {
 					case frames <- hostReadFrame{err: err}:
 					case <-readCtx.Done():
 					}
 					return
+				}
+				// WS wire rule (PROTOCOL.md): a BINARY message is one
+				// raw-deflate stream of the JSON frame; TEXT is bare JSON.
+				if typ == websocket.MessageBinary {
+					if !upDeflate {
+						log.Printf("[capri-hub] host %s: binary frame without deflate negotiation, dropping", hostID)
+						continue
+					}
+					inflated, err := inflateUplink(data)
+					if err != nil {
+						log.Printf("[capri-hub] host %s: uplink inflate: %v", hostID, err)
+						continue
+					}
+					data = inflated
 				}
 				select {
 				case frames <- hostReadFrame{data: data}:
@@ -697,16 +717,52 @@ type hostReadFrame struct {
 
 // writeHostHello sends the hub hello (subscribers + last host seq) down a
 // host transport. seq lets a reconnecting host resume events it buffered
-// while offline.
-func writeHostHello(h *hub.Hub, hostID string, write func([]byte) error) error {
-	hello, _ := json.Marshal(map[string]any{
+// while offline. When the host requested uplink flate compression
+// (QUIC auth frame / WS handshake, see internal/hub/PROTOCOL.md), the
+// hello echoes "deflate":true — the host may only start compressing
+// uplink frames after seeing the echo.
+func writeHostHello(h *hub.Hub, hostID string, deflate bool, write func([]byte) error) error {
+	hello := map[string]any{
 		"v":           1,
 		"type":        "hello",
 		"service":     "hub",
 		"subscribers": h.SubscriberCount(),
 		"seq":         h.LastSeq(hostID),
-	})
-	return write(hello)
+	}
+	if deflate {
+		hello["deflate"] = true
+	}
+	b, err := json.Marshal(hello)
+	if err != nil {
+		return err
+	}
+	return write(b)
+}
+
+// ── host→hub uplink flate compression (T2) ───────────────────────────
+//
+// Negotiation and wire format are specified byte-precisely in
+// internal/hub/PROTOCOL.md. Hub side: frames arrive either as bare JSON
+// (WS text message / QUIC length prefix without the flag bit) or as one
+// raw-deflate stream of the JSON payload (WS binary message / QUIC
+// length prefix with the top bit set). Payloads below
+// uplinkMinCompressSize are never compressed by the host, but the hub
+// accepts any flagged frame regardless of size.
+
+// uplinkCompressedFlag is bit 31 of the QUIC 4-byte length prefix,
+// marking the frame body as a raw-deflate stream.
+const uplinkCompressedFlag = 1 << 31
+
+// parseUplinkLen splits a QUIC uplink length prefix into the true frame
+// length and the compressed flag (top bit).
+func parseUplinkLen(n uint32) (length uint32, compressed bool) {
+	return n &^ uplinkCompressedFlag, n&uplinkCompressedFlag != 0
+}
+
+// inflateUplink decompresses one raw-deflate uplink payload back into the
+// original JSON frame bytes.
+func inflateUplink(b []byte) ([]byte, error) {
+	return io.ReadAll(flate.NewReader(bytes.NewReader(b)))
 }
 
 // writeHostPing sends the hub→host liveness ping. It also RE-ASSERTS the
@@ -1168,13 +1224,21 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
 			return nil, err
 		}
-		n := binary.BigEndian.Uint32(lenBuf[:])
+		// QUIC wire rule (PROTOCOL.md): bit 31 of the length prefix marks
+		// the body as one raw-deflate stream; the low 31 bits carry the
+		// (compressed) body length.
+		n, compressed := parseUplinkLen(binary.BigEndian.Uint32(lenBuf[:]))
 		if n > 32<<20 {
 			return nil, fmt.Errorf("frame too large: %d", n)
 		}
 		buf := make([]byte, n)
-		_, err := io.ReadFull(stream, buf)
-		return buf, err
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			return nil, err
+		}
+		if !compressed {
+			return buf, nil
+		}
+		return inflateUplink(buf)
 	}
 	// Match WS hostWriteTimeout: a half-open peer must not block writes
 	// (and thus writeMu / notifyHostsSubscribers goroutines) forever.
@@ -1197,8 +1261,9 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		return
 	}
 	var auth struct {
-		Type  string `json:"type"`
-		Token string `json:"token"`
+		Type    string `json:"type"`
+		Token   string `json:"token"`
+		Deflate bool   `json:"deflate"`
 	}
 	if json.Unmarshal(data, &auth) != nil || auth.Type != "auth" || auth.Token == "" {
 		_ = write([]byte(`{"v":1,"type":"auth_error","error":"missing auth"}`))
@@ -1209,6 +1274,9 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 		_ = write([]byte(`{"v":1,"type":"auth_error","error":"token 无效"}`))
 		return
 	}
+	// Uplink flate negotiation (T2): confirmed via the hello echo; until
+	// then the host must send bare JSON. See internal/hub/PROTOCOL.md.
+	upDeflate := auth.Deflate
 
 	var writeMu sync.Mutex
 	wsafe := func(payload []byte) error {
@@ -1220,7 +1288,7 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	// hello before ConnectStream registration: a relayed request must
 	// never be pushed into a stream the host has not acked yet (see
 	// handleHostWS for the same ordering on the WebSocket transport).
-	if err := writeHostHello(h, hostID, wsafe); err != nil {
+	if err := writeHostHello(h, hostID, upDeflate, wsafe); err != nil {
 		return
 	}
 	sc, stop, err := h.ConnectStream(hostID, wsafe)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -998,4 +999,247 @@ func TestPairConstantTimeCompareIsValueExact(t *testing.T) {
 	if _, err := h2.Pair(string(runes), "h1", "H1"); err == nil {
 		t.Error("near-miss code must be rejected")
 	}
+}
+
+// TestUplinkDeflateWSRoundtrip: a host that negotiates uplink deflate
+// (X-Hub-Deflate: 1) gets "deflate":true echoed in hello and may send
+// flate-compressed binary frames; the hub inflates them and fans the
+// events out as usual. Without negotiation, binary frames are dropped.
+func TestUplinkDeflateWSRoundtrip(t *testing.T) {
+	h := hub.NewWithDir("")
+	tickets := newFETicketStore()
+	lim := newPairLimiter()
+	srv := httptest.NewServer(buildHandler(h, "", tickets, lim, nil))
+	defer srv.Close()
+	code, _ := h.PairingCode()
+	tok, err := h.Pair(code, "h1", "H1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dial := func(header http.Header) *websocket.Conn {
+		conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{HTTPHeader: header})
+		if err != nil {
+			t.Fatalf("host ws dial: %v", err)
+		}
+		conn.SetReadLimit(1 << 20)
+		return conn
+	}
+
+	feCh, feUnsub := h.Subscribe()
+	defer feUnsub()
+
+	// Negotiated connection.
+	conn := dial(http.Header{
+		"Authorization": []string{"Bearer " + tok},
+		"X-Hub-Deflate": []string{"1"},
+	})
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	_, helloRaw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hello map[string]any
+	if json.Unmarshal(helloRaw, &hello) != nil {
+		t.Fatalf("hello = %s", helloRaw)
+	}
+	if hello["deflate"] != true {
+		t.Fatalf("hello must echo deflate:true, got %s", helloRaw)
+	}
+	waitChunk := func(want string) {
+		deadline := time.After(3 * time.Second)
+		for {
+			select {
+			case ev := <-feCh:
+				if typ, _ := ev["type"].(string); typ == "chunk" {
+					wire, _ := hub.MarshalEvent(ev)
+					var m map[string]any
+					_ = json.Unmarshal(wire, &m)
+					if m["text"] == want {
+						return
+					}
+				}
+			case <-deadline:
+				t.Fatalf("event %q not fanned out", want)
+			}
+		}
+	}
+
+	// flate-compressed events frame as a BINARY message.
+	payload := []byte(`{"v":1,"type":"events","seqStart":1,"events":[{"type":"chunk","text":"deflated","seq":1}]}`)
+	var buf bytes.Buffer
+	fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
+	fw.Write(payload)
+	fw.Close()
+	if err := conn.Write(ctx, websocket.MessageBinary, buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	waitChunk("deflated")
+
+	// Below-threshold / plain text frames still work alongside.
+	plain := []byte(`{"v":1,"type":"events","seqStart":2,"events":[{"type":"chunk","text":"plain","seq":2}]}`)
+	if err := conn.Write(ctx, websocket.MessageText, plain); err != nil {
+		t.Fatal(err)
+	}
+	waitChunk("plain")
+
+	// Un-negotiated connection: hello must NOT echo deflate, and binary
+	// frames are dropped (backward compat: bare JSON only).
+	conn2 := dial(http.Header{"Authorization": []string{"Bearer " + tok}})
+	defer conn2.Close(websocket.StatusNormalClosure, "")
+	_, hello2Raw, err := conn2.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(hello2Raw, []byte(`"deflate"`)) {
+		t.Fatalf("un-negotiated hello must not mention deflate: %s", hello2Raw)
+	}
+	var buf2 bytes.Buffer
+	fw2, _ := flate.NewWriter(&buf2, flate.BestSpeed)
+	fw2.Write([]byte(`{"v":1,"type":"events","seqStart":3,"events":[{"type":"chunk","text":"sneaky","seq":3}]}`))
+	fw2.Close()
+	if err := conn2.Write(ctx, websocket.MessageBinary, buf2.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-feCh:
+		if typ, _ := ev["type"].(string); typ == "chunk" {
+			wire, _ := hub.MarshalEvent(ev)
+			if bytes.Contains(wire, []byte("sneaky")) {
+				t.Fatal("un-negotiated compressed frame must be dropped")
+			}
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestUplinkParseLenFlag: the QUIC length prefix reserves bit 31 as the
+// deflate flag; lengths round-trip through parseUplinkLen.
+func TestUplinkParseLenFlag(t *testing.T) {
+	for _, n := range []uint32{0, 1, 255, 256, 1 << 20, 32<<20 - 1, 0x7FFFFFFF} {
+		prefixed := n | uplinkCompressedFlag
+		got, compressed := parseUplinkLen(prefixed)
+		if got != n || !compressed {
+			t.Errorf("parseUplinkLen(%d|flag) = %d,%v want %d,true", n, got, compressed, n)
+		}
+		got, compressed = parseUplinkLen(n)
+		if got != n || compressed {
+			t.Errorf("parseUplinkLen(%d) = %d,%v want %d,false", n, got, compressed, n)
+		}
+	}
+}
+
+// TestIntegrationQUICUplinkDeflate: QUIC auth with "deflate":true is
+// confirmed by the hello echo; a compressed events frame (length-prefix
+// bit 31 set, raw-deflate body) is inflated and registered, and a plain
+// frame still works alongside.
+func TestIntegrationQUICUplinkDeflate(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	tok, err := h.Pair(code, "qh2", "QH2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsConf, err := quicTLSConfig(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := quic.ListenAddr("127.0.0.1:0", tlsConf, &quic.Config{KeepAlivePeriod: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveQUIC(ln, h)
+
+	udpAddr := ln.Addr().(*net.UDPAddr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, udpAddr.String(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"capri-hub"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("quic dial: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	writeFrame := func(payload []byte, compressed bool) error {
+		var cFlag uint32
+		if compressed {
+			cFlag = uplinkCompressedFlag
+		}
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload))|cFlag)
+		if _, err := stream.Write(lenBuf[:]); err != nil {
+			return err
+		}
+		_, err := stream.Write(payload)
+		return err
+	}
+	readFrame := func() ([]byte, error) {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+			return nil, err
+		}
+		n := binary.BigEndian.Uint32(lenBuf[:])
+		buf := make([]byte, n)
+		_, err := io.ReadFull(stream, buf)
+		return buf, err
+	}
+
+	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true})
+	if err := writeFrame(auth, false); err != nil {
+		t.Fatal(err)
+	}
+	hello, err := readFrame()
+	if err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	var hm map[string]any
+	if json.Unmarshal(hello, &hm) != nil || hm["type"] != "hello" || hm["deflate"] != true {
+		t.Fatalf("hello must echo deflate:true, got %s", hello)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && h.DefaultHostID() == "" {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	flateBytes := func(v any) []byte {
+		b, _ := json.Marshal(v)
+		var buf bytes.Buffer
+		fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
+		fw.Write(b)
+		fw.Close()
+		return buf.Bytes()
+	}
+	if err := writeFrame(flateBytes(map[string]any{
+		"v": 1, "type": "events", "seqStart": 1,
+		"events": []any{map[string]any{"type": "chunk", "text": "z", "seq": 1}},
+	}), true); err != nil {
+		t.Fatal(err)
+	}
+	// Plain frame alongside (host skips compression under 256 bytes).
+	plain, _ := json.Marshal(map[string]any{
+		"v": 1, "type": "events", "seqStart": 2,
+		"events": []any{map[string]any{"type": "chunk", "text": "p", "seq": 2}},
+	})
+	if err := writeFrame(plain, false); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.LastSeq("qh2") == 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("LastSeq = %d, want 2", h.LastSeq("qh2"))
 }
