@@ -1556,3 +1556,91 @@ func TestRegisterEventPerHostLockParallel(t *testing.T) {
 		}
 	}
 }
+
+// TestFanoutResyncOnDropThreshold: once a slow subscriber accumulates
+// resyncDropThreshold dropped events, it receives ONE
+// {"type":"resync",fromSeq:N} frame and the counter resets (the next
+// resync needs another full threshold of drops — no storm).
+func TestFanoutResyncOnDropThreshold(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	// Fill the 512-slot queue synchronously (no drops yet: the counter
+	// only starts once the queue is full).
+	for i := 1; i <= 512; i++ {
+		h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+	}
+	// 40 more events all drop. The sender runs in a goroutine because
+	// the resync delivery (on the 32nd drop) blocks until we drain; we
+	// pause first so the goroutine hits a genuinely full queue instead
+	// of racing into slots our drain loop frees.
+	go func() {
+		for i := 513; i <= 552; i++ {
+			h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	resyncs := 0
+	var lastResyncSeq uint64
+	deadline := time.After(5 * time.Second)
+	for resyncs < 1 {
+		select {
+		case ev := <-ch:
+			if typ, _ := ev["type"].(string); typ == "resync" {
+				resyncs++
+				if fs, ok := ev["fromSeq"].(uint64); ok {
+					lastResyncSeq = fs
+				}
+			}
+		case <-deadline:
+			t.Fatalf("no resync after threshold drops (got %d)", resyncs)
+		}
+	}
+	if lastResyncSeq != 544 {
+		t.Errorf("resync fromSeq = %d, want 544 (seq of the 32nd drop after the queue filled)", lastResyncSeq)
+	}
+	// Drain the rest; no second resync may appear (only 8 further drops
+	// since the counter reset).
+	quiet := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case ev := <-ch:
+			if typ, _ := ev["type"].(string); typ == "resync" {
+				t.Fatal("unexpected second resync below threshold (storm)")
+			}
+		case <-quiet:
+			return
+		}
+	}
+}
+
+// TestFanoutCriticalEventSurvivesBackpressure: with the queue full, a
+// terminal event is delivered via the blocking fallback rather than
+// dropped (the FE would otherwise wait forever on a finished turn).
+func TestFanoutCriticalEventSurvivesBackpressure(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	// Exactly fill the queue with droppable chunks.
+	for i := 1; i <= 512; i++ {
+		h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+	}
+	// Queue full. A critical event must still land: the sender blocks
+	// briefly, so read concurrently.
+	go h.RegisterEvent("h1", Event{"type": "done", "seq": 513})
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			if typ, _ := ev["type"].(string); typ == "done" {
+				return // delivered despite a full queue
+			}
+		case <-deadline:
+			t.Fatal("critical event dropped on full queue")
+		}
+	}
+}

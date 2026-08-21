@@ -1283,10 +1283,85 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 }
 
 // feSubscriber is one browser /ws/fe registration. The channel is the
-// fan-out queue; per-subscriber pressure state (drop counters, T5) hangs
-// off this struct so the copy-on-write list stays a plain slice.
+// fan-out queue; per-subscriber pressure state hangs off this struct so
+// the copy-on-write list stays a plain slice.
 type feSubscriber struct {
 	ch chan Event
+
+	// dropped counts events dropped for this subscriber because its
+	// channel was full (slow FE). Once it reaches resyncDropThreshold a
+	// resync frame is pushed and the counter resets — one resync per
+	// threshold worth of drops, so a permanently stuck FE cannot trigger
+	// a resync storm.
+	dropped atomic.Int32
+}
+
+// Drop-tier policy for a full subscriber queue. Terminal / control events
+// must never be lost to backpressure: a FE that misses "done" or a
+// client_request waits on a turn that already ended. Bulk streaming
+// events (chunk/thought and everything else) are droppable — the FE's
+// (hostId,seq) gap-pull repairs them.
+var criticalEventTypes = map[string]struct{}{
+	"done":           {},
+	"turn_completed": {},
+	"client_request": {},
+}
+
+const (
+	// criticalSendTimeout bounds the blocking fallback delivery for
+	// critical events on a full queue: the FE writer drains a 512-event
+	// channel fast, so a short block rescues the event under transient
+	// pressure without pinning the hub behind a wedged subscriber.
+	criticalSendTimeout = 100 * time.Millisecond
+	// resyncSendTimeout bounds delivery of the resync frame itself.
+	resyncSendTimeout = time.Second
+	// resyncDropThreshold is the dropped-event count that triggers one
+	// {"type":"resync",fromSeq:N} frame (counter then resets).
+	resyncDropThreshold = 32
+)
+
+// criticalEvent reports whether ev is a never-drop event type.
+func criticalEvent(ev Event) bool {
+	t, _ := ev["type"].(string)
+	_, ok := criticalEventTypes[t]
+	return ok
+}
+
+// deliver is one subscriber's fan-out step. Non-critical events use the
+// historical non-blocking drop; critical events block briefly first so
+// terminal/control state survives backpressure. Drops are counted, and
+// crossing the threshold pushes a resync (the FE then rebuilds via
+// GET /api/events?after=) before the counter resets.
+func (s *feSubscriber) deliver(ev Event) {
+	if criticalEvent(ev) {
+		select {
+		case s.ch <- ev:
+			return
+		case <-time.After(criticalSendTimeout):
+			// Still full after a grace period (wedged FE): fall through
+			// to the drop accounting below.
+		}
+	} else {
+		select {
+		case s.ch <- ev:
+			return
+		default:
+		}
+	}
+	// Dropped for this subscriber only. seq gaps are repaired by FE
+	// gap-pull; the resync below forces a full rebuild once enough has
+	// been lost that gap-pulling one-by-one would be the slower path.
+	if s.dropped.Add(1) == resyncDropThreshold {
+		s.dropped.Store(0)
+		seq := evSeq(ev)
+		resync := Event{"type": "resync", "fromSeq": seq}
+		select {
+		case s.ch <- resync:
+		case <-time.After(resyncSendTimeout):
+			// Even the resync cannot land; the FE is gone/wedged and the
+			// transport will reap it. Counter already reset — no storm.
+		}
+	}
 }
 
 // subscribeLocked registers s in the copy-on-write subscriber list. The
@@ -1447,15 +1522,7 @@ func (h *Hub) broadcast(ev Event) {
 		return
 	}
 	for _, s := range *cur {
-		select {
-		case s.ch <- ev:
-		default:
-			// Slow FE /ws/fe: drop this event for that subscriber only.
-			// Host-assigned seqs may then look gapped on that client
-			// (e.g. 1 then 3). Expected: FE uses GET /api/events?after=
-			// gap-pull and (hostId,seq) dedup; do not block the hub
-			// lock or invent continuous seqs here.
-		}
+		s.deliver(ev)
 	}
 }
 
