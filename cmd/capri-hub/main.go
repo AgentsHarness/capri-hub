@@ -733,6 +733,20 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 	}
 	switch frame.Type {
 	case "events":
+		// Frame-level integrity check: the host stamps seqStart with the
+		// first event's seq. A mismatch means the frame was corrupted or
+		// assembled wrong (e.g. a bug in the batching/replay packing) —
+		// rejecting the whole frame keeps the hub's per-host watermark
+		// aligned with the host's own sequence instead of silently
+		// accepting truncated/reordered events. Frames without per-event
+		// seqs (legacy) are exempt.
+		if frame.SeqStart != nil && len(frame.Events) > 0 {
+			if first := hub.EvSeq(frame.Events[0]); first > 0 && first != *frame.SeqStart {
+				log.Printf("[capri-hub] host %s events frame seqStart mismatch: seqStart=%d first event seq=%d, rejecting %d events",
+					hostID, *frame.SeqStart, first, len(frame.Events))
+				return
+			}
+		}
 		// Events carry host-assigned seqs (frames carry seqStart = the
 		// first event's seq), so preserve them: the per-host counter then
 		// tracks the host's sequence exactly and hello.seq lets a

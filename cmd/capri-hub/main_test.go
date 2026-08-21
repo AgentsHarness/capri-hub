@@ -931,3 +931,61 @@ func TestIntegrationSupersededHostConnIgnoredAndDropped(t *testing.T) {
 	sendEvents(conn2, 3, "fresh")
 	waitFEChunk(3, 2, "fresh")
 }
+
+// TestHandleHostFrameSeqStartMismatchRejected: a frame whose seqStart
+// disagrees with the first event's seq is corrupted / mis-assembled and
+// must be rejected whole — neither its events nor the per-host watermark
+// may advance.
+func TestHandleHostFrameSeqStartMismatchRejected(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	// seqStart claims 100 but the first event carries 200.
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"events","seqStart":100,"events":[{"type":"chunk","text":"a","seq":200},{"type":"chunk","text":"b","seq":201}]}`),
+		func([]byte) error { return nil })
+	if got := h.LastSeq("h1"); got != 0 {
+		t.Errorf("LastSeq = %d, want 0 (mismatched frame must be rejected)", got)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("rejected frame must not fan out, got %v", ev)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A matching frame still passes through unchanged.
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"events","seqStart":200,"events":[{"type":"chunk","text":"a","seq":200}]}`),
+		func([]byte) error { return nil })
+	if got := h.LastSeq("h1"); got != 200 {
+		t.Errorf("LastSeq = %d, want 200 (valid frame accepted)", got)
+	}
+}
+
+// TestPairConstantTimeCompareIsValueExact: after switching the pairing
+// code comparison to crypto/subtle, pairing still accepts the exact code
+// (normalized) and rejects near-misses.
+func TestPairConstantTimeCompareIsValueExact(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(strings.ToLower(code), "h1", "H1"); err != nil {
+		t.Fatalf("lowercased code must pair: %v", err)
+	}
+	h2 := hub.NewWithDir("")
+	code2, _ := h2.PairingCode()
+	// Mutate one character.
+	runes := []rune(code2)
+	if runes[0] == 'A' {
+		runes[0] = 'B'
+	} else {
+		runes[0] = 'A'
+	}
+	if _, err := h2.Pair(string(runes), "h1", "H1"); err == nil {
+		t.Error("near-miss code must be rejected")
+	}
+}

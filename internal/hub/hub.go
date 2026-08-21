@@ -14,6 +14,7 @@ package hub
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -497,7 +498,12 @@ func (h *Hub) StartPairingCodeMaintainer(ctx context.Context) {
 // it, so flaky storage never stalls the hub.
 func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 	h.mu.Lock()
-	if strings.ToUpper(strings.TrimSpace(code)) != h.pairingCode {
+	// Constant-time compare: the pairing code is a short-lived secret and
+	// POST /api/pair is internet-reachable, so the comparison must not
+	// leak how many leading bytes matched. (subtle.ConstantTimeCompare
+	// still returns 0 immediately for differing lengths — the code length
+	// is fixed public knowledge, so that leak is harmless.)
+	if subtle.ConstantTimeCompare([]byte(strings.ToUpper(strings.TrimSpace(code))), []byte(h.pairingCode)) != 1 {
 		h.mu.Unlock()
 		return "", ErrCodeInvalid
 	}
@@ -752,6 +758,10 @@ func evSeq(ev Event) uint64 {
 	}
 	return 0
 }
+
+// EvSeq is the exported form of evSeq (used by cmd/capri-hub's frame-level
+// seqStart validation).
+func EvSeq(ev Event) uint64 { return evSeq(ev) }
 
 // SetHostReady updates Ready from a control-plane host_status frame (no
 // seq). Always refreshes LastSeen; if ready flips, updates Ready and
