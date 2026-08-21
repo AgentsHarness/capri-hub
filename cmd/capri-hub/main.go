@@ -225,7 +225,20 @@ func handleEvents(h *hub.Hub) http.HandlerFunc {
 		}
 		after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 		evs := h.EventsAfter(hostID, after)
-		writeJSON(w, 200, map[string]any{"ok": true, "hostId": hostID, "events": evs})
+		// Raw fast path: buffered events may carry pre-encoded wire bytes
+		// (hub.MarshalEvent returns them verbatim); legacy map events
+		// marshal as before. Either way the JSON handed to the FE is
+		// semantically identical to the old whole-frame marshal.
+		raws := make([]json.RawMessage, len(evs))
+		for i, ev := range evs {
+			b, err := hub.MarshalEvent(ev)
+			if err != nil {
+				writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			raws[i] = b
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "hostId": hostID, "events": raws})
 	}
 }
 
@@ -719,13 +732,13 @@ func writeHostPing(h *hub.Hub, write func([]byte) error) error {
 // host_status/seq_reset/ping). Shared by the WebSocket and QUIC transports.
 func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) error) {
 	var frame struct {
-		Type     string          `json:"type"`
-		SeqStart *uint64         `json:"seqStart"`
-		Events   []hub.Event     `json:"events"`
-		ReqID    string          `json:"reqId"`
-		Status   int             `json:"status"`
-		Body     json.RawMessage `json:"body"`
-		Ready    bool            `json:"ready"`
+		Type     string            `json:"type"`
+		SeqStart *uint64           `json:"seqStart"`
+		Events   []json.RawMessage `json:"events"`
+		ReqID    string            `json:"reqId"`
+		Status   int               `json:"status"`
+		Body     json.RawMessage   `json:"body"`
+		Ready    bool              `json:"ready"`
 	}
 	if err := json.Unmarshal(data, &frame); err != nil {
 		log.Printf("[capri-hub] host %s bad frame: %v", hostID, err)
@@ -741,23 +754,21 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 		// accepting truncated/reordered events. Frames without per-event
 		// seqs (legacy) are exempt.
 		if frame.SeqStart != nil && len(frame.Events) > 0 {
-			if first := hub.EvSeq(frame.Events[0]); first > 0 && first != *frame.SeqStart {
+			var first struct {
+				Seq uint64 `json:"seq"`
+			}
+			if json.Unmarshal(frame.Events[0], &first) == nil && first.Seq > 0 && first.Seq != *frame.SeqStart {
 				log.Printf("[capri-hub] host %s events frame seqStart mismatch: seqStart=%d first event seq=%d, rejecting %d events",
-					hostID, *frame.SeqStart, first, len(frame.Events))
+					hostID, *frame.SeqStart, first.Seq, len(frame.Events))
 				return
 			}
 		}
-		// Events carry host-assigned seqs (frames carry seqStart = the
-		// first event's seq), so preserve them: the per-host counter then
-		// tracks the host's sequence exactly and hello.seq lets a
-		// reconnecting host resume precisely where it left off. Seq-less
-		// frames (direct callers / legacy clients) fall back to
-		// RegisterEvent's counter advance — renumbering them from 1 here
-		// would reset the counter and trigger a full replay (plus FE
-		// re-emission) on the next reconnect.
-		for _, ev := range frame.Events {
-			h.RegisterEvent(hostID, ev)
-		}
+		// Raw fast path: event bodies stay json.RawMessage — the hub
+		// shallow-parses only seq/type/ready and splices its tags into
+		// the original bytes for fan-out (no per-event map decode, no
+		// re-encode per FE). Seq handling matches the legacy
+		// RegisterEvent path exactly (see hub.RegisterRawEvents).
+		h.RegisterRawEvents(hostID, frame.Events)
 	case "host_status":
 		// Control-plane ready heartbeat: no seq, not an event. Updates
 		// Ready + LastSeen (and hosts_changed on flip) without advancing
@@ -867,7 +878,18 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 			return writeFrame(b, false)
 		}
 		writeEventsFrame := func(evs []hub.Event) error {
-			b, err := json.Marshal(map[string]any{"v": 1, "type": "events", "events": evs})
+			// Raw splice: pre-encoded events (host wire path) are
+			// concatenated verbatim — no re-marshal of event bodies.
+			// Semantically identical to the previous whole-frame marshal.
+			raws := make([]json.RawMessage, len(evs))
+			for i, ev := range evs {
+				b, err := hub.MarshalEvent(ev)
+				if err != nil {
+					return err
+				}
+				raws[i] = b
+			}
+			b, err := json.Marshal(map[string]any{"v": 1, "type": "events", "events": raws})
 			if err != nil {
 				return err
 			}

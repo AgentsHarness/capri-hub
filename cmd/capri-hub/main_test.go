@@ -762,7 +762,17 @@ func TestHandleHostFrameSeqReset(t *testing.T) {
 	for {
 		select {
 		case ev := <-ch:
-			if ev["type"] == "chunk" && ev["text"] == "fresh" {
+			// Raw-path events carry the body as pre-encoded wire bytes
+			// (hub.MarshalEvent); "type"/"seq" are the shallow fields.
+			if ev["type"] != "chunk" {
+				continue
+			}
+			wire, err := hub.MarshalEvent(ev)
+			if err != nil {
+				t.Fatalf("MarshalEvent: %v", err)
+			}
+			var m map[string]any
+			if json.Unmarshal(wire, &m) != nil || m["text"] == "fresh" {
 				return
 			}
 		case <-deadline:

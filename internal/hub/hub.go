@@ -12,6 +12,7 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -881,6 +883,141 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 	cp["hostId"] = hostID
 	cp["hostName"] = hs.info.HostName
 	h.broadcastLocked(cp)
+	return true
+}
+
+// ── raw (pre-encoded) event fast path ─────────────────────────────────
+//
+// Events arriving over the wire used to be fully decoded into Event maps
+// (one map + one allocation per leaf value per event — chunk storms burn
+// most of the hub's CPU there) and then re-encoded per FE on fan-out. The
+// raw path instead keeps the event body as json.RawMessage end-to-end:
+// only the fields the hub itself needs (seq/type/ready) are shallow
+// parsed, and the FE-bound wire bytes are produced once by splicing the
+// hub's hostId/hostName tags into the original bytes.
+//
+// rawWireKey is the reserved Event key under which the canonical wire
+// bytes travel through the fan-out channel and the gap-pull buffer. An
+// Event carrying it is opaque: consumers must serialize it via
+// MarshalEvent (which returns the bytes verbatim) instead of
+// json.Marshal. The key starts with NUL so it can never collide with a
+// wire field name. Alongside the raw bytes the map carries the few
+// shallow fields hub/FE code inspects: type, seq, hostId, hostName.
+const rawWireKey = "\x00wire"
+
+// MarshalEvent serializes one event to its canonical wire bytes: the
+// pre-encoded bytes verbatim for raw-path events, a plain marshal for
+// legacy map events.
+func MarshalEvent(ev Event) ([]byte, error) {
+	if raw, ok := ev[rawWireKey].(json.RawMessage); ok {
+		return raw, nil
+	}
+	return json.Marshal(ev)
+}
+
+// rawEventMeta is the shallow header the hub needs from every raw event.
+type rawEventMeta struct {
+	Seq   uint64 `json:"seq"`
+	Type  string `json:"type"`
+	Ready bool   `json:"ready"`
+}
+
+// spliceRawEvent builds the FE-bound wire bytes for one raw event by
+// appending the hub's tags before the closing brace of the original
+// object. Appending (rather than prepending) preserves the legacy
+// RegisterEvent semantics under duplicate keys — the hub's hostId /
+// hostName / injected seq always win (encoding/json keeps the LAST
+// occurrence). Returns nil when raw is not a JSON object (caller skips).
+func spliceRawEvent(raw, idJSON, nameJSON []byte, seq uint64, injectSeq bool) json.RawMessage {
+	r := bytes.TrimRight(raw, " \t\r\n")
+	if len(r) < 2 || r[0] != '{' || r[len(r)-1] != '}' {
+		return nil
+	}
+	out := make([]byte, 0, len(r)+len(idJSON)+len(nameJSON)+48)
+	out = append(out, r[:len(r)-1]...)
+	if len(out) > 1 { // non-empty object: separate from existing members
+		out = append(out, ',')
+	}
+	if injectSeq {
+		out = append(out, `"seq":`...)
+		out = strconv.AppendUint(out, seq, 10)
+		out = append(out, ',')
+	}
+	out = append(out, `"hostId":`...)
+	out = append(out, idJSON...)
+	out = append(out, `,"hostName":`...)
+	out = append(out, nameJSON...)
+	out = append(out, '}')
+	return json.RawMessage(out)
+}
+
+// RegisterRawEvents is RegisterEvent for events still in their original
+// wire form (host events frames): each body stays json.RawMessage, only
+// seq/type/ready are shallow-parsed, and the FE-bound bytes are spliced
+// once instead of decode-map + re-encode per subscriber. Semantics match
+// RegisterEvent exactly: seq gating / hub-side assignment, gap-pull
+// buffering, host_status ready flip, hostId/hostName tagging. Non-object
+// entries (e.g. null) are skipped. Returns false only for unknown hosts.
+func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		return false
+	}
+	hs.info.LastSeen = time.Now()
+	idJSON, _ := json.Marshal(hostID)
+	nameJSON, _ := json.Marshal(hs.info.HostName)
+	for _, raw := range raws {
+		// Validate shape BEFORE consuming a seq from the counter.
+		r := bytes.TrimRight(raw, " \t\r\n")
+		if len(r) < 2 || r[0] != '{' || r[len(r)-1] != '}' {
+			log.Printf("[capri-hub] host %s non-object event skipped", hostID)
+			continue
+		}
+		var meta rawEventMeta
+		if err := json.Unmarshal(r, &meta); err != nil {
+			continue
+		}
+		// Same seq gating as RegisterEvent: preserve host seqs, skip
+		// stale/duplicate, fall back to hub-side assignment.
+		if meta.Seq > 0 {
+			if meta.Seq <= hs.seq {
+				if meta.Seq < hs.seq {
+					log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, meta.Seq, hs.seq)
+				}
+				continue
+			}
+			hs.seq = meta.Seq
+		} else {
+			hs.seq++
+		}
+		wire := spliceRawEvent(raw, idJSON, nameJSON, hs.seq, meta.Seq == 0)
+		if wire == nil {
+			log.Printf("[capri-hub] host %s non-object event skipped", hostID)
+			continue
+		}
+		ev := Event{
+			rawWireKey: wire,
+			"type":     meta.Type,
+			"seq":      float64(hs.seq),
+			"hostId":   hostID,
+			"hostName": hs.info.HostName,
+		}
+		hs.evBuf = append(hs.evBuf, ev)
+		if len(hs.evBuf) > evBufHighWater {
+			trimmed := make([]Event, eventBufCap, evBufHighWater)
+			copy(trimmed, hs.evBuf[len(hs.evBuf)-eventBufCap:])
+			hs.evBuf = trimmed
+		}
+		// Back-compat: old hosts still send host_status inside events
+		// frames (see RegisterEvent).
+		if meta.Type == "host_status" && meta.Ready != hs.info.Ready {
+			hs.info.Ready = meta.Ready
+			h.broadcastLocked(hostsChanged())
+		}
+		h.broadcastLocked(ev)
+	}
 	return true
 }
 

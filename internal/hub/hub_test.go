@@ -1413,3 +1413,81 @@ func TestDispatchAbandonedByBrowser(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestRegisterRawEvents: the raw (pre-encoded) fast path must match
+// RegisterEvent's semantics without decoding event bodies into maps —
+// host seqs preserved / stale skipped, hub-assigned seq injected into the
+// WIRE bytes (not just the map), hostId/hostName tags appended, and the
+// broadcast event serializing via MarshalEvent to the spliced original
+// bytes.
+func TestRegisterRawEvents(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	raws := []json.RawMessage{
+		json.RawMessage(`{"type":"chunk","text":"a","seq":10}`),
+		json.RawMessage(`{"type":"chunk","text":"b"}`), // hub assigns 11
+		json.RawMessage(`{"type":"chunk","text":"stale","seq":5}`), // skipped
+	}
+	if !h.RegisterRawEvents("h1", raws) {
+		t.Fatal("RegisterRawEvents failed for paired host")
+	}
+	if got := h.LastSeq("h1"); got != 11 {
+		t.Fatalf("LastSeq = %d, want 11", got)
+	}
+	// Two fan-outs (stale skipped).
+	var wires []map[string]any
+	for len(wires) < 2 {
+		select {
+		case ev := <-ch:
+			if ev["type"] != "chunk" {
+				continue // hosts_changed noise
+			}
+			wire, err := MarshalEvent(ev)
+			if err != nil {
+				t.Fatalf("MarshalEvent: %v", err)
+			}
+			var m map[string]any
+			if json.Unmarshal(wire, &m) != nil {
+				t.Fatalf("spliced wire is not valid JSON: %s", wire)
+			}
+			wires = append(wires, m)
+		case <-time.After(time.Second):
+			t.Fatalf("only %d events", len(wires))
+		}
+	}
+	if wires[0]["text"] != "a" || wires[0]["seq"].(float64) != 10 {
+		t.Errorf("event 0 = %v", wires[0])
+	}
+	if wires[0]["hostId"] != "h1" || wires[0]["hostName"] != "H1" {
+		t.Errorf("event 0 tags missing: %v", wires[0])
+	}
+	if wires[1]["text"] != "b" || wires[1]["seq"].(float64) != 11 {
+		t.Errorf("event 1 = %v (hub-assigned seq must be injected into wire)", wires[1])
+	}
+	// Stale event not buffered.
+	if evs := h.EventsAfter("h1", 0); len(evs) != 2 {
+		t.Errorf("EventsAfter = %d events, want 2", len(evs))
+	}
+	// Non-object entries are skipped without consuming a seq.
+	h.RegisterRawEvents("h1", []json.RawMessage{json.RawMessage(`null`)})
+	if got := h.LastSeq("h1"); got != 11 {
+		t.Errorf("LastSeq after null entry = %d, want 11", got)
+	}
+	if h.RegisterRawEvents("nope", nil) {
+		t.Error("unknown host must return false")
+	}
+}
+
+// TestRegisterRawEventsHostStatusReady: host_status inside a raw events
+// frame still flips Ready (legacy back-compat path).
+func TestRegisterRawEventsHostStatusReady(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	h.RegisterRawEvents("h1", []json.RawMessage{json.RawMessage(`{"type":"host_status","ready":true}`)})
+	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
+		t.Errorf("ready not tracked: %+v", hosts)
+	}
+}
