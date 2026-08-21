@@ -1428,7 +1428,7 @@ func TestRegisterRawEvents(t *testing.T) {
 
 	raws := []json.RawMessage{
 		json.RawMessage(`{"type":"chunk","text":"a","seq":10}`),
-		json.RawMessage(`{"type":"chunk","text":"b"}`), // hub assigns 11
+		json.RawMessage(`{"type":"chunk","text":"b"}`),             // hub assigns 11
 		json.RawMessage(`{"type":"chunk","text":"stale","seq":5}`), // skipped
 	}
 	if !h.RegisterRawEvents("h1", raws) {
@@ -1489,5 +1489,70 @@ func TestRegisterRawEventsHostStatusReady(t *testing.T) {
 	h.RegisterRawEvents("h1", []json.RawMessage{json.RawMessage(`{"type":"host_status","ready":true}`)})
 	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
 		t.Errorf("ready not tracked: %+v", hosts)
+	}
+}
+
+// TestRegisterEventPerHostLockParallel: with the per-host data-plane
+// lock, concurrent ingestion on different hosts must stay correct (no
+// lost/duplicated seqs, strictly ordered buffers) — run under -race this
+// also pins the h.mu → hs.mu lock ordering.
+func TestRegisterEventPerHostLockParallel(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	testPair(t, h, "h2", "H2")
+
+	const perHost = 500
+	var wg sync.WaitGroup
+	for _, id := range []string{"h1", "h2"} {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			for i := 1; i <= perHost; i++ {
+				if !h.RegisterEvent(id, Event{"type": "chunk", "seq": uint64(i)}) {
+					t.Errorf("register %s/%d failed", id, i)
+					return
+				}
+			}
+		}(id)
+	}
+	// Concurrent COW churn: subscribe/unsubscribe while events flow, so
+	// fan-out snapshots race list swaps (must be torn-read free).
+	stopChurn := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopChurn:
+				return
+			default:
+				ch, unsub := h.Subscribe()
+				// Non-blocking drain so the channel cannot fill.
+				for {
+					select {
+					case <-ch:
+					default:
+						goto done
+					}
+				}
+			done:
+				unsub()
+			}
+		}
+	}()
+	wg.Wait()
+	close(stopChurn)
+
+	for _, id := range []string{"h1", "h2"} {
+		if got := h.LastSeq(id); got != perHost {
+			t.Errorf("%s LastSeq = %d, want %d", id, got, perHost)
+		}
+		evs := h.EventsAfter(id, 0)
+		if len(evs) != perHost {
+			t.Fatalf("%s buffered %d events, want %d", id, len(evs), perHost)
+		}
+		for i, ev := range evs {
+			if got, want := evSeq(ev), uint64(i+1); got != want {
+				t.Fatalf("%s buffer[%d] seq = %d, want %d (order/loss violated)", id, i, got, want)
+			}
+		}
 	}
 }

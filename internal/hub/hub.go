@@ -148,6 +148,12 @@ type hostState struct {
 	token string
 	conn  *streamConn
 
+	// mu guards seq/evBuf ONLY (the per-host data plane). The global h.mu
+	// protects the registry (hosts/tokens maps, conn, info, pending) —
+	// event ingestion no longer serializes every host behind it. Lock
+	// order is always h.mu → hs.mu; nothing takes them the other way.
+	mu sync.Mutex
+
 	// seq is the last event sequence number seen from this host
 	// (host-assigned, monotonic per host process). evBuf is a bounded
 	// ring of recent events (with seq injected) so browsers can pull
@@ -169,8 +175,13 @@ type Hub struct {
 	tokens map[string]string // token → hostId
 	hosts  map[string]*hostState
 
-	subscribers map[chan Event]struct{}
-	pending     map[string]map[string]*pendingReq
+	// subs is the browser-subscriber set as a copy-on-write slice behind
+	// an atomic pointer: fan-out reads the snapshot lock-free, and
+	// subscribe/unsubscribe swap in a new slice under h.mu. Churn is rare
+	// (browser connect/disconnect) while fan-out runs per event, so
+	// readers never contend on h.mu.
+	subs    atomic.Pointer[[]*feSubscriber]
+	pending map[string]map[string]*pendingReq
 
 	nextReq    atomic.Int64
 	nextConnID atomic.Int64
@@ -199,13 +210,14 @@ func New() *Hub {
 // NewWithDir returns a Hub persisting to dir/hub.json; pass "" to disable
 // persistence (used by tests).
 func NewWithDir(dir string) *Hub {
+	emptySubs := []*feSubscriber{}
 	h := &Hub{
-		tokens:      make(map[string]string),
-		hosts:       make(map[string]*hostState),
-		subscribers: make(map[chan Event]struct{}),
-		pending:     make(map[string]map[string]*pendingReq),
-		prefs:       BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
+		tokens:  make(map[string]string),
+		hosts:   make(map[string]*hostState),
+		pending: make(map[string]map[string]*pendingReq),
+		prefs:   BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
 	}
+	h.subs.Store(&emptySubs)
 	if dir != "" {
 		h.dataFile = filepath.Join(dir, "hub.json")
 		h.load()
@@ -424,7 +436,7 @@ func (h *Hub) SetPrefs(prefs BrowserPrefs) error {
 		payload = b
 	}
 	h.prefs = cp
-	h.broadcastLocked(prefsChanged(cp))
+	h.broadcast(prefsChanged(cp))
 	h.mu.Unlock()
 
 	if persist {
@@ -575,14 +587,16 @@ func (h *Hub) Unpair(hostID string) error {
 	h.revokeTokensForHostLocked(hostID)
 	h.failPendingLocked(hostID)
 	hs.conn = nil
-	hs.evBuf = nil
 	delete(h.hosts, hostID)
+	hs.mu.Lock()
+	hs.evBuf = nil
+	hs.mu.Unlock()
 	var snap persistFile
 	persist := h.dataFile != ""
 	if persist {
 		snap = h.snapshotLocked()
 	}
-	h.broadcastLocked(hostsChanged())
+	h.broadcast(hostsChanged())
 	h.mu.Unlock()
 
 	if persist {
@@ -620,7 +634,7 @@ func (h *Hub) RenameHost(hostID, hostName string) error {
 	if persist {
 		snap = h.snapshotLocked()
 	}
-	h.broadcastLocked(hostsChanged())
+	h.broadcast(hostsChanged())
 	h.mu.Unlock()
 
 	if persist {
@@ -678,7 +692,7 @@ func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*s
 	hs.conn = conn
 	hs.info.Online = true
 	hs.info.LastSeen = time.Now()
-	h.broadcastLocked(hostsChanged())
+	h.broadcast(hostsChanged())
 	return conn, func() { h.disconnectStream(hostID, conn) }, nil
 }
 
@@ -696,14 +710,17 @@ func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
 	hs.evBufEpoch++
 	epoch := hs.evBufEpoch
 	h.failPendingLocked(hostID)
-	h.broadcastLocked(hostsChanged())
+	h.broadcast(hostsChanged())
 	grace := EventBufGrace
 	h.mu.Unlock()
 
 	if grace <= 0 {
 		h.mu.Lock()
-		if hs := h.hosts[hostID]; hs != nil && hs.conn == nil && hs.evBufEpoch == epoch {
+		hs := h.hosts[hostID]
+		if hs != nil && hs.conn == nil && hs.evBufEpoch == epoch {
+			hs.mu.Lock()
 			hs.evBuf = nil
+			hs.mu.Unlock()
 		}
 		h.mu.Unlock()
 		return
@@ -715,7 +732,9 @@ func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
 		if hs == nil || hs.conn != nil || hs.evBufEpoch != epoch {
 			return
 		}
+		hs.mu.Lock()
 		hs.evBuf = nil
+		hs.mu.Unlock()
 	})
 }
 
@@ -779,7 +798,7 @@ func (h *Hub) SetHostReady(hostID string, ready bool) bool {
 	hs.info.LastSeen = time.Now()
 	if ready != hs.info.Ready {
 		hs.info.Ready = ready
-		h.broadcastLocked(hostsChanged())
+		h.broadcast(hostsChanged())
 	}
 	return true
 }
@@ -791,15 +810,18 @@ func (h *Hub) SetHostReady(hostID string, ready bool) bool {
 // Does not change Ready/Online or fire hosts_changed.
 func (h *Hub) ResetHostSeq(hostID string) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
 	if hs == nil {
+		h.mu.Unlock()
 		return false
 	}
+	hs.info.LastSeen = time.Now()
+	h.mu.Unlock()
+	hs.mu.Lock()
 	prev := hs.seq
 	hs.seq = 0
 	hs.evBuf = nil
-	hs.info.LastSeen = time.Now()
+	hs.mu.Unlock()
 	if prev > 0 {
 		log.Printf("[capri-hub] host %s seq reset (was %d) — host process restart", hostID, prev)
 	}
@@ -832,15 +854,43 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 	for k, v := range ev {
 		cp[k] = v
 	}
+	// Global lock only for the registry lookup + liveness; the seq /
+	// buffer update runs under the per-host lock and fan-out is
+	// lock-free, so one host's event ingest cannot serialize every other
+	// host behind h.mu (see hostState.mu).
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
 	if hs == nil {
+		h.mu.Unlock()
 		return false
 	}
 	hs.info.LastSeen = time.Now()
-	// Host-provided seq (events frames carry per-event seq); fall back to
-	// hub-side assignment for direct RegisterEvent callers (tests).
+	hostName := hs.info.HostName
+	h.mu.Unlock()
+
+	if fanout := hs.appendEvent(cp, hostID, hostName); fanout != nil {
+		// Back-compat: old hosts still send host_status inside events
+		// frames — flip Ready (and fire hosts_changed) via the same
+		// control-plane path WS host_status uses.
+		if t, _ := cp["type"].(string); t == "host_status" {
+			if r, ok := cp["ready"].(bool); ok {
+				h.SetHostReady(hostID, r)
+			}
+		}
+		h.broadcast(fanout)
+	}
+	return true
+}
+
+// appendEvent is RegisterEvent's per-host data-plane section: seq gating
+// (host-provided preserved, stale/duplicate skipped, hub-side assignment
+// otherwise), hostId/hostName tagging, gap-pull buffering and amortized
+// compaction. Returns the tagged event to fan out, or nil when the event
+// was stale/duplicate (accepted, LastSeen already refreshed — same
+// contract as before). Runs under hs.mu only.
+func (hs *hostState) appendEvent(cp Event, hostID, hostName string) Event {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
 	if s := evSeq(cp); s > 0 {
 		// Skip fan-out for duplicate/stale seqs (reconnect residual +
 		// replay). Counter must never move backwards.
@@ -848,42 +898,26 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 			if s < hs.seq {
 				log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, s, hs.seq)
 			}
-			return true
+			return nil
 		}
 		hs.seq = s
 	} else {
 		hs.seq++
 		cp["seq"] = hs.seq
 	}
+	cp["hostId"] = hostID
+	cp["hostName"] = hostName
 	hs.evBuf = append(hs.evBuf, cp)
 	if len(hs.evBuf) > evBufHighWater {
-		// Amortized compaction. A naive "trim to eventBufCap on every
-		// overflow" reallocates an eventBufCap-element slice and copies
-		// it PER EVENT once the buffer is full — 4000 pointer copies plus
-		// a ~32KB allocation for every chunk event, all while holding the
-		// global h.mu, which serializes the entire hub behind a memcpy
-		// during a streaming turn. Compacting only at the high-water mark
-		// makes the copy amortized O(1) per event (one copy per
-		// eventBufCap events) at the cost of bounded extra memory.
-		//
-		// The copy itself (rather than a plain reslice) is still required:
-		// a reslice keeps the whole backing array — and every dropped
-		// Event map in it — reachable until the next append reallocates.
+		// Amortized compaction (see RegisterEvent history / evBufHighWater):
+		// one fresh array per eventBufCap events instead of a reallocating
+		// copy per event. The copy (not a reslice) keeps the dropped Event
+		// maps from staying reachable via the old backing array.
 		trimmed := make([]Event, eventBufCap, evBufHighWater)
 		copy(trimmed, hs.evBuf[len(hs.evBuf)-eventBufCap:])
 		hs.evBuf = trimmed
 	}
-	// Back-compat: old hosts still send host_status inside events frames.
-	if t, _ := cp["type"].(string); t == "host_status" {
-		if r, ok := cp["ready"].(bool); ok && r != hs.info.Ready {
-			hs.info.Ready = r
-			h.broadcastLocked(hostsChanged())
-		}
-	}
-	cp["hostId"] = hostID
-	cp["hostName"] = hs.info.HostName
-	h.broadcastLocked(cp)
-	return true
+	return cp
 }
 
 // ── raw (pre-encoded) event fast path ─────────────────────────────────
@@ -959,15 +993,21 @@ func spliceRawEvent(raw, idJSON, nameJSON []byte, seq uint64, injectSeq bool) js
 // buffering, host_status ready flip, hostId/hostName tagging. Non-object
 // entries (e.g. null) are skipped. Returns false only for unknown hosts.
 func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
+	// Same locking shape as RegisterEvent: global lock for lookup +
+	// liveness only; seq/buffer under the per-host lock; fan-out
+	// lock-free (see hostState.mu).
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
 	if hs == nil {
+		h.mu.Unlock()
 		return false
 	}
 	hs.info.LastSeen = time.Now()
+	hostName := hs.info.HostName
+	h.mu.Unlock()
+
 	idJSON, _ := json.Marshal(hostID)
-	nameJSON, _ := json.Marshal(hs.info.HostName)
+	nameJSON, _ := json.Marshal(hostName)
 	for _, raw := range raws {
 		// Validate shape BEFORE consuming a seq from the counter.
 		r := bytes.TrimRight(raw, " \t\r\n")
@@ -979,21 +1019,24 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 		if err := json.Unmarshal(r, &meta); err != nil {
 			continue
 		}
-		// Same seq gating as RegisterEvent: preserve host seqs, skip
+		hs.mu.Lock()
+		// Same seq gating as appendEvent: preserve host seqs, skip
 		// stale/duplicate, fall back to hub-side assignment.
 		if meta.Seq > 0 {
 			if meta.Seq <= hs.seq {
 				if meta.Seq < hs.seq {
 					log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, meta.Seq, hs.seq)
 				}
+				hs.mu.Unlock()
 				continue
 			}
 			hs.seq = meta.Seq
 		} else {
 			hs.seq++
 		}
-		wire := spliceRawEvent(raw, idJSON, nameJSON, hs.seq, meta.Seq == 0)
+		wire := spliceRawEvent(r, idJSON, nameJSON, hs.seq, meta.Seq == 0)
 		if wire == nil {
+			hs.mu.Unlock()
 			log.Printf("[capri-hub] host %s non-object event skipped", hostID)
 			continue
 		}
@@ -1002,7 +1045,7 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 			"type":     meta.Type,
 			"seq":      float64(hs.seq),
 			"hostId":   hostID,
-			"hostName": hs.info.HostName,
+			"hostName": hostName,
 		}
 		hs.evBuf = append(hs.evBuf, ev)
 		if len(hs.evBuf) > evBufHighWater {
@@ -1010,13 +1053,13 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 			copy(trimmed, hs.evBuf[len(hs.evBuf)-eventBufCap:])
 			hs.evBuf = trimmed
 		}
+		hs.mu.Unlock()
 		// Back-compat: old hosts still send host_status inside events
 		// frames (see RegisterEvent).
-		if meta.Type == "host_status" && meta.Ready != hs.info.Ready {
-			hs.info.Ready = meta.Ready
-			h.broadcastLocked(hostsChanged())
+		if meta.Type == "host_status" {
+			h.SetHostReady(hostID, meta.Ready)
 		}
-		h.broadcastLocked(ev)
+		h.broadcast(ev)
 	}
 	return true
 }
@@ -1025,11 +1068,14 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 // (0 when unknown / nothing seen yet).
 func (h *Hub) LastSeq(hostID string) uint64 {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if hs := h.hosts[hostID]; hs != nil {
-		return hs.seq
+	hs := h.hosts[hostID]
+	h.mu.Unlock()
+	if hs == nil {
+		return 0
 	}
-	return 0
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.seq
 }
 
 // SeqByHost returns the last event seq for every known host (for the FE
@@ -1039,7 +1085,9 @@ func (h *Hub) SeqByHost() map[string]uint64 {
 	defer h.mu.Unlock()
 	out := make(map[string]uint64, len(h.hosts))
 	for id, hs := range h.hosts {
+		hs.mu.Lock()
 		out[id] = hs.seq
+		hs.mu.Unlock()
 	}
 	return out
 }
@@ -1049,15 +1097,17 @@ func (h *Hub) SeqByHost() map[string]uint64 {
 // callers must not mutate the events.
 func (h *Hub) EventsAfter(hostID string, after uint64) []Event {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
+	h.mu.Unlock()
 	if hs == nil {
 		return nil
 	}
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
 	// evBuf is append-only in strictly increasing seq order (RegisterEvent
 	// drops anything <= the watermark), so the cut point can be found by
-	// binary search instead of scanning up to evBufHighWater events under
-	// the global lock on every reconnect gap-pull.
+	// binary search instead of scanning up to evBufHighWater events on
+	// every reconnect gap-pull.
 	i := sort.Search(len(hs.evBuf), func(i int) bool {
 		return evSeq(hs.evBuf[i]) > after
 	})
@@ -1232,6 +1282,43 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 	return ch, unsub
 }
 
+// feSubscriber is one browser /ws/fe registration. The channel is the
+// fan-out queue; per-subscriber pressure state (drop counters, T5) hangs
+// off this struct so the copy-on-write list stays a plain slice.
+type feSubscriber struct {
+	ch chan Event
+}
+
+// subscribeLocked registers s in the copy-on-write subscriber list. The
+// caller must hold h.mu; readers (broadcast) see the old or new slice,
+// never a torn one.
+func (h *Hub) subscribeLocked(s *feSubscriber) {
+	var next []*feSubscriber
+	if cur := h.subs.Load(); cur != nil {
+		next = make([]*feSubscriber, 0, len(*cur)+1)
+		next = append(next, *cur...)
+	} else {
+		next = make([]*feSubscriber, 0, 1)
+	}
+	next = append(next, s)
+	h.subs.Store(&next)
+}
+
+// unsubscribe removes s (copy-on-write, under h.mu).
+func (h *Hub) unsubscribe(s *feSubscriber) {
+	var cur []*feSubscriber
+	if p := h.subs.Load(); p != nil {
+		cur = *p
+	}
+	next := make([]*feSubscriber, 0, len(cur))
+	for _, sub := range cur {
+		if sub != s {
+			next = append(next, sub)
+		}
+	}
+	h.subs.Store(&next)
+}
+
 // TrySubscribe is Subscribe with a subscriber cap: when max > 0 and the
 // hub already has max live browser subscribers, it returns ok=false
 // instead of registering another. Each subscriber costs a 512-event
@@ -1240,22 +1327,22 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool) {
 	// Larger than the old SSE path: WS fan-out still drops on a full buffer,
 	// but 512 absorbs short FE write stalls without losing a turn of chunks.
-	ch = make(chan Event, 512)
+	s := &feSubscriber{ch: make(chan Event, 512)}
 	h.mu.Lock()
-	if max > 0 && len(h.subscribers) >= max {
+	if cur := h.subs.Load(); cur != nil && max > 0 && len(*cur) >= max {
 		h.mu.Unlock()
 		return nil, nil, false
 	}
-	h.subscribers[ch] = struct{}{}
+	h.subscribeLocked(s)
 	h.mu.Unlock()
 	h.notifyHostsSubscribers()
-	return ch, func() {
+	return s.ch, func() {
 		h.mu.Lock()
-		delete(h.subscribers, ch)
+		h.unsubscribe(s)
 		h.mu.Unlock()
 		for {
 			select {
-			case <-ch:
+			case <-s.ch:
 			default:
 				goto drained
 			}
@@ -1267,9 +1354,10 @@ func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool)
 
 // SubscriberCount is the number of live browser /ws/fe clients.
 func (h *Hub) SubscriberCount() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.subscribers)
+	if cur := h.subs.Load(); cur != nil {
+		return len(*cur)
+	}
+	return 0
 }
 
 // notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N, gen:G} to
@@ -1292,7 +1380,10 @@ func (h *Hub) SubscriberCount() int {
 // a lost frame is repaired by the periodic re-assert on the host ping.
 func (h *Hub) notifyHostsSubscribers() {
 	h.mu.Lock()
-	count := len(h.subscribers)
+	var count int
+	if cur := h.subs.Load(); cur != nil {
+		count = len(*cur)
+	}
 	if h.lastNotifiedSubs != nil && *h.lastNotifiedSubs == count {
 		h.mu.Unlock()
 		return
@@ -1333,7 +1424,9 @@ func (h *Hub) notifyHostsSubscribers() {
 // leaving the host paused until the next browser connect/disconnect.
 func (h *Hub) SubscribersState() (count int, gen uint64) {
 	h.mu.Lock()
-	count = len(h.subscribers)
+	if cur := h.subs.Load(); cur != nil {
+		count = len(*cur)
+	}
 	h.mu.Unlock()
 	return count, h.subsGen.Add(1)
 }
@@ -1341,15 +1434,21 @@ func (h *Hub) SubscribersState() (count int, gen uint64) {
 // Broadcast fans an event out to browser subscribers (drops for slow
 // consumers). Callers typically use RegisterEvent instead.
 func (h *Hub) Broadcast(ev Event) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.broadcastLocked(ev)
+	h.broadcast(ev)
 }
 
-func (h *Hub) broadcastLocked(ev Event) {
-	for ch := range h.subscribers {
+// broadcast fans an event out to every browser subscriber against a
+// lock-free copy-on-write snapshot of the subscriber list: registration
+// churn (browser connect/disconnect) swaps the slice under h.mu, while
+// this hot path — per host event — never touches the global lock.
+func (h *Hub) broadcast(ev Event) {
+	cur := h.subs.Load()
+	if cur == nil {
+		return
+	}
+	for _, s := range *cur {
 		select {
-		case ch <- ev:
+		case s.ch <- ev:
 		default:
 			// Slow FE /ws/fe: drop this event for that subscriber only.
 			// Host-assigned seqs may then look gapped on that client
