@@ -128,6 +128,10 @@ stream-specific except the auth handshake.
     `seq_reset`, `pong`.
   - hub → host: `hello` (deflate echo), `subscribers`, `ping`, and ALL
     relayed `request` frames. The hub never writes on any other stream.
+    The `ping` piggy-backs `"seq"`: the per-host data-plane watermark
+    (same meaning as `hello.seq`), refreshed every ping — hosts use it as
+    a delivery ACK to anchor drop-repairs. Old hubs omit the field; hosts
+    treat a missing `seq` as "no new ack".
   - closing the control stream (or its read timeout) ends the whole
     session and the connection.
 

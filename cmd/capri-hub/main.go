@@ -697,7 +697,7 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 				idle.Reset(hostReadTimeout)
 				handleHostFrame(h, hostID, f.data, write)
 			case <-ping.C:
-				_ = writeHostPing(h, write)
+				_ = writeHostPing(h, hostID, write)
 			case <-idle.C:
 				log.Printf("[capri-hub] host %s: no uplink for %s, dropping", hostID, hostReadTimeout)
 				return
@@ -772,11 +772,18 @@ func inflateUplink(b []byte) ([]byte, error) {
 // paused while a browser sits watching a frozen page. Piggy-backing the
 // absolute value on the ping makes the state self-healing within one ping
 // interval. `subsGen` lets the host discard an out-of-order delivery.
-func writeHostPing(h *hub.Hub, write func([]byte) error) error {
+//
+// `seq` piggy-backs the per-host data-plane watermark (same meaning as
+// hello.seq): it is a delivery ACK for the host's uplink events, letting
+// the host anchor its drop-repair at what actually reached the hub instead
+// of what it managed to enqueue. Absent on old hubs — hosts treat a
+// missing field as "no new ack".
+func writeHostPing(h *hub.Hub, hostID string, write func([]byte) error) error {
 	count, gen := h.SubscribersState()
 	frame, err := json.Marshal(map[string]any{
 		"v": 1, "type": "ping", "ts": time.Now().Unix(),
 		"subscribers": count, "subsGen": gen,
+		"seq": h.LastSeq(hostID),
 	})
 	if err != nil {
 		return err
@@ -1323,7 +1330,7 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 			case <-pingDone:
 				return
 			case <-t.C:
-				if err := writeHostPing(h, wsafe); err != nil {
+				if err := writeHostPing(h, hostID, wsafe); err != nil {
 					return
 				}
 			}

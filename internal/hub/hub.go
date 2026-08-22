@@ -40,8 +40,15 @@ const (
 	// RelayTimeout caps how long the hub waits for a host to answer a
 	// relayed request (mirrors the host's 30-minute prompt timeout).
 	RelayTimeout = 45 * time.Minute
-	// eventBufCap bounds per-host buffered events for gap-pull.
-	eventBufCap = 4000
+	// eventBufCap bounds per-host buffered events for gap-pull. It MUST
+	// stay ≥ the host's replay ring (capri-host internal/hub replayCap =
+	// 5000): after a long disconnect the host replays up to its whole
+	// ring, and a smaller hub buffer would compact away the oldest of
+	// those events — the FE's gap-pull could then never fill the hole and
+	// its ordered-delivery buffer would wait on a predecessor that no
+	// longer exists on either side. 6000 keeps a margin above the host
+	// constant.
+	eventBufCap = 6000
 	// evBufHighWater is where RegisterEvent compacts the buffer back down
 	// to eventBufCap. Compacting on every overflow instead would copy the
 	// whole buffer per event (see RegisterEvent); the slack makes it

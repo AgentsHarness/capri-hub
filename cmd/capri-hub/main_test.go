@@ -277,6 +277,48 @@ func TestHandleHostFrameSeqLessAdvancesCounter(t *testing.T) {
 	}
 }
 
+// TestWriteHostPingCarriesSeqAck: the hub→host ping piggy-backs the
+// per-host data-plane watermark (same meaning as hello.seq) so the host
+// can anchor drop-repairs at what actually reached the hub. Absent field
+// would silently strand old-host compatibility, so assert it explicitly.
+func TestWriteHostPingCarriesSeqAck(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	for i := uint64(1); i <= 7; i++ {
+		if !h.RegisterEvent("h1", hub.Event{"type": "chunk", "text": "x", "seq": i}) {
+			t.Fatalf("RegisterEvent %d rejected", i)
+		}
+	}
+	var frame []byte
+	if err := writeHostPing(h, "h1", func(p []byte) error { frame = p; return nil }); err != nil {
+		t.Fatalf("writeHostPing: %v", err)
+	}
+	var f struct {
+		Type        string  `json:"type"`
+		Seq         *uint64 `json:"seq"`
+		Subscribers int     `json:"subscribers"`
+	}
+	if err := json.Unmarshal(frame, &f); err != nil {
+		t.Fatalf("bad ping frame: %.60s (%v)", frame, err)
+	}
+	if f.Type != "ping" {
+		t.Fatalf("frame type = %q, want ping", f.Type)
+	}
+	if f.Seq == nil || *f.Seq != 7 {
+		t.Fatalf("ping seq = %v, want 7 (the host's data-plane watermark)", f.Seq)
+	}
+	// A host with no events yet acks 0 (field still present, not null).
+	if err := writeHostPing(h, "ghost", func(p []byte) error { frame = p; return nil }); err != nil {
+		t.Fatalf("writeHostPing(ghost): %v", err)
+	}
+	if err := json.Unmarshal(frame, &f); err != nil || f.Seq == nil || *f.Seq != 0 {
+		t.Fatalf("unknown-host ping seq = %v, want 0", f.Seq)
+	}
+}
+
 func TestFETicketSingleUse(t *testing.T) {
 	s := newFETicketStore()
 	ticket, exp := s.issue()
