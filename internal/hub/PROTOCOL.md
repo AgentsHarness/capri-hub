@@ -115,3 +115,33 @@ The hub→host downlink never sets the flag bit; hosts may ignore it.
   host MUST send every frame as bare JSON (WS text / QUIC `C = 0`). The
   hub drops binary WS frames and QUIC `C = 1` frames it cannot map to a
   negotiated connection.
+
+## 4. QUIC stream planes (multi-stream sessions)
+
+One QUIC connection = one host session, spread over several bidirectional
+streams. Frames are self-describing JSON routed by `type`; no frame is
+stream-specific except the auth handshake.
+
+- **Control stream** — the FIRST stream the host opens (and the hub
+  accepts) on the connection:
+  - host → hub: first frame MUST be `auth`; then `events`, `host_status`,
+    `seq_reset`, `pong`.
+  - hub → host: `hello` (deflate echo), `subscribers`, `ping`, and ALL
+    relayed `request` frames. The hub never writes on any other stream.
+  - closing the control stream (or its read timeout) ends the whole
+    session and the connection.
+
+- **Request streams** — every additional stream the host opens after
+  auth. Pure uplink:
+  - carry `respond` frames (one stream per in-flight request, or a
+    single shared request stream on older hosts);
+  - the host MAY send one no-op `pong` as the first frame to materialize
+    the stream (`OpenStream` transmits nothing until first write — an
+    unaccepted, unwritten stream is invisible to the hub);
+  - EOF/reset on a request stream is the NORMAL end of that request and
+    MUST NOT tear down the session; each request stream also has its own
+    idle deadline (hub-side `hostReadTimeout`).
+
+Wire format (length prefix, bit 31 deflate flag) is identical on every
+stream; the deflate flag is session-scoped (negotiated via the auth
+frame / hello echo) and applies to frames on all streams.

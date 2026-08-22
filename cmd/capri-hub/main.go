@@ -863,6 +863,14 @@ const maxFESubscribers = 256
 // get to skip a decompression step.
 const minCompressSize = 256
 
+// FE WS liveness cadence (T7): protocol-level Ping every interval, pong
+// must arrive within the timeout or the subscriber is reclaimed. Vars
+// (not consts) so tests can tighten them.
+var (
+	feLivenessInterval = 20 * time.Second
+	feLivenessTimeout  = 10 * time.Second
+)
+
 // Pooled flate writers/buffers for the compressed /ws/fe path: under
 // chunk storms writeEventsFrame runs per frame, and a fresh
 // flate.Writer + bytes.Buffer per frame would hammer the GC.
@@ -1026,9 +1034,17 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 
 		ping := time.NewTicker(10 * time.Second)
 		defer ping.Stop()
+		// Snapshot once per connection: tests retune the package vars
+		// between connections without racing in-flight handlers.
+		livenessInterval, livenessTimeout := feLivenessInterval, feLivenessTimeout
+		liveness := time.NewTicker(livenessInterval)
+		defer liveness.Stop()
 
 		ctx := r.Context()
 		// Drain FE pings in background so the read side does not stall.
+		// This reader is also what processes the peer's WS pong for the
+		// protocol-level Ping below — without an in-flight Read the pong
+		// would never be dispatched.
 		go func() {
 			for {
 				_, _, err := conn.Read(ctx)
@@ -1048,6 +1064,20 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 					return
 				}
 				if err := writeJSONFrame(map[string]any{"v": 1, "type": "ping", "ts": time.Now().Unix()}); err != nil {
+					return
+				}
+			case <-liveness.C:
+				// Protocol-level liveness (T7): a half-open FE connection
+				// used to linger until a data write hit the 15s timeout —
+				// and forever on an idle session. Ping waits for the peer's
+				// pong (processed by the drain goroutine above); failure
+				// frees the 512-event subscriber channel immediately.
+				// Concurrent with writeFrame: the library serializes
+				// control frames via its internal write mutex.
+				pctx, pcancel := context.WithTimeout(ctx, livenessTimeout)
+				err := conn.Ping(pctx)
+				pcancel()
+				if err != nil {
 					return
 				}
 			case <-flushCh:
@@ -1219,27 +1249,7 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	defer stream.Close()
 	defer conn.CloseWithError(0, "")
 
-	readFrame := func() ([]byte, error) {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-			return nil, err
-		}
-		// QUIC wire rule (PROTOCOL.md): bit 31 of the length prefix marks
-		// the body as one raw-deflate stream; the low 31 bits carry the
-		// (compressed) body length.
-		n, compressed := parseUplinkLen(binary.BigEndian.Uint32(lenBuf[:]))
-		if n > 32<<20 {
-			return nil, fmt.Errorf("frame too large: %d", n)
-		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(stream, buf); err != nil {
-			return nil, err
-		}
-		if !compressed {
-			return buf, nil
-		}
-		return inflateUplink(buf)
-	}
+	readFrame := quicFrameReader(stream)
 	// Match WS hostWriteTimeout: a half-open peer must not block writes
 	// (and thus writeMu / notifyHostsSubscribers goroutines) forever.
 	write := func(payload []byte) error {
@@ -1324,6 +1334,48 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	// the read deadline is reset before every frame, so a host that
 	// stops sending is dropped silently instead of lingering "online"
 	// with every relay stuck.
+	go func() {
+		for {
+			// Request-plane streams (T1): besides the control stream the
+			// host opens further bidirectional streams — one per in-flight
+			// relay request (or a shared request stream on older hosts).
+			// They carry only host→hub `respond` frames plus a no-op
+			// `pong` used to materialize the stream (OpenStream transmits
+			// nothing until first write). The hub→host direction stays on
+			// the control stream, so these are pure uplink: EOF when the
+			// host finishes a request is NORMAL and must not tear down the
+			// session — only the control stream's death does (below, or
+			// via conn.CloseWithError when this session returns).
+			rs, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				return // connection closed with the session
+			}
+			go func(rs *quic.Stream) {
+				defer rs.Close()
+				rf := quicFrameReader(rs)
+				for {
+					// Per-stream idle cap: a stalled request stream is
+					// dropped alone (hostReadTimeout, same budget as the
+					// control plane).
+					if err := rs.SetReadDeadline(time.Now().Add(hostReadTimeout)); err != nil {
+						return
+					}
+					data, err := rf()
+					if err != nil {
+						return // EOF / timeout / reset: end of this stream only
+					}
+					if !h.IsCurrentConn(hostID, sc) {
+						return
+					}
+					// handleHostFrame routes by frame type; `write`
+					// replies (pong to a stray ping) go back over the
+					// CONTROL stream via wsafe, never this stream.
+					handleHostFrame(h, hostID, data, wsafe)
+				}
+			}(rs)
+		}
+	}()
+
 	for {
 		if err := stream.SetReadDeadline(time.Now().Add(hostReadTimeout)); err != nil {
 			return
@@ -1339,6 +1391,30 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 			return
 		}
 		handleHostFrame(h, hostID, data, wsafe)
+	}
+}
+
+// quicFrameReader returns a readFrame closure for one QUIC stream. The
+// wire format is identical on every stream of the session (4-byte big
+// endian length prefix, bit 31 = raw-deflate flag; see PROTOCOL.md §2).
+func quicFrameReader(stream *quic.Stream) func() ([]byte, error) {
+	return func() ([]byte, error) {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+			return nil, err
+		}
+		n, compressed := parseUplinkLen(binary.BigEndian.Uint32(lenBuf[:]))
+		if n > 32<<20 {
+			return nil, fmt.Errorf("frame too large: %d", n)
+		}
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			return nil, err
+		}
+		if !compressed {
+			return buf, nil
+		}
+		return inflateUplink(buf)
 	}
 }
 
