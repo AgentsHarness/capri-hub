@@ -1243,3 +1243,237 @@ func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 	}
 	t.Fatalf("LastSeq = %d, want 2", h.LastSeq("qh2"))
 }
+
+// TestIntegrationQUICMultiStreamRequestPlane: T1 multi-stream sessions.
+// Control stream (first accepted) carries auth + events and receives the
+// relayed request; additional request-plane streams carry respond frames
+// (plus the no-op pong that materializes a freshly opened stream). EOF on
+// a request stream must NOT end the session.
+func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	tok, err := h.Pair(code, "qm1", "QM1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsConf, err := quicTLSConfig(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := quic.ListenAddr("127.0.0.1:0", tlsConf, &quic.Config{KeepAlivePeriod: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveQUIC(ln, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, ln.Addr().String(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"capri-hub"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("quic dial: %v", err)
+	}
+	defer conn.CloseWithError(0, "")
+
+	control, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	wf := func(s *quic.Stream, payload []byte, compressed bool) error {
+		var cFlag uint32
+		if compressed {
+			cFlag = uplinkCompressedFlag
+		}
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload))|cFlag)
+		if _, err := s.Write(lenBuf[:]); err != nil {
+			return err
+		}
+		_, err := s.Write(payload)
+		return err
+	}
+	rf := func(s *quic.Stream) ([]byte, error) {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(s, lenBuf[:]); err != nil {
+			return nil, err
+		}
+		n := binary.BigEndian.Uint32(lenBuf[:])
+		buf := make([]byte, n)
+		_, err := io.ReadFull(s, buf)
+		return buf, err
+	}
+
+	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true})
+	if err := wf(control, auth, false); err != nil {
+		t.Fatal(err)
+	}
+	hello, err := rf(control)
+	if err != nil || json.Unmarshal(hello, &map[string]any{}) != nil {
+		t.Fatalf("hello: %v %s", err, hello)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && h.DefaultHostID() == "" {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.DefaultHostID() != "qm1" {
+		t.Fatalf("host not online: %q", h.DefaultHostID())
+	}
+
+	// An event on the control stream advances the watermark.
+	ev1, _ := json.Marshal(map[string]any{"v": 1, "type": "events", "seqStart": 1,
+		"events": []any{map[string]any{"type": "chunk", "text": "a", "seq": 1}}})
+	if err := wf(control, ev1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Relay round-trip: Dispatch pushes a request down the CONTROL stream;
+	// we answer with a respond on a fresh REQUEST stream.
+	type resp struct {
+		Status int
+		Body   string
+		Err    error
+	}
+	respCh := make(chan resp, 1)
+	go func() {
+		r, err := h.Dispatch(ctx, "qm1", "GET", "/x", nil)
+		if err != nil {
+			respCh <- resp{Err: err}
+			return
+		}
+		respCh <- resp{Status: r.Status, Body: string(r.Body)}
+	}()
+
+	// Read the request frame off the control stream (hello already
+	// consumed; ping frames may interleave — skip to the request).
+	var reqID string
+	for reqID == "" {
+		data, err := rf(control)
+		if err != nil {
+			t.Fatalf("read request frame: %v", err)
+		}
+		var f struct {
+			Type  string `json:"type"`
+			ReqID string `json:"reqId"`
+		}
+		if json.Unmarshal(data, &f) == nil && f.Type == "request" {
+			reqID = f.ReqID
+		}
+	}
+
+	// Request stream: no-op pong materializes it, then the respond. Send
+	// the respond COMPRESSED — the deflate flag is session-scoped and
+	// must be honored on request streams too (PROTOCOL.md §4).
+	rs, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
+	if err := wf(rs, pong, false); err != nil {
+		t.Fatal(err)
+	}
+	rbody, _ := json.Marshal(map[string]any{"ok": true, "via": "request-stream"})
+	var rbuf bytes.Buffer
+	fw, _ := flate.NewWriter(&rbuf, flate.BestSpeed)
+	fw.Write(rbody)
+	fw.Close()
+	frameJSON, _ := json.Marshal(map[string]any{"v": 1, "type": "respond", "reqId": reqID, "status": 234, "body": json.RawMessage(rbody)})
+	var zbuf bytes.Buffer
+	zw, _ := flate.NewWriter(&zbuf, flate.BestSpeed)
+	zw.Write(frameJSON)
+	zw.Close()
+	if err := wf(rs, zbuf.Bytes(), true); err != nil {
+		t.Fatal(err)
+	}
+	rs.Close() // normal end of the request plane for this request
+
+	select {
+	case r := <-respCh:
+		if r.Err != nil {
+			t.Fatalf("dispatch: %v", r.Err)
+		}
+		if r.Status != 234 || r.Body != string(rbody) {
+			t.Fatalf("relay respond = %d %s, want 234 %s", r.Status, r.Body, rbody)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("respond on request stream never routed to Dispatch")
+	}
+
+	// The session must survive the request stream's EOF: another control
+	// event still lands.
+	ev2, _ := json.Marshal(map[string]any{"v": 1, "type": "events", "seqStart": 2,
+		"events": []any{map[string]any{"type": "chunk", "text": "b", "seq": 2}}})
+	if err := wf(control, ev2, false); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.LastSeq("qm1") == 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("LastSeq = %d, want 2 (session died with request stream?)", h.LastSeq("qm1"))
+}
+
+// TestFeWSLivenessReclaimsDeadSubscriber: T7 — an FE client that stops
+// reading (so never answers the protocol-level Ping) must lose its
+// subscriber slot promptly instead of lingering until a data write
+// times out; a healthy reader keeps its slot.
+func TestFeWSLivenessReclaimsDeadSubscriber(t *testing.T) {
+	oldI, oldT := feLivenessInterval, feLivenessTimeout
+	feLivenessInterval, feLivenessTimeout = 100*time.Millisecond, 300*time.Millisecond
+	defer func() { feLivenessInterval, feLivenessTimeout = oldI, oldT }()
+
+	h := hub.NewWithDir("")
+	ts := httptest.NewServer(handleFeWS(h, feAuth{}))
+	defer ts.Close()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/fe"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Healthy client: keeps reading → answers pongs → stays subscribed.
+	good, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer good.Close(websocket.StatusNormalClosure, "")
+	go func() {
+		for {
+			if _, _, err := good.Read(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	waitCount := func(want int) bool {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if h.SubscriberCount() == want {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+	if !waitCount(1) {
+		t.Fatal("healthy FE subscriber never registered")
+	}
+
+	// Dead client: dials but never reads → no pong → reclaimed.
+	dead, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dead.Close(websocket.StatusNormalClosure, "")
+	if !waitCount(2) {
+		t.Fatal("second subscriber never registered")
+	}
+	if !waitCount(1) {
+		t.Fatalf("dead subscriber not reclaimed within liveness window (count=%d)", h.SubscriberCount())
+	}
+}
