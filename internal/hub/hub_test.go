@@ -1227,10 +1227,10 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 		Todos:            map[string]string{"s1": "todo", "s2": "completed"},
 		FePrefs:          FePrefs{"collapseToolGroups": false},
 	}
-	if err := h.SetPrefs(doc); err != nil {
+	if _, err := h.SetPrefs(doc, 0, false); err != nil {
 		t.Fatalf("SetPrefs: %v", err)
 	}
-	got := h.Prefs()
+	got, _ := h.Prefs()
 	if len(got.PinnedWorkspaces) != 2 || got.PinnedSessions[0] != "s1" || got.Todos["s2"] != "completed" {
 		t.Errorf("Prefs = %+v, want the stored doc", got)
 	}
@@ -1241,25 +1241,25 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 	got.PinnedWorkspaces[0] = "MUTATED"
 	got.Todos["s1"] = "completed"
 	got.FePrefs["collapseToolGroups"] = true
-	again := h.Prefs()
+	again, _ := h.Prefs()
 	if again.PinnedWorkspaces[0] != "/home/u/a" || again.Todos["s1"] != "todo" ||
 		again.FePrefs["collapseToolGroups"] != false {
 		t.Errorf("Prefs is not a deep copy: %+v", again)
 	}
 	// A fresh Hub on the same dir reloads the doc from prefs.json.
 	h2 := NewWithDir(dir)
-	reloaded := h2.Prefs()
+	reloaded, _ := h2.Prefs()
 	if reloaded.PinnedWorkspaces[0] != "/home/u/a" || reloaded.Todos["s2"] != "completed" ||
 		reloaded.FePrefs["collapseToolGroups"] != false {
 		t.Errorf("reloaded Prefs = %+v, want the persisted doc", reloaded)
 	}
 	// Replace semantics: SetPrefs overwrites the whole doc.
-	if err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"only"}}); err != nil {
+	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"only"}}, 0, false); err != nil {
 		t.Fatalf("SetPrefs replace: %v", err)
 	}
-	got = h.Prefs()
+	got, _ = h.Prefs()
 	if len(got.PinnedWorkspaces) != 0 || len(got.Todos) != 0 || got.PinnedSessions[0] != "only" {
-		t.Errorf("Prefs after replace = %+v", got)
+		t.Errorf("Prefs after replace = %+v, want the stored doc", got)
 	}
 	if len(got.FePrefs) != 0 {
 		t.Errorf("Prefs.FePrefs after replace = %+v, want empty", got.FePrefs)
@@ -1268,9 +1268,65 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 
 func TestPrefsEmptyDoc(t *testing.T) {
 	h := NewWithDir(t.TempDir())
-	p := h.Prefs()
+	p, version := h.Prefs()
 	if p.PinnedWorkspaces == nil || p.PinnedSessions == nil || p.Todos == nil {
 		t.Errorf("empty doc must have non-nil containers: %+v", p)
+	}
+	if version != 0 {
+		t.Errorf("fresh hub version = %d, want 0", version)
+	}
+}
+
+// TestPrefsVersionCas: conditional writes with baseVersion — accepted when
+// the base matches, ErrPrefsConflict (doc untouched) when stale; version
+// bumps on every accepted write (unconditional ones included) and survives
+// a hub restart via prefs.json.
+func TestPrefsVersionCas(t *testing.T) {
+	dir := t.TempDir()
+	h := NewWithDir(dir)
+
+	// Unconditional (old-FE) writes are accepted and bump the version.
+	v1, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s1"}}, 0, false)
+	if err != nil || v1 != 1 {
+		t.Fatalf("unconditional write: v=%d err=%v, want v=1 nil", v1, err)
+	}
+	// Matching base accepted.
+	v2, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s1", "s2"}}, v1, true)
+	if err != nil || v2 != 2 {
+		t.Fatalf("matching-base write: v=%d err=%v, want v=2 nil", v2, err)
+	}
+	// Stale base rejected, doc untouched.
+	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"stale"}}, v1, true); !errors.Is(err, ErrPrefsConflict) {
+		t.Fatalf("stale-base write err = %v, want ErrPrefsConflict", err)
+	}
+	doc, v := h.Prefs()
+	if v != v2 || len(doc.PinnedSessions) != 2 || doc.PinnedSessions[1] != "s2" {
+		t.Errorf("after rejected write: doc=%+v v=%d, want s1+s2 v=%d", doc, v, v2)
+	}
+
+	// A subscriber sees prefs_changed carrying the new version.
+	ch, unsub, ok := h.TrySubscribe(0)
+	if !ok {
+		t.Fatalf("TrySubscribe failed")
+	}
+	defer unsub()
+	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s3"}}, v, true); err != nil {
+		t.Fatalf("broadcast write: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		params, _ := ev["params"].(map[string]any)
+		if ver, _ := params["version"].(uint64); ver != v+1 {
+			t.Errorf("broadcast version = %v, want %d", params["version"], v+1)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("no prefs_changed broadcast received")
+	}
+
+	// Version persists with the doc: a fresh hub reloads both.
+	h2 := NewWithDir(dir)
+	if _, vr := h2.Prefs(); vr != v+1 {
+		t.Errorf("reloaded version = %d, want %d", vr, v+1)
 	}
 }
 
@@ -1281,7 +1337,7 @@ func TestPrefsBroadcast(t *testing.T) {
 	ch, unsub := h.Subscribe()
 	defer unsub()
 	doc := BrowserPrefs{PinnedSessions: []string{"s1"}, Todos: map[string]string{"s1": "todo"}}
-	if err := h.SetPrefs(doc); err != nil {
+	if _, err := h.SetPrefs(doc, 0, false); err != nil {
 		t.Fatalf("SetPrefs: %v", err)
 	}
 	select {

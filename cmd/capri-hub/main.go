@@ -477,31 +477,51 @@ func handleHosts(h *hub.Hub) http.HandlerFunc {
 // handlePrefsGet: GET /api/prefs — the browser prefs document (pinned
 // workspaces / sessions + per-session todo status), persisted by the hub
 // in prefs.json. One shared document for all browsers; the FE merges it
-// with its localStorage cache on boot.
+// with its localStorage cache on boot. Carries the doc's version — the
+// CAS base for conditional PUTs (old FEs ignore it).
 func handlePrefsGet(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "prefs": h.Prefs()})
+		doc, version := h.Prefs()
+		writeJSON(w, 200, map[string]any{"ok": true, "prefs": doc, "version": version})
 	}
 }
 
-// handlePrefsPut: PUT /api/prefs {prefs: {...}} — replace the browser
-// prefs document. The FE writes its whole doc on every change
-// (debounced client-side), so this is a simple idempotent replace. The
-// doc is small (pins + todos), no size cap is enforced.
+// handlePrefsPut: PUT /api/prefs {prefs: {...}, baseVersion?: N} — replace
+// the browser prefs document. baseVersion (new FE) makes the write
+// conditional: a stale writer gets 409 + the current doc and version so it
+// can replay its pending operations onto them and retry; without
+// baseVersion the write is unconditional (old-FE compat). The doc is
+// small (pins + todos), no size cap is enforced.
 func handlePrefsPut(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Prefs *hub.BrowserPrefs `json:"prefs"`
+			Prefs       *hub.BrowserPrefs `json:"prefs"`
+			BaseVersion *uint64           `json:"baseVersion"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prefs == nil {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 prefs 字段"})
 			return
 		}
-		if err := h.SetPrefs(*body.Prefs); err != nil {
+		base := uint64(0)
+		if body.BaseVersion != nil {
+			base = *body.BaseVersion
+		}
+		version, err := h.SetPrefs(*body.Prefs, base, body.BaseVersion != nil)
+		if err != nil {
+			if errors.Is(err, hub.ErrPrefsConflict) {
+				doc, cur := h.Prefs()
+				writeJSON(w, 409, map[string]any{
+					"ok":      false,
+					"error":   err.Error(),
+					"prefs":   doc,
+					"version": cur,
+				})
+				return
+			}
 			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"ok": true})
+		writeJSON(w, 200, map[string]any{"ok": true, "version": version})
 	}
 }
 

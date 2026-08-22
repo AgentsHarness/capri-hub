@@ -204,6 +204,10 @@ type Hub struct {
 	// hub.json). Written on SetPrefs only.
 	prefsFile string
 	prefs     BrowserPrefs
+	// prefsVersion is the CAS version of prefs: bumped on every accepted
+	// write, persisted in prefs.json, and echoed in GET/broadcast so FEs
+	// can make conditional (baseVersion) writes. 0 = never written.
+	prefsVersion uint64
 }
 
 // codeAlphabet avoids look-alike characters (no I/L/O/0/1).
@@ -366,19 +370,29 @@ func writeFileAtomic(path string, b []byte) error {
 
 // ── browser preferences (pins / todos) ────────────────────────────────
 
-// loadPrefs reads prefs.json into h.prefs. A missing file starts empty;
-// an unreadable one is ignored (rebuilt on the next write).
+// loadPrefs reads prefs.json into h.prefs (+ version). A missing file
+// starts empty; an unreadable one is ignored (rebuilt on the next write).
+// The version rides in the same JSON object as a sibling key, so an older
+// hub reading a newer file still finds every doc field.
 func (h *Hub) loadPrefs() {
 	b, err := os.ReadFile(h.prefsFile)
 	if err != nil {
 		return
 	}
-	var raw BrowserPrefs
+	var raw prefsFileDoc
 	if json.Unmarshal(b, &raw) != nil {
 		log.Printf("[capri-hub] prefs: ignoring unreadable %s", h.prefsFile)
 		return
 	}
-	h.prefs = sanitizePrefs(raw)
+	h.prefs = sanitizePrefs(raw.BrowserPrefs)
+	h.prefsVersion = raw.Version
+}
+
+// prefsFileDoc is the prefs.json envelope: the doc fields at the top level
+// plus the CAS version (unknown-key-tolerant both ways across upgrades).
+type prefsFileDoc struct {
+	BrowserPrefs
+	Version uint64 `json:"version"`
 }
 
 // sanitizePrefs normalizes a decoded doc (nil slices → empty, nil todos →
@@ -415,35 +429,47 @@ func clonePrefs(p BrowserPrefs) BrowserPrefs {
 	})
 }
 
-// Prefs returns a deep copy of the browser prefs doc (empty when the hub
-// has never received one).
-func (h *Hub) Prefs() BrowserPrefs {
+// ErrPrefsConflict: a conditional SetPrefs whose baseVersion no longer
+// matches the current version — the writer is stale and must re-pull.
+var ErrPrefsConflict = errors.New("prefs version conflict")
+
+// Prefs returns a deep copy of the browser prefs doc plus its current
+// version (a consistent pair under one lock; empty doc when the hub has
+// never received one).
+func (h *Hub) Prefs() (BrowserPrefs, uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return clonePrefs(h.prefs)
+	return clonePrefs(h.prefs), h.prefsVersion
 }
 
 // SetPrefs replaces the browser prefs doc and persists it to prefs.json.
-// The snapshot is taken under the lock; the file write runs outside it
-// (same pattern as pairing state). The doc is small (pins + todos), so
-// no size cap is enforced. Every accepted doc is broadcast to browser
-// subscribers as `prefs_changed` (hub-level event, no hostId) so OTHER
-// browsers apply the change live — one end's edit syncs to every end.
-func (h *Hub) SetPrefs(prefs BrowserPrefs) error {
+// base/hasBase implement compare-and-swap writes: with hasBase the doc is
+// accepted only when base equals the current version (stale writers get
+// ErrPrefsConflict and must re-pull); without it the write is unconditional
+// (old-FE compat). Every accepted doc bumps the version and is broadcast
+// to browser subscribers as `prefs_changed` (carrying the new version) so
+// other browsers apply the change live. Returns the new version.
+func (h *Hub) SetPrefs(prefs BrowserPrefs, base uint64, hasBase bool) (uint64, error) {
 	cp := sanitizePrefs(clonePrefs(prefs))
 	h.mu.Lock()
+	if hasBase && base != h.prefsVersion {
+		h.mu.Unlock()
+		return 0, ErrPrefsConflict
+	}
 	persist := h.prefsFile != ""
 	var payload []byte
 	if persist {
-		b, err := json.Marshal(cp)
+		b, err := json.Marshal(prefsFileDoc{BrowserPrefs: cp, Version: h.prefsVersion + 1})
 		if err != nil {
 			h.mu.Unlock()
-			return fmt.Errorf("marshal prefs: %w", err)
+			return 0, fmt.Errorf("marshal prefs: %w", err)
 		}
 		payload = b
 	}
+	h.prefsVersion++
+	newVersion := h.prefsVersion
 	h.prefs = cp
-	h.broadcast(prefsChanged(cp))
+	h.broadcast(prefsChanged(cp, newVersion))
 	h.mu.Unlock()
 
 	if persist {
@@ -451,13 +477,14 @@ func (h *Hub) SetPrefs(prefs BrowserPrefs) error {
 			log.Printf("[capri-hub] prefs persist: %v", err)
 		}
 	}
-	return nil
+	return newVersion, nil
 }
 
 // prefsChanged builds the prefs broadcast event (hub-level, no hostId —
-// browsers apply it regardless of the selected host).
-func prefsChanged(prefs BrowserPrefs) Event {
-	return Event{"type": "prefs_changed", "params": map[string]any{"prefs": prefs}}
+// browsers apply it regardless of the selected host). Carries the doc's
+// new version so clean clients track their CAS base without re-pulling.
+func prefsChanged(prefs BrowserPrefs, version uint64) Event {
+	return Event{"type": "prefs_changed", "params": map[string]any{"prefs": prefs, "version": version}}
 }
 
 // ── pairing ───────────────────────────────────────────────────────────
