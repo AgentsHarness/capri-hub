@@ -213,7 +213,8 @@ type Hub struct {
 // codeAlphabet avoids look-alike characters (no I/L/O/0/1).
 const codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
-// New returns a Hub that persists pairing state under ~/.capri-hub.
+// New returns a Hub that persists pairing state under HUB_DATA_DIR when
+// set, else ~/.capri-hub.
 func New() *Hub {
 	return NewWithDir(defaultDataDir())
 }
@@ -239,7 +240,16 @@ func NewWithDir(dir string) *Hub {
 	return h
 }
 
+// defaultDataDir resolves where hub.json / prefs.json live.
+//
+// HUB_DATA_DIR wins when set: a container has no meaningful home
+// directory, and relying on $HOME to redirect state is fragile (it also
+// moves anything else that reads the home dir). An explicit override
+// lets the deployment mount one volume at one known path.
 func defaultDataDir() string {
+	if dir := strings.TrimSpace(os.Getenv("HUB_DATA_DIR")); dir != "" {
+		return dir
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""

@@ -45,6 +45,13 @@ import (
 )
 
 func main() {
+	// Subcommands run and exit without starting a server. Only an exact
+	// match is intercepted so any existing invocation (which passes no
+	// arguments) keeps booting the hub.
+	if len(os.Args) > 1 && os.Args[1] == "paircode" {
+		os.Exit(runPairCode(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	port := 8787
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -78,6 +85,11 @@ func main() {
 
 	code, exp := h.PairingCode()
 	log.Printf("[capri-hub] pairing code: %s (expires %s)", code, exp.Format("15:04:05"))
+	// The line above is stale within PairingCodeTTL, so point at the
+	// command that always prints the live one — this log is often the
+	// only thing an operator of a container ever reads.
+	log.Printf("[capri-hub] 配对码 %d 分钟后自动轮换；随时查看当前码: capri-hub paircode",
+		int(hub.PairingCodeTTL/time.Minute))
 	if feToken != "" {
 		log.Printf("[capri-hub] FE_TOKEN set — browser requests require Authorization: Bearer <token> (WS: prefer POST /api/ws-ticket + ?ticket=)")
 	} else {

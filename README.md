@@ -38,18 +38,44 @@ Hub **不执行**任何命令，只做配对、发现和转发。
 
 ## 部署
 
-需要 Go 1.26+，或从 [Releases](https://github.com/AgentsHarness/capri-hub/releases) 下载二进制。
+### Docker（推荐）
+
+```bash
+cp .env.example .env       # 填 FE_TOKEN：openssl rand -hex 24
+mkdir -p data && sudo chown -R 10001:10001 data
+docker compose up -d
+docker compose exec capri-hub capri-hub paircode    # ← 配对码在这里
+```
+
+多架构镜像（amd64 / arm64）在 `ghcr.io/luoxiaoxin123/capri-hub`。反向代理
+配置、UDP 8788 放行、迁移已有配对、排查清单见
+**[docs/DOCKER.md](docs/DOCKER.md)**。
+
+### 裸二进制
+
+需要 Go 1.26+，或从 [Releases](https://github.com/AgentsHarness/capri-hub/releases) 下载。
 
 ```bash
 # 生产务必设置 FE_TOKEN（浏览器门禁）
-FE_TOKEN=$(openssl rand -hex 24) go run ./capri-hub
+FE_TOKEN=$(openssl rand -hex 24) go run ./cmd/capri-hub
 ```
 
-启动日志会打印 **6 位配对码**（15 分钟有效）。也可以随时通过前端或API查看 / 换新：
+### 配对码
+
+启动日志会打印 **6 位配对码**，15 分钟有效、过期自动轮换，所以那一行很快
+就过时了。随时查看当前有效的码：
 
 ```bash
-curl http://127.0.0.1:8787/api/pairing
-curl -X POST http://127.0.0.1:8787/api/pairing/rotate
+capri-hub paircode           # 本机
+capri-hub paircode -rotate   # 立刻换一个新的（旧码失效）
+capri-hub paircode -json     # 给脚本用
+```
+
+也可以走 API（设了 `FE_TOKEN` 之后需要带 token）：
+
+```bash
+curl -H "Authorization: Bearer $FE_TOKEN" http://127.0.0.1:8787/api/pairing
+curl -X POST -H "Authorization: Bearer $FE_TOKEN" http://127.0.0.1:8787/api/pairing/rotate
 ```
 
 默认端口：HTTP `8787`，QUIC UDP `8788`（无 QUIC 则 WebSocket）。
@@ -78,6 +104,8 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 | `QUIC_PORT`        | `8788` | Host 主通道（UDP）                      |
 | `FE_TOKEN`         | —      | 浏览器访问密钥。生产必设                |
 | `REQUIRE_FE_TOKEN` | —      | 设为 `1` 时，没配 `FE_TOKEN` 会拒绝启动 |
+| `HUB_DATA_DIR`     | `~/.capri-hub` | 状态目录（`hub.json` / `prefs.json`）。容器部署设为 `/data` |
+| `QUIC_ALLOW_SELF_SIGNED` | — | 设了 `FE_TOKEN` 又没有真证书时，必须设为 `1`，否则 QUIC 关闭、Host 退回 WebSocket |
 | `CORS_ORIGINS`     | `*`    | 生产写成前端真实源                      |
 
 ## 项目生态

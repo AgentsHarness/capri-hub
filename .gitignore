@@ -19,3 +19,10 @@ acp-hub
 .idea
 .DS_Store
 /bin/
+
+# Docker deployment (docker-compose.yml mounts ./data)
+# .env holds FE_TOKEN; data/ holds every paired host's token.
+.env
+.env.*
+!.env.example
+/data/
