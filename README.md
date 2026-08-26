@@ -47,8 +47,14 @@ docker compose up -d
 docker compose exec capri-hub capri-hub paircode    # ← 配对码在这里
 ```
 
-多架构镜像（amd64 / arm64）在 `ghcr.io/luoxiaoxin123/capri-hub`。反向代理
-配置、UDP 8788 放行、迁移已有配对、排查清单见
+多架构镜像（amd64 / arm64）在 `ghcr.io/luoxiaoxin123/capri-hub`。要自己构建，
+国内机器得指定代理，否则 `go mod download` 会在 `proxy.golang.org` 上超时：
+
+```bash
+docker build --build-arg GOPROXY=https://goproxy.cn,direct -t capri-hub:local .
+```
+
+反向代理配置、UDP 8788 放行、迁移已有配对、排查清单见
 **[docs/DOCKER.md](docs/DOCKER.md)**。
 
 ### 裸二进制
