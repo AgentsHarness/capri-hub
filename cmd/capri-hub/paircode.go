@@ -61,9 +61,6 @@ func fetchPairCode(ctx context.Context, client *http.Client, baseURL, token stri
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
-	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return out, err
