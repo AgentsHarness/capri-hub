@@ -213,7 +213,8 @@ type Hub struct {
 // codeAlphabet avoids look-alike characters (no I/L/O/0/1).
 const codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
-// New returns a Hub that persists pairing state under ~/.capri-hub.
+// New returns a Hub that persists pairing state under HUB_DATA_DIR when
+// set, else ~/.capri-hub.
 func New() *Hub {
 	return NewWithDir(defaultDataDir())
 }
@@ -239,7 +240,16 @@ func NewWithDir(dir string) *Hub {
 	return h
 }
 
+// defaultDataDir resolves where hub.json / prefs.json live.
+//
+// HUB_DATA_DIR wins when set: a container has no meaningful home
+// directory, and relying on $HOME to redirect state is fragile (it also
+// moves anything else that reads the home dir). An explicit override
+// lets the deployment mount one volume at one known path.
 func defaultDataDir() string {
+	if dir := strings.TrimSpace(os.Getenv("HUB_DATA_DIR")); dir != "" {
+		return dir
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -450,7 +460,7 @@ func (h *Hub) Prefs() (BrowserPrefs, uint64) {
 // to browser subscribers as `prefs_changed` (carrying the new version) so
 // other browsers apply the change live. Returns the new version.
 func (h *Hub) SetPrefs(prefs BrowserPrefs, base uint64, hasBase bool) (uint64, error) {
-	cp := sanitizePrefs(clonePrefs(prefs))
+	cp := clonePrefs(prefs) // clonePrefs already sanitizes
 	h.mu.Lock()
 	if hasBase && base != h.prefsVersion {
 		h.mu.Unlock()
@@ -925,33 +935,50 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 func (hs *hostState) appendEvent(cp Event, hostID, hostName string) Event {
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
-	if s := evSeq(cp); s > 0 {
-		// Skip fan-out for duplicate/stale seqs (reconnect residual +
-		// replay). Counter must never move backwards.
-		if s <= hs.seq {
-			if s < hs.seq {
-				log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, s, hs.seq)
-			}
-			return nil
-		}
-		hs.seq = s
-	} else {
-		hs.seq++
-		cp["seq"] = hs.seq
+	incoming := evSeq(cp)
+	assigned, ok := hs.gateSeqLocked(hostID, incoming)
+	if !ok {
+		return nil
+	}
+	if incoming == 0 {
+		cp["seq"] = assigned
 	}
 	cp["hostId"] = hostID
 	cp["hostName"] = hostName
-	hs.evBuf = append(hs.evBuf, cp)
+	hs.bufferEventLocked(cp)
+	return cp
+}
+
+// gateSeqLocked applies the per-host seq gate shared by the map and raw event
+// paths: a host-provided seq is preserved (stale/duplicate rejected), and a
+// host that sent no seq gets the next hub-side counter. Returns the seq the
+// caller should stamp on its event and ok=false when the event was stale/
+// duplicate (skip fan-out). The caller must hold hs.mu.
+func (hs *hostState) gateSeqLocked(hostID string, incoming uint64) (assigned uint64, ok bool) {
+	if incoming > 0 {
+		if incoming <= hs.seq {
+			if incoming < hs.seq {
+				log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, incoming, hs.seq)
+			}
+			return 0, false
+		}
+		hs.seq = incoming
+	} else {
+		hs.seq++
+	}
+	return hs.seq, true
+}
+
+// bufferEventLocked appends ev to the gap-pull ring and compacts at the
+// high-water mark. The copy (not a reslice) keeps dropped Event maps from
+// staying reachable via the old backing array. The caller must hold hs.mu.
+func (hs *hostState) bufferEventLocked(ev Event) {
+	hs.evBuf = append(hs.evBuf, ev)
 	if len(hs.evBuf) > evBufHighWater {
-		// Amortized compaction (see RegisterEvent history / evBufHighWater):
-		// one fresh array per eventBufCap events instead of a reallocating
-		// copy per event. The copy (not a reslice) keeps the dropped Event
-		// maps from staying reachable via the old backing array.
 		trimmed := make([]Event, eventBufCap, evBufHighWater)
 		copy(trimmed, hs.evBuf[len(hs.evBuf)-eventBufCap:])
 		hs.evBuf = trimmed
 	}
-	return cp
 }
 
 // ── raw (pre-encoded) event fast path ─────────────────────────────────
@@ -1054,21 +1081,14 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 			continue
 		}
 		hs.mu.Lock()
-		// Same seq gating as appendEvent: preserve host seqs, skip
-		// stale/duplicate, fall back to hub-side assignment.
-		if meta.Seq > 0 {
-			if meta.Seq <= hs.seq {
-				if meta.Seq < hs.seq {
-					log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, meta.Seq, hs.seq)
-				}
-				hs.mu.Unlock()
-				continue
-			}
-			hs.seq = meta.Seq
-		} else {
-			hs.seq++
+		// Same seq gating as appendEvent (shared via gateSeqLocked): preserve
+		// host seqs, skip stale/duplicate, fall back to hub-side assignment.
+		assigned, ok := hs.gateSeqLocked(hostID, meta.Seq)
+		if !ok {
+			hs.mu.Unlock()
+			continue
 		}
-		wire := spliceRawEvent(r, idJSON, nameJSON, hs.seq, meta.Seq == 0)
+		wire := spliceRawEvent(r, idJSON, nameJSON, assigned, meta.Seq == 0)
 		if wire == nil {
 			hs.mu.Unlock()
 			log.Printf("[capri-hub] host %s non-object event skipped", hostID)
@@ -1077,16 +1097,11 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 		ev := Event{
 			rawWireKey: wire,
 			"type":     meta.Type,
-			"seq":      float64(hs.seq),
+			"seq":      float64(assigned),
 			"hostId":   hostID,
 			"hostName": hostName,
 		}
-		hs.evBuf = append(hs.evBuf, ev)
-		if len(hs.evBuf) > evBufHighWater {
-			trimmed := make([]Event, eventBufCap, evBufHighWater)
-			copy(trimmed, hs.evBuf[len(hs.evBuf)-eventBufCap:])
-			hs.evBuf = trimmed
-		}
+		hs.bufferEventLocked(ev)
 		hs.mu.Unlock()
 		// Back-compat: old hosts still send host_status inside events
 		// frames (see RegisterEvent).

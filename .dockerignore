@@ -1,0 +1,44 @@
+# Keep the build context to source + go.mod/go.sum. Everything below is
+# either useless to the build or must never enter an image layer.
+
+# Secrets and local state — .env holds FE_TOKEN, data/ holds host tokens.
+.env
+.env.*
+!.env.example
+data/
+*.pem
+*.key
+
+# Git metadata (the version string is passed as a build arg instead).
+.git
+.gitignore
+.github
+
+# Built binaries from a host-side `go build`: they would be copied in and
+# then ignored, and a Windows/macOS binary in a linux context is pure
+# waste.
+capri-hub
+capri-hub.exe
+acp-hub
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Docs and deployment files: changing a README should not invalidate the
+# build cache.
+*.md
+docs/
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
+.dockerignore
+LICENSE
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
