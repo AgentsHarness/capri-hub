@@ -1015,6 +1015,12 @@ type rawEventMeta struct {
 	Seq   uint64 `json:"seq"`
 	Type  string `json:"type"`
 	Ready bool   `json:"ready"`
+	// Only tool_call_update has a payload member here; every other event
+	// type leaves it zero. Read for the drop-tier decision (criticalEvent) —
+	// the alternative is decoding the body per subscriber.
+	ToolCallUpdate struct {
+		Status string `json:"status"`
+	} `json:"toolCallUpdate"`
 }
 
 // spliceRawEvent builds the FE-bound wire bytes for one raw event by
@@ -1100,6 +1106,10 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 			"seq":      float64(assigned),
 			"hostId":   hostID,
 			"hostName": hostName,
+		}
+		switch meta.ToolCallUpdate.Status {
+		case "completed", "failed":
+			ev[terminalToolUpdateKey] = true
 		}
 		hs.bufferEventLocked(ev)
 		hs.mu.Unlock()
@@ -1356,6 +1366,14 @@ var criticalEventTypes = map[string]struct{}{
 	"client_request": {},
 }
 
+// terminalToolUpdateKey flags the raw-path Event of a tool call's terminal
+// update. Host events reach the hub as opaque bytes (see rawWireKey), so
+// criticalEvent cannot see the nested status unless ingest lifts it. The
+// NUL-prefixed key follows the rawWireKey convention: an Event carrying it
+// also carries rawWireKey, and MarshalEvent returns those bytes verbatim,
+// so the flag can never leak onto the FE wire.
+const terminalToolUpdateKey = "\x00terminalToolUpdate"
+
 const (
 	// criticalSendTimeout bounds the blocking fallback delivery for
 	// critical events on a full queue: the FE writer drains a 512-event
@@ -1369,11 +1387,29 @@ const (
 	resyncDropThreshold = 32
 )
 
-// criticalEvent reports whether ev is a never-drop event type.
+// criticalEvent reports whether ev is a never-drop event type. A
+// tool_call_update counts only when it carries the call's terminal status:
+// losing that one update leaves the FE spinning a "Running" block until the
+// turn-end settle, while the in_progress argument/output deltas for the same
+// call stay droppable (gap-pull refills them).
 func criticalEvent(ev Event) bool {
+	if ev[terminalToolUpdateKey] == true {
+		return true
+	}
 	t, _ := ev["type"].(string)
-	_, ok := criticalEventTypes[t]
-	return ok
+	if _, ok := criticalEventTypes[t]; ok {
+		return true
+	}
+	if t != "tool_call_update" {
+		return false
+	}
+	// Legacy decoded path (RegisterEvent): the payload is already a map.
+	u, ok := ev["toolCallUpdate"].(map[string]any)
+	if !ok {
+		return false
+	}
+	s, _ := u["status"].(string)
+	return s == "completed" || s == "failed"
 }
 
 // deliver is one subscriber's fan-out step. Non-critical events use the

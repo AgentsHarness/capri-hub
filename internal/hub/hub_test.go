@@ -1700,3 +1700,99 @@ func TestFanoutCriticalEventSurvivesBackpressure(t *testing.T) {
 		}
 	}
 }
+
+// TestRawTerminalToolUpdateIsCritical: the raw ingest path must lift a
+// tool call's terminal status into the Event so the drop tier can see it,
+// without that flag ever reaching the FE wire.
+func TestRawTerminalToolUpdateIsCritical(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	raws := []json.RawMessage{
+		json.RawMessage(`{"type":"tool_call_update","toolCallUpdate":{"toolCallId":"c1","status":"in_progress"},"seq":1}`),
+		json.RawMessage(`{"type":"tool_call_update","toolCallUpdate":{"toolCallId":"c1","status":"completed"},"seq":2}`),
+		json.RawMessage(`{"type":"chunk","text":"x","seq":3}`),
+	}
+	h.RegisterRawEvents("h1", raws)
+
+	wantCritical := map[string]bool{"in_progress": false, "completed": false, "chunk": false}
+	seen := 0
+	for seen < 3 {
+		select {
+		case ev := <-ch:
+			typ, _ := ev["type"].(string)
+			if typ != "tool_call_update" && typ != "chunk" {
+				continue // hosts_changed noise
+			}
+			seen++
+			name := typ
+			if typ == "tool_call_update" {
+				u, _ := ev["toolCallUpdate"].(map[string]any)
+				if u != nil {
+					t.Errorf("raw event must not decode the body: %v", u)
+				}
+				wire, err := MarshalEvent(ev)
+				if err != nil {
+					t.Fatalf("MarshalEvent: %v", err)
+				}
+				if strings.Contains(string(wire), "terminalTool") {
+					t.Errorf("internal flag leaked onto the FE wire: %s", wire)
+				}
+				if strings.Contains(string(wire), `"completed"`) {
+					name = "completed"
+				} else {
+					name = "in_progress"
+				}
+			}
+			wantCritical[name] = criticalEvent(ev)
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of 3 events fan-out", seen)
+		}
+	}
+	if !wantCritical["completed"] {
+		t.Error("terminal tool_call_update not critical — the FE would wait for the turn-end settle")
+	}
+	if wantCritical["in_progress"] {
+		t.Error("in_progress tool_call_update must stay droppable (streaming deltas)")
+	}
+	if wantCritical["chunk"] {
+		t.Error("chunk must stay droppable")
+	}
+}
+
+// TestDeliverTerminalToolUpdateOnFullQueue: on a wedged subscriber the
+// completion lands via the blocking fallback while a delta drops and counts
+// toward the resync threshold.
+func TestDeliverTerminalToolUpdateOnFullQueue(t *testing.T) {
+	s := &feSubscriber{ch: make(chan Event, 1)}
+	s.ch <- Event{"type": "chunk"} // queue full
+
+	done := make(chan struct{})
+	go func() {
+		<-s.ch // free a slot so the blocking fallback can land
+		close(done)
+	}()
+	s.deliver(Event{
+		"type":                "tool_call_update",
+		terminalToolUpdateKey: true,
+	})
+	<-done
+	if n := len(s.ch); n != 1 {
+		t.Fatalf("terminal tool_call_update dropped on a full queue (len=%d)", n)
+	}
+	if got := s.dropped.Load(); got != 0 {
+		t.Errorf("dropped = %d, want 0", got)
+	}
+
+	s2 := &feSubscriber{ch: make(chan Event, 1)}
+	s2.ch <- Event{"type": "chunk"}
+	s2.deliver(Event{"type": "tool_call_update"}) // no terminal flag
+	if n := len(s2.ch); n != 1 {
+		t.Errorf("delta must not displace the queued event (len=%d)", n)
+	}
+	if got := s2.dropped.Load(); got != 1 {
+		t.Errorf("dropped = %d, want 1 (counts toward resync)", got)
+	}
+}
