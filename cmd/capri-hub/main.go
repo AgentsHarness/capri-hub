@@ -822,6 +822,11 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 		Status   int               `json:"status"`
 		Body     json.RawMessage   `json:"body"`
 		Ready    bool              `json:"ready"`
+		// Transient registry fields (absent on older hosts → nil leaves
+		// the hub's current value untouched).
+		Busy         *bool `json:"busy"`
+		Booting      *bool `json:"booting"`
+		PendingCount *int  `json:"pendingCount"`
 	}
 	if err := json.Unmarshal(data, &frame); err != nil {
 		log.Printf("[capri-hub] host %s bad frame: %v", hostID, err)
@@ -853,10 +858,16 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 		// RegisterEvent path exactly (see hub.RegisterRawEvents).
 		h.RegisterRawEvents(hostID, frame.Events)
 	case "host_status":
-		// Control-plane ready heartbeat: no seq, not an event. Updates
-		// Ready + LastSeen (and hosts_changed on flip) without advancing
-		// the per-host counter or the transcript buffer.
-		h.SetHostReady(hostID, frame.Ready)
+		// Control-plane status heartbeat: no seq, not an event. Updates
+		// Ready/Busy/Booting/PendingCount + LastSeen (and hosts_changed
+		// on any flip) without advancing the per-host counter or the
+		// transcript buffer.
+		h.UpdateHostStatus(hostID, hub.HostStatusPatch{
+			Ready:        &frame.Ready,
+			Busy:         frame.Busy,
+			Booting:      frame.Booting,
+			PendingCount: frame.PendingCount,
+		})
 	case "seq_reset":
 		// Host process restarted: bridge seq recounts from 1. Clear the
 		// hub watermark so new low seqs are not treated as stale and

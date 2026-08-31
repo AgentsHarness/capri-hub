@@ -111,14 +111,23 @@ func (e *RelayError) Error() string { return e.Message }
 // host's hostId/hostName before fan-out.
 type Event map[string]any
 
-// HostInfo is the public registry entry (GET /api/hosts).
+// HostInfo is the public registry entry (GET /api/hosts). busy/booting/
+// pendingCount are the host's live snapshot (host_status heartbeat) —
+// transient, never persisted; absent on older hosts/FEs that predate
+// them (omitempty).
 type HostInfo struct {
-	HostID   string    `json:"hostId"`
-	HostName string    `json:"hostName"`
-	Online   bool      `json:"online"`
-	Ready    bool      `json:"ready"`
-	LastSeen time.Time `json:"lastSeen"`
-	Local    bool      `json:"local,omitempty"`
+	HostID   string `json:"hostId"`
+	HostName string `json:"hostName"`
+	Online   bool   `json:"online"`
+	Ready    bool   `json:"ready"`
+	// Busy: any session has a turn in flight (thinking / working).
+	Busy bool `json:"busy,omitempty"`
+	// Booting: agent process has not finished booting.
+	Booting bool `json:"booting,omitempty"`
+	// PendingCount: pending client requests (permits / x.ai questions).
+	PendingCount int       `json:"pendingCount,omitempty"`
+	LastSeen     time.Time `json:"lastSeen"`
+	Local        bool      `json:"local,omitempty"`
 }
 
 // RelayRequest is pushed to a host over its WebSocket.
@@ -818,11 +827,24 @@ func evSeq(ev Event) uint64 {
 // seqStart validation).
 func EvSeq(ev Event) uint64 { return evSeq(ev) }
 
-// SetHostReady updates Ready from a control-plane host_status frame (no
-// seq). Always refreshes LastSeen; if ready flips, updates Ready and
-// broadcasts hosts_changed. Returns false for unknown hosts. Does not
-// advance the per-host event seq or touch the transcript buffer.
-func (h *Hub) SetHostReady(hostID string, ready bool) bool {
+// HostStatusPatch carries the registry fields a host_status frame may
+// update. Fields absent from the frame arrive as nil and leave the
+// current value untouched (hosts predating busy/booting/pendingCount
+// send only `ready`). LastSeen refreshes on every frame; hosts_changed
+// fires when any field flips.
+type HostStatusPatch struct {
+	Ready        *bool
+	Busy         *bool
+	Booting      *bool
+	PendingCount *int
+}
+
+// UpdateHostStatus applies a control-plane host_status frame (no seq).
+// Always refreshes LastSeen; on any visible-field flip it updates the
+// registry entry and broadcasts hosts_changed. Returns false for unknown
+// hosts. Does not advance the per-host event seq or touch the transcript
+// buffer.
+func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
@@ -830,11 +852,35 @@ func (h *Hub) SetHostReady(hostID string, ready bool) bool {
 		return false
 	}
 	hs.info.LastSeen = time.Now()
-	if ready != hs.info.Ready {
-		hs.info.Ready = ready
+	changed := false
+	if p.Ready != nil && *p.Ready != hs.info.Ready {
+		hs.info.Ready = *p.Ready
+		changed = true
+	}
+	if p.Busy != nil && *p.Busy != hs.info.Busy {
+		hs.info.Busy = *p.Busy
+		changed = true
+	}
+	if p.Booting != nil && *p.Booting != hs.info.Booting {
+		hs.info.Booting = *p.Booting
+		changed = true
+	}
+	if p.PendingCount != nil && *p.PendingCount != hs.info.PendingCount {
+		hs.info.PendingCount = *p.PendingCount
+		changed = true
+	}
+	if changed {
 		h.broadcast(hostsChanged())
 	}
 	return true
+}
+
+// SetHostReady updates only the Ready field — the host_status shape of
+// hosts predating busy/booting/pendingCount, and the events-frame
+// back-compat path (old hosts nest host_status inside events frames,
+// which carry readiness only anyway).
+func (h *Hub) SetHostReady(hostID string, ready bool) bool {
+	return h.UpdateHostStatus(hostID, HostStatusPatch{Ready: &ready})
 }
 
 // ResetHostSeq clears the per-host event counter and gap-pull buffer.

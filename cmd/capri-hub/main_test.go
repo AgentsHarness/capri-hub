@@ -771,6 +771,51 @@ func TestHandleHostFrameHostStatusControl(t *testing.T) {
 	}
 }
 
+// TestHandleHostFrameHostStatusLive: host_status frames carrying the
+// transient registry fields (busy/booting/pendingCount) apply them to the
+// registry and broadcast hosts_changed; older ready-only frames leave
+// them untouched.
+func TestHandleHostFrameHostStatusLive(t *testing.T) {
+	h := hub.NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"host_status","ready":true,"busy":true,"booting":false,"pendingCount":3}`),
+		func([]byte) error { return nil })
+	if hosts := h.ListHosts(); len(hosts) != 1 {
+		t.Fatalf("hosts len = %d", len(hosts))
+	} else {
+		got := hosts[0]
+		if !got.Ready || !got.Busy || got.Booting || got.PendingCount != 3 {
+			t.Errorf("registry = %+v, want ready+busy, booting=false, pending=3", got)
+		}
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed from live host_status")
+	}
+
+	// Older host shape (ready only): transient fields must survive.
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"host_status","ready":true}`),
+		func([]byte) error { return nil })
+	if hosts := h.ListHosts(); len(hosts) != 1 {
+		t.Fatalf("hosts len = %d", len(hosts))
+	} else if hosts[0].Busy != true || hosts[0].PendingCount != 3 {
+		t.Errorf("registry = %+v, want busy/pending kept by ready-only frame", hosts[0])
+	}
+}
+
 // TestHandleHostFrameSeqReset: host process restart control frame clears
 // LastSeq so subsequent low seqs fan out instead of being skipped.
 func TestHandleHostFrameSeqReset(t *testing.T) {
