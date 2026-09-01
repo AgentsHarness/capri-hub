@@ -1086,6 +1086,98 @@ func TestSetHostReady(t *testing.T) {
 	}
 }
 
+// TestUpdateHostStatus: control-plane host_status carries the live
+// registry fields (ready/busy/booting/pendingCount); hosts_changed fires
+// on ANY flip, nil fields leave the current value untouched (older hosts
+// send only ready), and identical frames stay silent.
+func TestUpdateHostStatus(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	boolPtr := func(b bool) *bool { return &b }
+	intPtr := func(n int) *int { return &n }
+
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	// Full update: ready+busy flip → one hosts_changed.
+	if !h.UpdateHostStatus("h1", HostStatusPatch{
+		Ready: boolPtr(true), Busy: boolPtr(true), Booting: boolPtr(false), PendingCount: intPtr(2),
+	}) {
+		t.Fatal("UpdateHostStatus failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 {
+		t.Fatalf("hosts len = %d", len(hosts))
+	} else {
+		got := hosts[0]
+		if !got.Ready || !got.Busy || got.Booting || got.PendingCount != 2 {
+			t.Errorf("registry = %+v, want ready+busy, booting=false, pending=2", got)
+		}
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed on full status update")
+	}
+
+	// Identical frame → silent (no rebroadcast).
+	if !h.UpdateHostStatus("h1", HostStatusPatch{
+		Ready: boolPtr(true), Busy: boolPtr(true), Booting: boolPtr(false), PendingCount: intPtr(2),
+	}) {
+		t.Fatal("UpdateHostStatus noop failed")
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("unchanged status must not rebroadcast, got %v", ev)
+	case <-time.After(50 * time.Millisecond):
+		// expected
+	}
+
+	// Busy-only flip fires hosts_changed and leaves other fields intact.
+	if !h.UpdateHostStatus("h1", HostStatusPatch{Busy: boolPtr(false)}) {
+		t.Fatal("UpdateHostStatus busy flip failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Busy || hosts[0].PendingCount != 2 || !hosts[0].Ready {
+		t.Errorf("registry = %+v, want busy=false, ready/pending untouched", hosts[0])
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed on busy flip")
+	}
+
+	// Nil fields (older host frame shape) leave current values untouched.
+	if !h.UpdateHostStatus("h1", HostStatusPatch{Ready: boolPtr(false)}) {
+		t.Fatal("UpdateHostStatus ready-only failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Busy || hosts[0].Booting || hosts[0].PendingCount != 2 {
+		t.Errorf("registry = %+v, want busy/booting/pending untouched by ready-only patch", hosts[0])
+	}
+
+	// PendingCount flip alone also broadcasts.
+	if !h.UpdateHostStatus("h1", HostStatusPatch{PendingCount: intPtr(0)}) {
+		t.Fatal("UpdateHostStatus pending flip failed")
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed on pending flip")
+	}
+
+	if h.UpdateHostStatus("nope", HostStatusPatch{Ready: boolPtr(true)}) {
+		t.Error("UpdateHostStatus for unknown host should fail")
+	}
+}
+
 // TestResetHostSeq: host process restart clears LastSeq + gap-pull buffer
 // so new low seqs fan out instead of being skipped as stale.
 func TestResetHostSeq(t *testing.T) {
