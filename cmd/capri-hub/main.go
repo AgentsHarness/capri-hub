@@ -370,12 +370,13 @@ func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 			Code     string `json:"code"`
 			HostID   string `json:"hostId"`
 			HostName string `json:"hostName"`
+			Port     int    `json:"port"` // optional local HTTP listen port
 		}
 		if err := readJSON(r, &body); err != nil || body.Code == "" || body.HostID == "" {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 code 和 hostId"})
 			return
 		}
-		token, err := h.Pair(body.Code, body.HostID, body.HostName)
+		token, err := h.Pair(body.Code, body.HostID, body.HostName, body.Port)
 		if err != nil {
 			status := 401
 			if errors.Is(err, hub.ErrHostLimit) {
@@ -828,6 +829,7 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 		Busy         *bool `json:"busy"`
 		Booting      *bool `json:"booting"`
 		PendingCount *int  `json:"pendingCount"`
+		Port         *int  `json:"port"`
 	}
 	if err := json.Unmarshal(data, &frame); err != nil {
 		log.Printf("[capri-hub] host %s bad frame: %v", hostID, err)
@@ -868,6 +870,7 @@ func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) 
 			Busy:         frame.Busy,
 			Booting:      frame.Booting,
 			PendingCount: frame.PendingCount,
+			Port:         frame.Port,
 		})
 	case "seq_reset":
 		// Host process restarted: bridge seq recounts from 1. Clear the
