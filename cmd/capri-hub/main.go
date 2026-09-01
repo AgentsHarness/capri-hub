@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1189,10 +1190,85 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 		if status < 100 || status > 599 {
 			status = 502
 		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(status)
-		_, _ = w.Write(resp.Body)
+		writeRelayResponse(w, r, status, resp.Body)
 	}
+}
+
+// writeRelayResponse writes the host's answer to the browser, gzipping it
+// when the client asked for it. The relay used to hand back the host's JSON
+// verbatim: a multi-megabyte session-history page then crossed the last hop
+// uncompressed (measured: 2.18 MB of JSON ≈ 5–15 s on a few-Mbps link, vs
+// 1.6 s for the 66 KB gzipped equivalent). The host↔hub uplink already has
+// its own flate layer, so nothing on this path compressed before now.
+func writeRelayResponse(w http.ResponseWriter, r *http.Request, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// Add, not Set: with CORS_ORIGINS configured, withCORS has already put
+	// `Vary: Origin` on this very header map and overwriting it would let a
+	// shared cache reuse an ACAO-bearing response for the wrong origin.
+	w.Header().Add("Vary", "Accept-Encoding")
+	// Same floor as the /ws/fe stream's minCompressSize: below it the gzip
+	// header is not worth a round trip through the compressor.
+	if len(body) >= minCompressSize && acceptsGzip(r) {
+		var buf bytes.Buffer
+		if err := gzipInto(&buf, body); err == nil && buf.Len() < len(body) {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+			w.WriteHeader(status)
+			_, _ = w.Write(buf.Bytes())
+			return
+		}
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+// acceptsGzip is true only when the client names gzip explicitly. A bare
+// `*` is not enough: non-browser callers (curl, server-side fetchers) send
+// it while being perfectly happy with identity, and compressing for them
+// would only burn hub CPU.
+func acceptsGzip(r *http.Request) bool {
+	for _, tok := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		name, params, _ := strings.Cut(strings.TrimSpace(tok), ";")
+		if !strings.EqualFold(name, "gzip") {
+			continue
+		}
+		for _, kv := range strings.Split(params, ";") {
+			k, v, ok := strings.Cut(strings.TrimSpace(kv), "=")
+			if !ok || !strings.EqualFold(k, "q") {
+				continue
+			}
+			if q, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && q <= 0 {
+				return false // "gzip;q=0" — explicitly refused
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// gzipBufPool reuses the deflate compressor state across responses; building
+// it per call is a fixed multi-hundred-KB cost on a path that can carry
+// tens of megabytes.
+var gzipBufPool = sync.Pool{
+	New: func() any {
+		zw, err := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+		if err != nil {
+			// Only a bad level reaches here, and the level is a constant.
+			panic("capri-hub: invalid gzip level: " + err.Error())
+		}
+		return zw
+	},
+}
+
+func gzipInto(dst *bytes.Buffer, b []byte) error {
+	zw := gzipBufPool.Get().(*gzip.Writer)
+	defer gzipBufPool.Put(zw)
+	zw.Reset(dst)
+	if _, err := zw.Write(b); err != nil {
+		return err
+	}
+	return zw.Close()
 }
 
 // ── QUIC host transport ──────────────────────────────────────────────
