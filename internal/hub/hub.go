@@ -1112,7 +1112,7 @@ func (hs *hostState) gateSeqLocked(hostID string, incoming uint64) (assigned uin
 	if incoming > 0 {
 		if incoming <= hs.seq {
 			if incoming < hs.seq {
-				log.Printf("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, incoming, hs.seq)
+				Verbosef("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, incoming, hs.seq)
 			}
 			return 0, false
 		}
@@ -1233,7 +1233,7 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 		// Validate shape BEFORE consuming a seq from the counter.
 		r := bytes.TrimRight(raw, " \t\r\n")
 		if len(r) < 2 || r[0] != '{' || r[len(r)-1] != '}' {
-			log.Printf("[capri-hub] host %s non-object event skipped", hostID)
+			Verbosef("[capri-hub] host %s non-object event skipped", hostID)
 			continue
 		}
 		var meta rawEventMeta
@@ -1251,7 +1251,7 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 		wire := spliceRawEvent(r, idJSON, nameJSON, assigned, meta.Seq == 0)
 		if wire == nil {
 			hs.mu.Unlock()
-			log.Printf("[capri-hub] host %s non-object event skipped", hostID)
+			Verbosef("[capri-hub] host %s non-object event skipped", hostID)
 			continue
 		}
 		ev := Event{

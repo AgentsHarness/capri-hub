@@ -115,6 +115,7 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 | `HUB_DATA_DIR`     | `~/.capri-hub` | 状态目录（`hub.json` / `prefs.json`）。容器部署设为 `/data` |
 | `QUIC_ALLOW_SELF_SIGNED` | — | 设了 `FE_TOKEN` 又没有真证书时，必须设为 `1`，否则 QUIC 关闭、Host 退回 WebSocket |
 | `CORS_ORIGINS`     | `*`    | 生产写成前端真实源                      |
+| `CAPRI_LOG_LEVEL`    | `info` | 设为 `debug` 才打印每条被拒事件的逐条明细（seq 回退、非对象事件跳过）；非法值回落 `info` |
 
 ## 项目生态
 

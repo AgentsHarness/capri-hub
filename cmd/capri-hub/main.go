@@ -53,6 +53,10 @@ func main() {
 		os.Exit(runPairCode(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
+	// Per-event detail is opt-in: a host that restarts mid-session otherwise
+	// writes one line per rejected event into the journal.
+	logLevel := hub.SetLogLevel(os.Getenv("CAPRI_LOG_LEVEL"))
+
 	port := 8787
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -100,6 +104,7 @@ func main() {
 		log.Printf("[capri-hub] CORS origins: %s", strings.Join(corsOrigins, ", "))
 	}
 	log.Printf("[capri-hub] listening on http://localhost:%d", port)
+	log.Printf("[capri-hub] log level: %s (per-event detail: CAPRI_LOG_LEVEL=debug)", logLevel)
 
 	tickets := newFETicketStore()
 	tickets.StartCleanup(runCtx)
