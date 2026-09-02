@@ -47,7 +47,7 @@ docker compose up -d
 docker compose exec capri-hub capri-hub paircode    # ← 配对码在这里
 ```
 
-多架构镜像（amd64 / arm64）在 `ghcr.io/luoxiaoxin123/capri-hub`。要自己构建，
+多架构镜像（amd64 / arm64）在 `ghcr.io/agentsharness/capri-hub`。要自己构建，
 国内机器得指定代理，否则 `go mod download` 会在 `proxy.golang.org` 上超时：
 
 ```bash

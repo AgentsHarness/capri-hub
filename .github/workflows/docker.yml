@@ -74,27 +74,34 @@ jobs:
           set -euo pipefail
 
           TOKEN="smoke-$(openssl rand -hex 8)"
-          docker run -d --name smoke \
-            -e FE_TOKEN="$TOKEN" \
-            -e REQUIRE_FE_TOKEN=1 \
-            -e QUIC_ALLOW_SELF_SIGNED=1 \
-            -e TZ=Asia/Shanghai \
-            -p 127.0.0.1:8787:8787 \
-            -p 127.0.0.1:8788:8788/udp \
-            capri-hub:smoke
+
+          # Both invocations share one named volume, so the persistence
+          # check below can destroy the container and bring up a fresh
+          # one against the same state — what `up --force-recreate` does.
+          run_smoke() {
+            docker run -d --name smoke \
+              -e FE_TOKEN="$TOKEN" \
+              -e REQUIRE_FE_TOKEN=1 \
+              -e QUIC_ALLOW_SELF_SIGNED=1 \
+              -e TZ=Asia/Shanghai \
+              -v smoke-data:/data \
+              -p 127.0.0.1:8787:8787 \
+              -p 127.0.0.1:8788:8788/udp \
+              capri-hub:smoke
+          }
+          wait_healthy() {
+            for i in $(seq 1 40); do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' smoke)" = healthy ] && return 0
+              [ "$i" -eq 40 ] && { echo "::error::container never became healthy"; docker logs smoke; return 1; }
+              sleep 1
+            done
+          }
+
+          run_smoke >/dev/null
 
           # The image carries its own HEALTHCHECK — wait on that rather
           # than sleeping a guessed number of seconds.
-          for i in $(seq 1 40); do
-            status="$(docker inspect -f '{{.State.Health.Status}}' smoke)"
-            [ "$status" = healthy ] && break
-            if [ "$i" -eq 40 ]; then
-              echo "::error::container never became healthy (last: $status)"
-              docker logs smoke
-              exit 1
-            fi
-            sleep 1
-          done
+          wait_healthy
 
           echo "--- container log ---"
           docker logs smoke
@@ -132,22 +139,24 @@ jobs:
             || { echo "::error::pairing failed: $TOKEN_OUT"; exit 1; }
           echo "::endgroup::"
 
-          echo "::group::state persists in HUB_DATA_DIR across a restart"
+          echo "::group::state survives a full container recreate, not just a restart"
           docker exec smoke test -f /data/hub.json \
             || { echo "::error::hub.json not written to /data — HUB_DATA_DIR is not taking effect"; exit 1; }
-          docker restart smoke >/dev/null
-          for i in $(seq 1 40); do
-            [ "$(docker inspect -f '{{.State.Health.Status}}' smoke)" = healthy ] && break
-            [ "$i" -eq 40 ] && { echo "::error::unhealthy after restart"; docker logs smoke; exit 1; }
-            sleep 1
-          done
+          # A `docker restart` keeps even the image's anonymous VOLUME, so it
+          # proves nothing about the failure this image exists to fix
+          # (`up --force-recreate` losing every paired host). Destroy the
+          # container entirely and bring up a new one on the same named
+          # volume — that is the recreate path.
+          docker rm -f smoke >/dev/null
+          run_smoke >/dev/null
+          wait_healthy
           curl -fsS -H "authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/hosts \
             | jq -e '[.hosts[] | select(.hostId == "smoke")] | length == 1' >/dev/null \
-            || { echo "::error::paired host did not survive the restart"; exit 1; }
+            || { echo "::error::paired host did not survive the recreate"; exit 1; }
           echo "::endgroup::"
 
           echo "::group::rotate invalidates the old code"
-          # Take a fresh code AFTER the restart: reusing the pre-restart
+          # Take a fresh code AFTER the recreate: reusing the pre-recreate
           # code would pass this check for the wrong reason (a restart
           # rotates the code anyway) and prove nothing about -rotate.
           CUR="$(docker exec smoke capri-hub paircode -json | jq -r .code)"
@@ -160,6 +169,7 @@ jobs:
           echo "::endgroup::"
 
           docker rm -f smoke >/dev/null
+          docker volume rm smoke-data >/dev/null
           echo "smoke test passed"
 
       - name: Build and push (linux/amd64 + linux/arm64)

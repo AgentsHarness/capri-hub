@@ -11,7 +11,7 @@ name: capri-hub
 
 services:
   capri-hub:
-    image: ghcr.io/luoxiaoxin123/capri-hub:latest
+    image: ghcr.io/agentsharness/capri-hub:latest
 
     # 想从源码构建就取消注释，然后 `docker compose build`。
     # 默认只用已发布的镜像，这样服务器上只需要这个文件 + .env，

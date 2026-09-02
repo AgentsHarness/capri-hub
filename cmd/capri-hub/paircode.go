@@ -165,7 +165,8 @@ FE_TOKEN:
 		case errors.Is(err, errPairCodeUnauthorized):
 			fmt.Fprintf(stderr, "hub 拒绝了请求: FE_TOKEN 不匹配。\n"+
 				"容器内请直接运行 `capri-hub paircode`（会复用 hub 自己的 FE_TOKEN）；\n"+
-				"容器外请用 -token 或设置环境变量 FE_TOKEN。\n")
+				"容器外请设置 FE_TOKEN 环境变量（不要用 -token：参数会留在\n"+
+				"进程命令行里，同机其他用户 ps 可见）。\n")
 		case errors.Is(err, context.DeadlineExceeded):
 			fmt.Fprintf(stderr, "连接 %s 超时。hub 起来了吗？端口/反代对吗？\n", *url)
 		default:

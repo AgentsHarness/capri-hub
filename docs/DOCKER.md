@@ -4,9 +4,9 @@ hub 是纯 Go、无 cgo、不内嵌前端，所以镜像就是一个静态二进
 文件（约 20 MB）。多架构镜像由 GitHub Actions 构建并推到 GHCR。
 
 ```
-ghcr.io/luoxiaoxin123/capri-hub:latest     # 跟随最新 tag
-ghcr.io/luoxiaoxin123/capri-hub:v1.2.3     # 具体版本
-ghcr.io/luoxiaoxin123/capri-hub:sha-abc1234
+ghcr.io/agentsharness/capri-hub:latest     # 跟随最新 tag
+ghcr.io/agentsharness/capri-hub:v1.2.3     # 具体版本
+ghcr.io/agentsharness/capri-hub:sha-abc1234
 ```
 
 支持 `linux/amd64` 和 `linux/arm64`。
@@ -61,11 +61,15 @@ docker compose exec capri-hub capri-hub paircode -rotate
 docker compose exec capri-hub capri-hub paircode -json | jq -r .code
 ```
 
-在容器外也能用，自己给地址和 token：
+在容器外也能用，自己给地址，token 走 `FE_TOKEN` 环境变量：
 
 ```bash
-capri-hub paircode -url https://hub.example.com -token "$FE_TOKEN"
+FE_TOKEN="$FE_TOKEN" capri-hub paircode -url https://hub.example.com
 ```
+
+不要用 `-token` 参数把密钥写在命令行上 —— 命令行参数会留在进程 argv 里，
+同机的其他用户 `ps` 就能看到。`-token` 依然可用（`FE_TOKEN` /
+`ACCESS_TOKEN` 环境变量都没设时的兜底），但只该在密钥已经公开的场合用。
 
 ### 2. 日志
 
