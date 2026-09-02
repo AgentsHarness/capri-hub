@@ -114,7 +114,8 @@ type Event map[string]any
 // HostInfo is the public registry entry (GET /api/hosts). busy/booting/
 // pendingCount are the host's live snapshot (host_status heartbeat) —
 // transient, never persisted; absent on older hosts/FEs that predate
-// them (omitempty).
+// them (omitempty). Port is the host's local HTTP listen port (so the
+// browser can probe 127.0.0.1:<port>); it is persisted.
 type HostInfo struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
@@ -125,9 +126,12 @@ type HostInfo struct {
 	// Booting: agent process has not finished booting.
 	Booting bool `json:"booting,omitempty"`
 	// PendingCount: pending client requests (permits / x.ai questions).
-	PendingCount int       `json:"pendingCount,omitempty"`
-	LastSeen     time.Time `json:"lastSeen"`
-	Local        bool      `json:"local,omitempty"`
+	PendingCount int `json:"pendingCount,omitempty"`
+	// Port: host's local HTTP listen port (e.g. 8765). FE probes
+	// http://127.0.0.1:<port> for a same-machine shortcut.
+	Port     int       `json:"port,omitempty"`
+	LastSeen time.Time `json:"lastSeen"`
+	Local    bool      `json:"local,omitempty"`
 }
 
 // RelayRequest is pushed to a host over its WebSocket.
@@ -277,6 +281,7 @@ type persistHost struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
 	Ready    bool   `json:"ready"`
+	Port     int    `json:"port,omitempty"`
 }
 
 func (h *Hub) load() {
@@ -294,7 +299,7 @@ func (h *Hub) load() {
 			id = hid
 		}
 		h.hosts[id] = &hostState{
-			info: HostInfo{HostID: id, HostName: ph.HostName, Ready: ph.Ready},
+			info: HostInfo{HostID: id, HostName: ph.HostName, Ready: ph.Ready, Port: ph.Port},
 		}
 	}
 	// Restore tokens and hostState.token so re-pair after restart can
@@ -331,7 +336,7 @@ func (h *Hub) snapshotLocked() persistFile {
 		pf.Tokens[tok] = hid
 	}
 	for hid, hs := range h.hosts {
-		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Ready: hs.info.Ready}
+		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Ready: hs.info.Ready, Port: hs.info.Port}
 	}
 	return pf
 }
@@ -563,7 +568,15 @@ func (h *Hub) StartPairingCodeMaintainer(ctx context.Context) {
 // so a restart that left multiple map entries cannot keep old credentials
 // alive. State is snapshotted under the lock but written to disk outside
 // it, so flaky storage never stalls the hub.
-func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
+//
+// Optional port (variadic): when the first extra arg is in 1..65535 it is
+// stored as HostInfo.Port (local HTTP listen port for FE localhost probe).
+// Omitted or out of range leaves any existing Port untouched on re-pair.
+func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
+	listenPort := 0
+	if len(port) > 0 {
+		listenPort = port[0]
+	}
 	h.mu.Lock()
 	// Constant-time compare: the pairing code is a short-lived secret and
 	// POST /api/pair is internet-reachable, so the comparison must not
@@ -598,14 +611,19 @@ func (h *Hub) Pair(code, hostID, hostName string) (string, error) {
 		h.revokeTokensForHostLocked(hostID)
 		hs.info.HostName = hostName
 		hs.info.LastSeen = time.Now()
+		if listenPort > 0 && listenPort <= 65535 {
+			hs.info.Port = listenPort
+		}
 	} else {
 		if len(h.hosts) >= MaxHosts {
 			h.mu.Unlock()
 			return "", ErrHostLimit
 		}
-		h.hosts[hostID] = &hostState{
-			info: HostInfo{HostID: hostID, HostName: hostName, LastSeen: time.Now()},
+		info := HostInfo{HostID: hostID, HostName: hostName, LastSeen: time.Now()}
+		if listenPort > 0 && listenPort <= 65535 {
+			info.Port = listenPort
 		}
+		h.hosts[hostID] = &hostState{info: info}
 	}
 	token := randomToken()
 	h.tokens[token] = hostID
@@ -847,22 +865,25 @@ type HostStatusPatch struct {
 	Busy         *bool
 	Booting      *bool
 	PendingCount *int
+	Port         *int
 }
 
 // UpdateHostStatus applies a control-plane host_status frame (no seq).
 // Always refreshes LastSeen; on any visible-field flip it updates the
 // registry entry and broadcasts hosts_changed. Returns false for unknown
 // hosts. Does not advance the per-host event seq or touch the transcript
-// buffer.
+// buffer. Port flips are also persisted (FE may need the port after a
+// hub restart before the next heartbeat).
 func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
 	if hs == nil {
+		h.mu.Unlock()
 		return false
 	}
 	hs.info.LastSeen = time.Now()
 	changed := false
+	portChanged := false
 	if p.Ready != nil && *p.Ready != hs.info.Ready {
 		hs.info.Ready = *p.Ready
 		changed = true
@@ -879,8 +900,25 @@ func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 		hs.info.PendingCount = *p.PendingCount
 		changed = true
 	}
+	if p.Port != nil {
+		port := *p.Port
+		if port > 0 && port <= 65535 && port != hs.info.Port {
+			hs.info.Port = port
+			changed = true
+			portChanged = true
+		}
+	}
+	var snap persistFile
+	persist := portChanged && h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
 	if changed {
 		h.broadcast(hostsChanged())
+	}
+	h.mu.Unlock()
+	if persist {
+		h.writePersist(snap)
 	}
 	return true
 }

@@ -1173,8 +1173,47 @@ func TestUpdateHostStatus(t *testing.T) {
 		t.Fatal("no hosts_changed on pending flip")
 	}
 
+	// Port flip updates registry + broadcasts; invalid ports are ignored.
+	if !h.UpdateHostStatus("h1", HostStatusPatch{Port: intPtr(8765)}) {
+		t.Fatal("UpdateHostStatus port flip failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Port != 8765 {
+		t.Errorf("registry port = %+v, want 8765", hosts[0])
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed on port flip")
+	}
+	if !h.UpdateHostStatus("h1", HostStatusPatch{Port: intPtr(0)}) {
+		t.Fatal("UpdateHostStatus invalid port failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Port != 8765 {
+		t.Errorf("invalid port must leave registry untouched, got %+v", hosts[0])
+	}
+
 	if h.UpdateHostStatus("nope", HostStatusPatch{Ready: boolPtr(true)}) {
 		t.Error("UpdateHostStatus for unknown host should fail")
+	}
+}
+
+// TestPairPortAndPersist: optional Pair port is stored and survives restart.
+func TestPairPortAndPersist(t *testing.T) {
+	dir := t.TempDir()
+	h1 := NewWithDir(dir)
+	code, _ := h1.PairingCode()
+	if _, err := h1.Pair(code, "h1", "H1", 8765); err != nil {
+		t.Fatalf("Pair: %v", err)
+	}
+	if hosts := h1.ListHosts(); len(hosts) != 1 || hosts[0].Port != 8765 {
+		t.Fatalf("after Pair port = %+v, want 8765", hosts)
+	}
+	h2 := NewWithDir(dir)
+	if hosts := h2.ListHosts(); len(hosts) != 1 || hosts[0].Port != 8765 {
+		t.Fatalf("after restart port = %+v, want 8765", hosts)
 	}
 }
 

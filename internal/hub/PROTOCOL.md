@@ -149,3 +149,33 @@ stream-specific except the auth handshake.
 Wire format (length prefix, bit 31 deflate flag) is identical on every
 stream; the deflate flag is session-scoped (negotiated via the auth
 frame / hello echo) and applies to frames on all streams.
+
+## 5. Hub → browser relay compression (`/api/*`, gzip)
+
+Distinct from §1–§2 (host↔hub flate) and from the `/ws/fe` event stream: the
+`/api/*` relay answers ordinary HTTP requests and historically wrote the host's
+JSON verbatim. A session-history page is multi-megabyte raw (one agentic turn
+carries tens of MB of tool output), so this last hop dominates session-switch
+latency — measured: 2.18 MB of JSON took 5–15 s on a few-Mbps link, where the
+same page gzips to ~66 KB / ~1.6 s.
+
+`handleRelay` compresses the relay response when BOTH hold:
+
+- the request names `gzip` explicitly in `Accept-Encoding` (a bare `*` does
+  not count — non-browser clients send it while being perfectly happy with
+  identity), and it is not refused with `gzip;q=0`;
+- the body is at least `minCompressSize` (256 B, same floor as the FE WS
+  stream).
+
+When it fires, the response carries `Content-Encoding: gzip`, an exact
+`Content-Length` of the compressed bytes, and `Vary: Accept-Encoding` —
+appended to any `Vary: Origin` the CORS layer already set, so a shared cache
+sees both axes. If the
+compressed form is not smaller, or the gzip step fails, the body goes out
+uncompressed with no `Content-Encoding` — `Accept-Encoding` never becomes a
+correctness requirement. Error paths answered through `writeJSON` (413, 503
+no-host, relay errors) stay plain JSON.
+
+The layer is payload-transparent: the host's `detail=lite|meta` history
+projection and this gzip are independent, and the hub never parses a relay
+body.

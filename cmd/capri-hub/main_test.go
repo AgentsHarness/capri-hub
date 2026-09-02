@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -246,6 +248,283 @@ func TestHandleRelayRejectsOversizeBody(t *testing.T) {
 	if rr.Code != 413 {
 		t.Fatalf("status = %d, want 413 (body %d bytes > 5MB)", rr.Code, len(body))
 	}
+}
+
+// TestAcceptsGzip: the relay compresses only for a client that names gzip
+// explicitly. "gzip;q=0" is an explicit refusal, a bare "*" is what curl /
+// server-side fetchers send while being perfectly happy with identity, and
+// an "*" alongside an explicit gzip still counts.
+func TestAcceptsGzip(t *testing.T) {
+	newReq := func(enc string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/api/session-updates", nil)
+		if enc != "" {
+			r.Header.Set("Accept-Encoding", enc)
+		}
+		return r
+	}
+	cases := []struct {
+		enc  string
+		want bool
+	}{
+		{"", false},
+		{"gzip", true},
+		{"GZIP", true},
+		{" gzip ", true},
+		{"gzip;", true},
+		{"gzip; q=0.8", true},
+		{"gzip;q=0", false},
+		{"gzip;q=0.0", false},
+		{"gzip;q=0.5", true},
+		{"gzip;q=1.0", true},
+		{"deflate, gzip", true},
+		{"br;q=1.0, gzip;q=0.8", true},
+		{"deflate, gzip;q=0", false},
+		{"*", false},
+		{"deflate, *", false},
+		{"*, gzip", true},
+		{"deflate", false},
+		{"identity", false},
+		{"x-gzip", false},
+	}
+	for _, tc := range cases {
+		if got := acceptsGzip(newReq(tc.enc)); got != tc.want {
+			t.Errorf("acceptsGzip(%q) = %v, want %v", tc.enc, got, tc.want)
+		}
+	}
+}
+
+// relayPage builds a session-history-shaped JSON body of n update entries
+// (~111 bytes each) — repetitive text, so deflate shrinks it. One entry
+// stays under the minCompressSize floor, 80 cross it comfortably.
+func relayPage(n int) []byte {
+	const entry = `{"msgSeq":1,"params":{"update":{"sessionUpdate":"tool_call","rawOutput":{"output":"历史信封正文 padding"}}}}`
+	var b bytes.Buffer
+	b.WriteString(`{"ok":true,"updates":[`)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(entry)
+	}
+	b.WriteString("]}")
+	return b.Bytes()
+}
+
+// relayIncompressible returns high-entropy bytes: deflate falls back to
+// stored blocks on them, so the gzip form ends up LONGER than the raw body,
+// which is the condition writeRelayResponse checks before switching
+// encoding. Deterministic so a failure reproduces.
+func relayIncompressible(n int) []byte {
+	b := make([]byte, n)
+	s := uint64(0x9E3779B97F4A7C15)
+	for i := range b {
+		s ^= s << 13
+		s ^= s >> 7
+		s ^= s << 17
+		b[i] = byte(s >> 24)
+	}
+	return b
+}
+
+func gunzipRelay(t *testing.T, b []byte) []byte {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("gunzip: %v", err)
+	}
+	return out
+}
+
+// TestWriteRelayResponseGzip: an over-floor body for a gzip-capable client
+// goes out deflated, with Content-Length describing the COMPRESSED bytes
+// (an identity length on a gzipped body makes the browser hang or truncate)
+// and Vary set, and the host's status survives the switch.
+func TestWriteRelayResponseGzip(t *testing.T) {
+	body := relayPage(80)
+	if len(body) < minCompressSize {
+		t.Fatalf("fixture is %d bytes, want >= the %d-byte floor", len(body), minCompressSize)
+	}
+	for _, status := range []int{200, 404, 500} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/session-updates", nil)
+			req.Header.Set("Accept-Encoding", "gzip")
+			rr := httptest.NewRecorder()
+			writeRelayResponse(rr, req, status, body)
+
+			if rr.Code != status {
+				t.Errorf("status = %d, want %d", rr.Code, status)
+			}
+			if got := rr.Header().Get("Content-Encoding"); got != "gzip" {
+				t.Fatalf("Content-Encoding = %q, want gzip", got)
+			}
+			if got := rr.Header().Get("Vary"); got != "Accept-Encoding" {
+				t.Errorf("Vary = %q, want Accept-Encoding", got)
+			}
+			if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+				t.Errorf("Content-Type = %q, want application/json", got)
+			}
+			cl := rr.Header().Get("Content-Length")
+			n, err := strconv.Atoi(cl)
+			if err != nil {
+				t.Fatalf("Content-Length = %q: %v", cl, err)
+			}
+			if n != rr.Body.Len() {
+				t.Errorf("Content-Length = %s but %d bytes were written", cl, rr.Body.Len())
+			}
+			if n >= len(body) {
+				t.Errorf("gzip did not shrink the body: %d -> %d", len(body), n)
+			}
+			if got := gunzipRelay(t, rr.Body.Bytes()); !bytes.Equal(got, body) {
+				t.Errorf("gunzipped body differs from the host answer (%d vs %d bytes)", len(got), len(body))
+			}
+		})
+	}
+}
+
+// TestWriteRelayResponseIdentity: three ways to get the body back verbatim
+// — under the floor, client not asking (or refusing), and a body gzip
+// cannot shrink. None may carry Content-Encoding, all keep Vary and the
+// exact byte length.
+func TestWriteRelayResponseIdentity(t *testing.T) {
+	big := relayPage(80)
+	small := relayPage(1)
+	if len(small) >= minCompressSize {
+		t.Fatalf("fixture is %d bytes, want < the %d-byte floor", len(small), minCompressSize)
+	}
+	cases := []struct {
+		name string
+		enc  string
+		body []byte
+	}{
+		{"under floor", "gzip", small},
+		{"no header", "", big},
+		{"identity only", "identity", big},
+		{"refused", "gzip;q=0", big},
+		{"wildcard only", "*", big},
+		{"incompressible", "gzip", relayIncompressible(len(big))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/session-updates", nil)
+			if tc.enc != "" {
+				req.Header.Set("Accept-Encoding", tc.enc)
+			}
+			rr := httptest.NewRecorder()
+			writeRelayResponse(rr, req, 404, tc.body)
+
+			if rr.Code != 404 {
+				t.Errorf("status = %d, want 404", rr.Code)
+			}
+			if got := rr.Header().Get("Content-Encoding"); got != "" {
+				t.Errorf("Content-Encoding = %q, want none", got)
+			}
+			if got := rr.Header().Get("Vary"); got != "Accept-Encoding" {
+				t.Errorf("Vary = %q, want Accept-Encoding", got)
+			}
+			if got := rr.Header().Get("Content-Length"); got != strconv.Itoa(len(tc.body)) {
+				t.Errorf("Content-Length = %q, want %d", got, len(tc.body))
+			}
+			if !bytes.Equal(rr.Body.Bytes(), tc.body) {
+				t.Error("body must be the host answer verbatim")
+			}
+		})
+	}
+}
+
+// TestRelayVaryKeepsCorsOrigin: writeRelayResponse must ADD its Vary entry,
+// not replace the `Vary: Origin` withCORS already wrote. A shared cache that
+// only sees the encoding axis is free to reuse this ACAO-bound answer for a
+// different origin.
+func TestRelayVaryKeepsCorsOrigin(t *testing.T) {
+	body := relayPage(80)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeRelayResponse(w, r, 200, body)
+	})
+	h := withCORS(inner, []string{"https://app.example"})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/session-updates", nil)
+	req.Header.Set("Origin", "https://app.example")
+	req.Header.Set("Accept-Encoding", "gzip")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+		t.Fatalf("Allow-Origin = %q, want app.example", got)
+	}
+	if got := rr.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	varied := rr.Header().Values("Vary")
+	for _, want := range []string{"Origin", "Accept-Encoding"} {
+		found := false
+		for _, v := range varied {
+			if strings.EqualFold(strings.TrimSpace(v), want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Vary = %q, want it to list both axes (missing %s)", varied, want)
+		}
+	}
+}
+
+// assertPlainRelayError: the error answers bypass writeRelayResponse, so
+// they must stay readable JSON even when the browser offered gzip — an
+// encoded or truncated error page turns a diagnosable 503 into a bare
+// network failure on the FE.
+func assertPlainRelayError(t *testing.T, rr *httptest.ResponseRecorder, wantErr string) {
+	t.Helper()
+	if got := rr.Header().Get("Content-Encoding"); got != "" {
+		t.Errorf("error answer must not be gzipped, got Content-Encoding=%q", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("error body is not readable JSON: %v (%s)", err, rr.Body.String())
+	}
+	if body["ok"] != false {
+		t.Errorf("body.ok = %v, want false", body["ok"])
+	}
+	if body["error"] != wantErr {
+		t.Errorf("body.error = %v, want %q", body["error"], wantErr)
+	}
+}
+
+// TestHandleRelayErrorBranchesStayPlain: no-host 503 and oversize-body 413
+// still answer correctly on a gzip-offering client.
+func TestHandleRelayErrorBranchesStayPlain(t *testing.T) {
+	t.Run("503 no host", func(t *testing.T) {
+		handler := handleRelay(hub.NewWithDir(""))
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/session-updates?offset=0&limit=200&detail=lite", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		handler.ServeHTTP(rr, req)
+		if rr.Code != 503 {
+			t.Fatalf("status = %d, want 503 (hub has no host to relay to)", rr.Code)
+		}
+		assertPlainRelayError(t, rr, hub.ErrNoHost.Error())
+	})
+
+	t.Run("413 oversize body", func(t *testing.T) {
+		h := hub.NewWithDir("")
+		code, _ := h.PairingCode()
+		if _, err := h.Pair(code, "h1", "H1"); err != nil {
+			t.Fatalf("pair: %v", err)
+		}
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/prompt", bytes.NewReader(make([]byte, (5<<20)+1)))
+		req.Header.Set("Accept-Encoding", "gzip")
+		handleRelay(h).ServeHTTP(rr, req)
+		if rr.Code != 413 {
+			t.Fatalf("status = %d, want 413", rr.Code)
+		}
+		assertPlainRelayError(t, rr, "请求体过大（上限 5MB）")
+	})
 }
 
 // TestHandleHostFrameSeqLessAdvancesCounter: a seq-less events frame must
@@ -1562,5 +1841,119 @@ func TestFeWSLivenessReclaimsDeadSubscriber(t *testing.T) {
 	}
 	if !waitCount(1) {
 		t.Fatalf("dead subscriber not reclaimed within liveness window (count=%d)", h.SubscriberCount())
+	}
+}
+
+// TestIntegrationRelayGzipRoundtrip: browser → hub → host WS → respond
+// frame → hub, with a page over the compression floor. Driven through a
+// real net/http server instead of a recorder because a Content-Length that
+// disagrees with the bytes actually written fails the client's read on a
+// live connection — exactly the failure a recorder hides.
+func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
+	h := hub.NewWithDir("")
+	tickets := newFETicketStore()
+	lim := newPairLimiter()
+	const secret = "gzip-int-secret"
+	srv := httptest.NewServer(buildHandler(h, secret, tickets, lim, nil))
+	defer srv.Close()
+
+	code, _ := h.PairingCode()
+	tok, err := h.Pair(code, "h1", "H1")
+	if err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + tok}},
+	})
+	if err != nil {
+		t.Fatalf("host ws dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	conn.SetReadLimit(32 << 20)
+
+	_, helloRaw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("host hello: %v", err)
+	}
+	var hello map[string]any
+	if json.Unmarshal(helloRaw, &hello) != nil || hello["type"] != "hello" {
+		t.Fatalf("hello frame = %s", helloRaw)
+	}
+
+	// The "host's" answer: one history page big enough to compress.
+	page := relayPage(80)
+	go func() {
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var frame map[string]any
+			if json.Unmarshal(data, &frame) != nil || frame["type"] != "request" {
+				continue
+			}
+			reqID, _ := frame["reqId"].(string)
+			out, _ := json.Marshal(map[string]any{
+				"v": 1, "type": "respond", "reqId": reqID,
+				"status": 200, "body": json.RawMessage(page),
+			})
+			if err := conn.Write(ctx, websocket.MessageText, out); err != nil {
+				return
+			}
+		}
+	}()
+
+	// DisableCompression keeps the transport from transparently undoing the
+	// encoding, so the assertions below see what the browser really gets.
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	relay := func(offerGzip bool) (*http.Response, []byte) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/session-updates?host=h1&offset=0&detail=lite", nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		if offerGzip {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("relay: %v", err)
+		}
+		defer resp.Body.Close()
+		wire, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read relay body (Content-Length=%v): %v", resp.Header.Get("Content-Length"), err)
+		}
+		return resp, wire
+	}
+
+	resp, wire := relay(true)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d body=%s, want 200", resp.StatusCode, wire)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := resp.Header.Get("Vary"); got != "Accept-Encoding" {
+		t.Errorf("Vary = %q, want Accept-Encoding", got)
+	}
+	if resp.ContentLength != int64(len(wire)) {
+		t.Errorf("Content-Length = %d, but %d bytes on the wire", resp.ContentLength, len(wire))
+	}
+	if len(wire) >= len(page) {
+		t.Errorf("gzip did not shrink the page: %d -> %d", len(page), len(wire))
+	}
+	if got := gunzipRelay(t, wire); !bytes.Equal(got, page) {
+		t.Errorf("gunzipped relay body != the host's answer (%d vs %d bytes)", len(got), len(page))
+	}
+
+	// A client that does not offer gzip must get the host answer verbatim.
+	resp2, wire2 := relay(false)
+	if got := resp2.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q on a client that did not offer gzip", got)
+	}
+	if !bytes.Equal(wire2, page) {
+		t.Errorf("identity relay body = %d bytes, want the host's %d verbatim", len(wire2), len(page))
 	}
 }
