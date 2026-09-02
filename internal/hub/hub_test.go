@@ -1384,7 +1384,11 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 		reloaded.FePrefs["collapseToolGroups"] != false {
 		t.Errorf("reloaded Prefs = %+v, want the persisted doc", reloaded)
 	}
-	// Replace semantics: SetPrefs overwrites the whole doc.
+	// Replace semantics (a snapshot-only write, i.e. an FE from before
+	// entries existed): the doc becomes what it says — pins/todos it drops
+	// are gone. fePrefs is the one exception: a key the writer does not
+	// mention cannot be told apart from one it deleted, so those entries
+	// survive with their own stamp (see bridgeLegacyPrefs).
 	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"only"}}, 0, false); err != nil {
 		t.Fatalf("SetPrefs replace: %v", err)
 	}
@@ -1392,8 +1396,8 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 	if len(got.PinnedWorkspaces) != 0 || len(got.Todos) != 0 || got.PinnedSessions[0] != "only" {
 		t.Errorf("Prefs after replace = %+v, want the stored doc", got)
 	}
-	if len(got.FePrefs) != 0 {
-		t.Errorf("Prefs.FePrefs after replace = %+v, want empty", got.FePrefs)
+	if got.FePrefs["collapseToolGroups"] != false {
+		t.Errorf("Prefs.FePrefs after replace = %+v, want the earlier choice preserved", got.FePrefs)
 	}
 }
 

@@ -500,12 +500,16 @@ func handlePrefsGet(h *hub.Hub) http.HandlerFunc {
 	}
 }
 
-// handlePrefsPut: PUT /api/prefs {prefs: {...}, baseVersion?: N} — replace
-// the browser prefs document. baseVersion (new FE) makes the write
-// conditional: a stale writer gets 409 + the current doc and version so it
-// can replay its pending operations onto them and retry; without
-// baseVersion the write is unconditional (old-FE compat). The doc is
-// small (pins + todos), no size cap is enforced.
+// handlePrefsPut: PUT /api/prefs {prefs: {...}, baseVersion?: N} — fold a
+// browser prefs write into the stored document.
+//
+// With `entries` (current FE) the hub MERGES per item — see
+// internal/hub/prefs.go — so the write needs no condition and the response
+// carries the merged authoritative doc for the writer to converge on.
+// Without entries (an FE from before entries existed) the write stays a
+// whole-document replace, and baseVersion makes it conditional: a stale
+// writer gets 409 + the current doc and version so it can rebase and retry.
+// The doc is small (pins + todos), no size cap is enforced.
 func handlePrefsPut(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {

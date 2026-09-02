@@ -93,6 +93,13 @@ type FePrefs map[string]any
 // ids are host-assigned UUIDs, so a doc is effectively per host
 // conversation without an explicit hostId scope.
 type BrowserPrefs struct {
+	// Entries is the source of truth: one last-write-wins record per
+	// preference item, deletions included (as tombstones). See prefs.go.
+	Entries PrefsEntries `json:"entries,omitempty"`
+	// The four fields below are a PROJECTION of Entries — what FEs render,
+	// and what pre-entries FEs and prefs.json files understand. The hub
+	// recomputes them from Entries on every write; a writer's own values are
+	// honored only when it sent no entries at all (a legacy client).
 	PinnedWorkspaces []string          `json:"pinnedWorkspaces"`
 	PinnedSessions   []string          `json:"pinnedSessions"`
 	Todos            map[string]string `json:"todos,omitempty"`
@@ -410,6 +417,15 @@ func (h *Hub) loadPrefs() {
 	}
 	h.prefs = sanitizePrefs(raw.BrowserPrefs)
 	h.prefsVersion = raw.Version
+	// A prefs.json written before entries existed carries only the
+	// snapshot: materialize it so the merged state has a starting point.
+	// Stamped with the load time — any later real write (including a
+	// deletion) is newer and wins, and a stale offline client stamped at 0
+	// cannot overwrite it.
+	if len(h.prefs.Entries) == 0 {
+		h.prefs.Entries = entriesFromSnapshot(h.prefs, time.Now().UnixMilli())
+	}
+	prunePrefsTombstones(h.prefs.Entries, time.Now())
 }
 
 // prefsFileDoc is the prefs.json envelope: the doc fields at the top level
@@ -419,8 +435,9 @@ type prefsFileDoc struct {
 	Version uint64 `json:"version"`
 }
 
-// sanitizePrefs normalizes a decoded doc (nil slices → empty, nil todos →
-// empty map) so callers never see nil containers.
+// sanitizePrefs normalizes a decoded doc (nil slices/maps → empty
+// containers, entries without a writer identity dropped) so callers never
+// see nil containers or unorderable records.
 func sanitizePrefs(p BrowserPrefs) BrowserPrefs {
 	if p.PinnedWorkspaces == nil {
 		p.PinnedWorkspaces = []string{}
@@ -430,6 +447,15 @@ func sanitizePrefs(p BrowserPrefs) BrowserPrefs {
 	}
 	if p.Todos == nil {
 		p.Todos = map[string]string{}
+	}
+	if p.Entries == nil {
+		p.Entries = PrefsEntries{}
+	} else {
+		for k, e := range p.Entries {
+			if k == "" || e.Site == "" {
+				delete(p.Entries, k)
+			}
+		}
 	}
 	return p
 }
@@ -445,7 +471,12 @@ func clonePrefs(p BrowserPrefs) BrowserPrefs {
 	for k, v := range p.FePrefs {
 		fePrefs[k] = v
 	}
+	entries := make(PrefsEntries, len(p.Entries))
+	for k, v := range p.Entries {
+		entries[k] = v
+	}
 	return sanitizePrefs(BrowserPrefs{
+		Entries:          entries,
 		PinnedWorkspaces: append([]string(nil), p.PinnedWorkspaces...),
 		PinnedSessions:   append([]string(nil), p.PinnedSessions...),
 		Todos:            todos,
@@ -466,24 +497,63 @@ func (h *Hub) Prefs() (BrowserPrefs, uint64) {
 	return clonePrefs(h.prefs), h.prefsVersion
 }
 
-// SetPrefs replaces the browser prefs doc and persists it to prefs.json.
-// base/hasBase implement compare-and-swap writes: with hasBase the doc is
-// accepted only when base equals the current version (stale writers get
-// ErrPrefsConflict and must re-pull); without it the write is unconditional
-// (old-FE compat). Every accepted doc bumps the version and is broadcast
-// to browser subscribers as `prefs_changed` (carrying the new version) so
-// other browsers apply the change live. Returns the new version.
+// SetPrefs folds a browser prefs write into the stored doc and persists it
+// to prefs.json.
+//
+// Two writer kinds, one stored truth:
+//
+//   - Entries-bearing (current FE): MERGED into the stored entries per key
+//     (newest (At, Site) record wins). The write is not conditional — a
+//     stale writer contributes nothing it hasn't actually touched, so
+//     base/hasBase are ignored and no version can be "too old". The stored
+//     snapshot is then recomputed from the merged entries, never taken from
+//     the request.
+//   - Snapshot-only (an FE from before entries existed): replaces the view
+//     as it always has (last write wins), bridged into entries so the two
+//     writer kinds share one state — pins/todos that vanished from the
+//     snapshot are tombstoned at the arrival time. Here base/hasBase still
+//     implement compare-and-swap, so two legacy clients cannot silently
+//     clobber each other's newer write.
+//
+// An accepted write bumps the version and is broadcast to browser
+// subscribers as `prefs_changed` (doc + version) so other browsers merge it
+// live. A write that changes nothing (a client re-pushing state the hub
+// already has) is dropped without bumping the version or broadcasting —
+// otherwise every reconnect would churn the doc.
 func (h *Hub) SetPrefs(prefs BrowserPrefs, base uint64, hasBase bool) (uint64, error) {
 	cp := clonePrefs(prefs) // clonePrefs already sanitizes
+	merged := len(cp.Entries) > 0
+	now := time.Now()
+	at := now.UnixMilli()
+
 	h.mu.Lock()
-	if hasBase && base != h.prefsVersion {
-		h.mu.Unlock()
-		return 0, ErrPrefsConflict
+	if hasBase && !merged {
+		if base != h.prefsVersion {
+			h.mu.Unlock()
+			return 0, ErrPrefsConflict
+		}
 	}
+	next := PrefsEntries{}
+	if merged {
+		mergePrefsEntries(next, h.prefs.Entries)
+		mergePrefsEntries(next, cp.Entries)
+	} else {
+		next = bridgeLegacyPrefs(h.prefs.Entries, cp, at)
+	}
+	prunePrefsTombstones(next, now)
+	if samePrefsEntries(h.prefs.Entries, next) {
+		// Nothing moved: keep the version, don't write, don't broadcast.
+		v := h.prefsVersion
+		h.mu.Unlock()
+		return v, nil
+	}
+	doc := cp
+	doc.Entries = next
+	applyPrefsProjection(&doc)
 	persist := h.prefsFile != ""
 	var payload []byte
 	if persist {
-		b, err := json.Marshal(prefsFileDoc{BrowserPrefs: cp, Version: h.prefsVersion + 1})
+		b, err := json.Marshal(prefsFileDoc{BrowserPrefs: doc, Version: h.prefsVersion + 1})
 		if err != nil {
 			h.mu.Unlock()
 			return 0, fmt.Errorf("marshal prefs: %w", err)
@@ -492,8 +562,8 @@ func (h *Hub) SetPrefs(prefs BrowserPrefs, base uint64, hasBase bool) (uint64, e
 	}
 	h.prefsVersion++
 	newVersion := h.prefsVersion
-	h.prefs = cp
-	h.broadcast(prefsChanged(cp, newVersion))
+	h.prefs = doc
+	h.broadcast(prefsChanged(clonePrefs(doc), newVersion))
 	h.mu.Unlock()
 
 	if persist {
