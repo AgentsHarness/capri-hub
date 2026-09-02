@@ -64,7 +64,9 @@ HUB_URL=https://<hub>
 HUB_PAIR_CODE=XXXXXX
 HOST_ID=pc
 HOST_NAME="家里的 Mac"
-FE_TOKEN=XXXXXX
+# 可选：这台 Host 自己接口的密钥，和上面的 Hub FE_TOKEN 是两把、不必同值。
+# 本机跑 Host 又想让浏览器直连本机端口，留空最省事（默认只听回环）。
+FE_TOKEN=
 nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 ```
 
@@ -76,7 +78,7 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 | ------------------ | ------ | --------------------------------------- |
 | `PORT`             | `8787` | HTTP 端口                               |
 | `QUIC_PORT`        | `8788` | Host 主通道（UDP）                      |
-| `FE_TOKEN`         | —      | 浏览器访问密钥。生产必设                |
+| `FE_TOKEN`         | —      | 浏览器访问密钥。生产必设。与各台 Host 自己的 `FE_TOKEN` 相互独立，不要求同值 |
 | `REQUIRE_FE_TOKEN` | —      | 设为 `1` 时，没配 `FE_TOKEN` 会拒绝启动 |
 | `CORS_ORIGINS`     | `*`    | 生产写成前端真实源                      |
 
