@@ -1,0 +1,83 @@
+# capri-hub — 生产部署
+#
+#   cp .env.example .env        # 至少填 FE_TOKEN
+#   mkdir -p data && sudo chown -R 10001:10001 data
+#   docker compose up -d
+#   docker compose exec capri-hub capri-hub paircode   # ← 配对码在这里
+#
+# 完整说明（反代配置、迁移已有配对、排查）见 docs/DOCKER.md。
+
+name: capri-hub
+
+services:
+  capri-hub:
+    image: ghcr.io/agentsharness/capri-hub:latest
+
+    # 想从源码构建就取消注释，然后 `docker compose build`。
+    # 默认只用已发布的镜像，这样服务器上只需要这个文件 + .env，
+    # 不必 clone 整个仓库。
+    # build:
+    #   context: .
+    #   args:
+    #     VERSION: local
+
+    container_name: capri-hub
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # 状态写到挂载卷，而不是容器可写层 —— 否则 recreate 一次
+      # 所有已配对的 host 全部丢失。
+      HUB_DATA_DIR: /data
+      TZ: ${TZ:-UTC}
+
+    # 与镜像里的 uid/gid 一致；改了这里也要改 data/ 的 chown。
+    user: "10001:10001"
+
+    ports:
+      # HTTP：只绑在回环上，由你的反代在 443 终止 TLS 再转发到这里。
+      # hub 自己不会说 TLS，所以除非你确实想把明文 HTTP 暴露到公网，
+      # 不要改成 "8787:8787"。
+      #
+      # 反代本身也跑在 Docker 里的话，127.0.0.1 从反代容器里是不通的：
+      # 那种情况下删掉这一行，改成让两个容器共享一个 network，
+      # 反代直接 proxy_pass 到 http://capri-hub:8787。
+      - "127.0.0.1:8787:8787"
+
+      # QUIC：host 直接拨 <hub 地址>:8788/udp，**不经过反代**。
+      # 这一行必须公开绑定，删掉或只绑回环的话不会报错 ——
+      # 每个 host 会静默退回 WebSocket，只是变慢，很难发现。
+      - "8788:8788/udp"
+
+    volumes:
+      # hub.json（host token）和 prefs.json 都在这里。备份就备份这个目录。
+      - ./data:/data
+
+    # healthcheck 由镜像自带（会跟随 PORT 覆盖值），此处不再重复定义。
+
+    # hub 收到 SIGTERM 后最多排空 5s。
+    stop_grace_period: 15s
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      # 监听端口都 >1024，不需要 NET_BIND_SERVICE。
+      - ALL
+
+    # hub 只往 HUB_DATA_DIR 里写（原子保存的临时文件也建在同一目录），
+    # 所以根文件系统可以只读。已在真实 Docker（Debian 12 / Docker 29.7）
+    # 上验证：容器 healthy、配对成功、hub.json 正常落盘、日志无
+    # read-only 报错。若你的环境下出现 "read-only file system"，
+    # 注释掉这两项即可。
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    logging:
+      driver: json-file
+      options:
+        # 配对码每 15 分钟轮换一次并打一行日志，不限制的话日志会一直长。
+        max-size: "10m"
+        max-file: "5"

@@ -1,0 +1,200 @@
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  image:
+    name: build, smoke-test, push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # No setup-qemu-action on purpose: the Dockerfile cross-compiles
+      # with Go from $BUILDPLATFORM, so arm64 is produced by this runner's
+      # own compiler. Emulating a Go build under QEMU costs minutes and
+      # buys nothing when CGO is off.
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+          # `latest` follows the newest semver tag, never a main push.
+          flavor: latest=auto
+
+      # amd64 only and loaded into the runner's daemon, so the next step
+      # can run the very image this workflow is about to publish.
+      - name: Build amd64 image for the smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: capri-hub:smoke
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # This is the deployment's real test: a Dockerfile that builds says
+      # nothing about whether the hub can write its state, whether the
+      # FE_TOKEN gate is on, or whether an operator can retrieve a pairing
+      # code. Each check below has failed for someone in a container.
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+
+          TOKEN="smoke-$(openssl rand -hex 8)"
+
+          # Both invocations share one named volume, so the persistence
+          # check below can destroy the container and bring up a fresh
+          # one against the same state — what `up --force-recreate` does.
+          run_smoke() {
+            docker run -d --name smoke \
+              -e FE_TOKEN="$TOKEN" \
+              -e REQUIRE_FE_TOKEN=1 \
+              -e QUIC_ALLOW_SELF_SIGNED=1 \
+              -e TZ=Asia/Shanghai \
+              -v smoke-data:/data \
+              -p 127.0.0.1:8787:8787 \
+              -p 127.0.0.1:8788:8788/udp \
+              capri-hub:smoke
+          }
+          wait_healthy() {
+            for i in $(seq 1 40); do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' smoke)" = healthy ] && return 0
+              [ "$i" -eq 40 ] && { echo "::error::container never became healthy"; docker logs smoke; return 1; }
+              sleep 1
+            done
+          }
+
+          run_smoke >/dev/null
+
+          # The image carries its own HEALTHCHECK — wait on that rather
+          # than sleeping a guessed number of seconds.
+          wait_healthy
+
+          echo "--- container log ---"
+          docker logs smoke
+
+          echo "::group::runs unprivileged"
+          uid="$(docker exec smoke id -u)"
+          [ "$uid" = "10001" ] || { echo "::error::running as uid $uid, want 10001"; exit 1; }
+          echo "uid=$uid ok"
+          echo "::endgroup::"
+
+          echo "::group::/health needs no token"
+          curl -fsS http://127.0.0.1:8787/health | jq -e '.ok == true' >/dev/null
+          echo "::endgroup::"
+
+          echo "::group::FE_TOKEN gate is live"
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/api/pairing)"
+          [ "$code" = "401" ] || { echo "::error::/api/pairing answered $code, want 401 — the gate is not protecting it"; exit 1; }
+          echo "unauthenticated /api/pairing → 401 ok"
+          echo "::endgroup::"
+
+          echo "::group::paircode works inside the container with no arguments"
+          # The operator-facing promise: no flags, no secret handling.
+          CODE="$(docker exec smoke capri-hub paircode -json | jq -r .code)"
+          # The hub's alphabet omits look-alikes (no I/L/O/0/1).
+          echo "$CODE" | grep -Eq '^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$' \
+            || { echo "::error::paircode returned '$CODE', not a 6-char pairing code"; exit 1; }
+          docker exec smoke capri-hub paircode
+          echo "::endgroup::"
+
+          echo "::group::that code actually pairs a host"
+          TOKEN_OUT="$(curl -fsS -X POST http://127.0.0.1:8787/api/pair \
+            -H 'content-type: application/json' \
+            -d "{\"code\":\"$CODE\",\"hostId\":\"smoke\",\"hostName\":\"Smoke Host\"}")"
+          echo "$TOKEN_OUT" | jq -e '.ok == true and (.token | length) == 64' >/dev/null \
+            || { echo "::error::pairing failed: $TOKEN_OUT"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::state survives a full container recreate, not just a restart"
+          docker exec smoke test -f /data/hub.json \
+            || { echo "::error::hub.json not written to /data — HUB_DATA_DIR is not taking effect"; exit 1; }
+          # A `docker restart` keeps even the image's anonymous VOLUME, so it
+          # proves nothing about the failure this image exists to fix
+          # (`up --force-recreate` losing every paired host). Destroy the
+          # container entirely and bring up a new one on the same named
+          # volume — that is the recreate path.
+          docker rm -f smoke >/dev/null
+          run_smoke >/dev/null
+          wait_healthy
+          curl -fsS -H "authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/hosts \
+            | jq -e '[.hosts[] | select(.hostId == "smoke")] | length == 1' >/dev/null \
+            || { echo "::error::paired host did not survive the recreate"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::rotate invalidates the old code"
+          # Take a fresh code AFTER the recreate: reusing the pre-recreate
+          # code would pass this check for the wrong reason (a restart
+          # rotates the code anyway) and prove nothing about -rotate.
+          CUR="$(docker exec smoke capri-hub paircode -json | jq -r .code)"
+          NEW="$(docker exec smoke capri-hub paircode -rotate -json | jq -r .code)"
+          [ "$NEW" != "$CUR" ] || { echo "::error::-rotate returned the same code"; exit 1; }
+          status="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8787/api/pair \
+            -H 'content-type: application/json' \
+            -d "{\"code\":\"$CUR\",\"hostId\":\"stale\",\"hostName\":\"Stale\"}")"
+          [ "$status" = "401" ] || { echo "::error::the rotated-away code still paired (HTTP $status)"; exit 1; }
+          echo "::endgroup::"
+
+          docker rm -f smoke >/dev/null
+          docker volume rm smoke-data >/dev/null
+          echo "smoke test passed"
+
+      - name: Build and push (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Image pushed"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Deploy: \`docker compose pull && docker compose up -d\`"
+            echo "Pairing code: \`docker compose exec capri-hub capri-hub paircode\`"
+          } >> "$GITHUB_STEP_SUMMARY"
