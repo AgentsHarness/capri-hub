@@ -1,9 +1,10 @@
 # PROTOCOL
 
-Wire-format notes for the capri-hub ↔ capri-host transport. The FE-facing
-(`/ws/fe`) formats are unchanged. This document specifies the host→hub
-**uplink flate compression** (`"deflate"`): the host side MUST follow it
-byte-for-byte.
+Wire-format notes for the capri-hub ↔ capri-host transport. This document
+specifies the host→hub **uplink flate compression** (`"deflate"`): the host
+side MUST follow it byte-for-byte. §6 covers the browser-facing host split
+(`/ws/fe`), which also changes what the host-facing `subscribers` count
+means.
 
 ## 1. Negotiation
 
@@ -179,3 +180,59 @@ no-host, relay errors) stay plain JSON.
 The layer is payload-transparent: the host's `detail=lite|meta` history
 projection and this gzip are independent, and the hub never parses a relay
 body.
+
+## 6. Per-host fan-out (`/ws/fe`) and what `subscribers` now counts
+
+Event sequence numbers are **per host** (§4's `hello.seq` / `ping.seq` are
+per-host watermarks too), so a browser that displays one host has no use for
+another host's stream — and mixing them is actively wrong, not just wasteful.
+`/ws/fe` therefore scopes each connection:
+
+### 6.1 Browser → hub
+
+```
+GET /ws/fe?ticket=…&host=<hostId>&c=1          (filter from the first frame)
+{"v":1,"type":"subscribe","host":"<hostId>"}   (retarget, no reconnect)
+```
+
+* `host` absent or empty ⇒ **every host** — the pre-split behaviour, so an
+  old FE against a new hub keeps working untouched.
+* `subscribe` is the only browser→hub frame the hub acts on; anything else
+  (app-level pings, junk, non-JSON) stays a read-side no-op. Re-sending the
+  current host is cheap: the count dedupe below suppresses the notify.
+
+### 6.2 Hub → browser
+
+```
+{"v":1,"type":"subscribed","host":"<hostId>","seq":S}
+```
+
+`seq` is that host's current hub-side watermark — the FE **aligns** to it
+(and, when it already saw events, gap-pulls only the real hole). Without it
+a host switch leaves the client at watermark 0, whose first event triggers
+`GET /api/events?host=…&after=0` — the whole per-host ring buffer (up to
+6000 events) fetched and then discarded.
+
+Fan-out rule per subscriber: an event tagged `hostId` reaches it when the
+subscriber's filter is empty or equal; hub-level frames (`hosts_changed`,
+`prefs_changed`, `hello`) carry no `hostId` and always fan out. The `resync`
+slow-consumer frame now also carries the `hostId` of the event that tripped
+it — untagged, one host's drop storm used to jump another host's FE
+watermark to the wrong sequence and silently drop everything below it.
+Old hubs omit the field; FEs then treat `resync` as being about their own
+host, as before.
+
+### 6.3 Effect on the host-facing `subscribers` count
+
+`hello.subscribers`, the `subscribers` control frame and `ping.subscribers`
+all carry the number of browsers that **receive that host's** events — its
+own filtered subscribers plus every watch-all subscriber — instead of the
+raw browser total. Nothing about the frame shape changes (a host still
+pauses its uplink at `count == 0` and replays from its own ring on 0→1),
+but with a filtered FE an unwatched host stops uploading entirely. Wire a
+hub to a host and a browser watching a different host and the host log
+stays silent; switch and the `0→1` resume line appears.
+
+Per-host counts are deduped per host (`hostID → last count sent`), so one
+page switching hosts writes two frames (leave → 0, join → 1) and nothing
+else, and `gen` keeps ordering safe exactly as before.

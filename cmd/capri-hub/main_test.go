@@ -1957,3 +1957,210 @@ func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
 		t.Errorf("identity relay body = %d bytes, want the host's %d verbatim", len(wire2), len(page))
 	}
 }
+
+// dialPairedHost pairs a host and opens its /ws/host WebSocket, returning the
+// connection. The host's hello is consumed here.
+func dialPairedHost(t *testing.T, ctx context.Context, srv *httptest.Server, h *hub.Hub, hostID, name string) *websocket.Conn {
+	t.Helper()
+	code, _ := h.PairingCode()
+	token, err := h.Pair(code, hostID, name)
+	if err != nil {
+		t.Fatalf("pair %s: %v", hostID, err)
+	}
+	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+	})
+	if err != nil {
+		t.Fatalf("host ws dial %s: %v", hostID, err)
+	}
+	conn.SetReadLimit(1 << 20)
+	_, raw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("host hello %s: %v", hostID, err)
+	}
+	var hello map[string]any
+	if json.Unmarshal(raw, &hello) != nil || hello["type"] != "hello" {
+		t.Fatalf("host hello frame %s = %s", hostID, raw)
+	}
+	return conn
+}
+
+// pushHostEvent sends one events frame from a host uplink.
+func pushHostEvent(t *testing.T, ctx context.Context, conn *websocket.Conn, seq int, body map[string]any) {
+	t.Helper()
+	ev := map[string]any{"seq": seq}
+	for k, v := range body {
+		ev[k] = v
+	}
+	frame, _ := json.Marshal(map[string]any{
+		"v": 1, "type": "events", "seqStart": seq, "events": []map[string]any{ev},
+	})
+	if err := conn.Write(ctx, websocket.MessageText, frame); err != nil {
+		t.Fatalf("host write: %v", err)
+	}
+}
+
+// feFrames reads FE WS frames into a channel. Per-read context timeouts are
+// NOT usable here — a cancelled Read tears the connection down in this
+// library — so one long-lived reader owns the connection and the test
+// selects on the channel instead.
+func feFrames(ctx context.Context, conn *websocket.Conn) chan map[string]any {
+	out := make(chan map[string]any, 256)
+	go func() {
+		defer close(out)
+		for {
+			_, raw, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var f map[string]any
+			if json.Unmarshal(raw, &f) != nil {
+				continue
+			}
+			out <- f
+		}
+	}()
+	return out
+}
+
+// chunkTextsOf collects events-frame chunk texts (and everything else) for d,
+// returning the texts and any frame of wantType seen along the way.
+func chunkTextsOf(ctx context.Context, frames chan map[string]any, d time.Duration) []string {
+	var out []string
+	deadline := time.After(d)
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				return out
+			}
+			if f["type"] != "events" {
+				continue
+			}
+			evs, _ := f["events"].([]any)
+			for _, e := range evs {
+				m, _ := e.(map[string]any)
+				if m["type"] == "chunk" {
+					if txt, _ := m["text"].(string); txt != "" {
+						out = append(out, txt)
+					}
+				}
+			}
+		case <-deadline:
+			return out
+		case <-ctx.Done():
+			return out
+		}
+	}
+}
+
+// waitForFrameType returns the next frame of the given type, or nil after d.
+func waitForFrameType(frames chan map[string]any, typ string, d time.Duration) map[string]any {
+	deadline := time.After(d)
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				return nil
+			}
+			if f["type"] == typ {
+				return f
+			}
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// TestIntegrationFeWSHostFilter is the end-to-end half of the FE host
+// split: a browser that names a host on /ws/fe receives ONLY that host's
+// events, and can retarget with a subscribe frame without reconnecting
+// (answered with the host's seq watermark so the client aligns instead of
+// gap-pulling the whole buffer).
+func TestIntegrationFeWSHostFilter(t *testing.T) {
+	h := hub.NewWithDir("")
+	tickets := newFETicketStore()
+	lim := newPairLimiter()
+	const secret = "filter-secret"
+	srv := httptest.NewServer(buildHandler(h, secret, tickets, lim, nil))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	h1 := dialPairedHost(t, ctx, srv, h, "h1", "H1")
+	defer h1.Close(websocket.StatusNormalClosure, "")
+	h2 := dialPairedHost(t, ctx, srv, h, "h2", "H2")
+	defer h2.Close(websocket.StatusNormalClosure, "")
+
+	ticket, _ := tickets.issue()
+	fe, _, err := websocket.Dial(ctx,
+		strings.Replace(srv.URL, "http", "ws", 1)+"/ws/fe?ticket="+ticket+"&host=h1", nil)
+	if err != nil {
+		t.Fatalf("fe ws dial: %v", err)
+	}
+	defer fe.Close(websocket.StatusNormalClosure, "")
+	fe.SetReadLimit(1 << 20)
+	frames := feFrames(ctx, fe)
+	if hello := waitForFrameType(frames, "hello", 3*time.Second); hello == nil {
+		t.Fatal("no fe hello")
+	}
+
+	pushHostEvent(t, ctx, h1, 1, map[string]any{"type": "chunk", "text": "for-h1"})
+	pushHostEvent(t, ctx, h2, 1, map[string]any{"type": "chunk", "text": "for-h2"})
+	got := chunkTextsOf(ctx, frames, 700*time.Millisecond)
+	if !containsStr(got, "for-h1") {
+		t.Fatalf("filtered FE missed its own host: %v", got)
+	}
+	if containsStr(got, "for-h2") {
+		t.Fatalf("other host's event leaked into the filtered stream: %v", got)
+	}
+	// The hub must also stop counting this page as an audience for h2 —
+	// that is what lets h2 pause its uplink entirely.
+	if n := h.SubscriberCountFor("h2"); n != 0 {
+		t.Errorf("SubscriberCountFor(h2) = %d, want 0", n)
+	}
+	if n := h.SubscriberCountFor("h1"); n != 1 {
+		t.Errorf("SubscriberCountFor(h1) = %d, want 1", n)
+	}
+
+	// Retarget to h2 over the same connection.
+	sub, _ := json.Marshal(map[string]any{"v": 1, "type": "subscribe", "host": "h2"})
+	if err := fe.Write(ctx, websocket.MessageText, sub); err != nil {
+		t.Fatalf("subscribe write: %v", err)
+	}
+	ack := waitForFrameType(frames, "subscribed", 3*time.Second)
+	if ack == nil {
+		t.Fatal("no subscribed ack")
+	}
+	if ack["host"] != "h2" {
+		t.Errorf("subscribed host = %v, want h2", ack["host"])
+	}
+	// seq is the host's current watermark (h2 pushed seq 1) — the FE aligns
+	// to it instead of pulling the whole per-host ring buffer from 0.
+	if seq, _ := ack["seq"].(float64); seq != 1 {
+		t.Errorf("subscribed seq = %v, want 1", ack["seq"])
+	}
+
+	pushHostEvent(t, ctx, h2, 2, map[string]any{"type": "chunk", "text": "h2-second"})
+	pushHostEvent(t, ctx, h1, 2, map[string]any{"type": "chunk", "text": "h1-second"})
+	after := chunkTextsOf(ctx, frames, 700*time.Millisecond)
+	if !containsStr(after, "h2-second") {
+		t.Errorf("after subscribe to h2, its events did not arrive: %v", after)
+	}
+	if containsStr(after, "h1-second") {
+		t.Errorf("after subscribe to h2, h1 events still leak: %v", after)
+	}
+	if n := h.SubscriberCountFor("h1"); n != 0 {
+		t.Errorf("SubscriberCountFor(h1) after retarget = %d, want 0", n)
+	}
+}
+
+func containsStr(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}

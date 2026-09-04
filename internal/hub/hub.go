@@ -215,9 +215,9 @@ type Hub struct {
 	// subsGen stamps every subscriber-count frame so hosts can discard an
 	// out-of-order delivery (see notifyHostsSubscribers).
 	subsGen atomic.Uint64
-	// lastNotifiedSubs is the count carried by the last notification
-	// (nil = never notified), used to skip no-op resends.
-	lastNotifiedSubs *int
+	// lastNotifiedSubs is the count each host was last told (hostID →
+	// count), used to skip no-op resends. Missing key = never notified.
+	lastNotifiedSubs map[string]int
 
 	dataFile string
 	// prefsFile holds the browser prefs document (prefs.json, sibling of
@@ -729,6 +729,7 @@ func (h *Hub) Unpair(hostID string) error {
 	h.failPendingLocked(hostID)
 	hs.conn = nil
 	delete(h.hosts, hostID)
+	delete(h.lastNotifiedSubs, hostID)
 	hs.mu.Lock()
 	hs.evBuf = nil
 	hs.mu.Unlock()
@@ -1501,12 +1502,39 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 type feSubscriber struct {
 	ch chan Event
 
+	// host is this subscriber's event filter: a host ID fans out only
+	// that host's events, the empty string (or nothing stored) fans out
+	// every host — the behaviour pre-filtering FE clients get. Written by
+	// the /ws/fe reader when the page switches hosts and read lock-free
+	// per event by broadcast, hence the atomic.
+	host atomic.Value // string
+
 	// dropped counts events dropped for this subscriber because its
 	// channel was full (slow FE). Once it reaches resyncDropThreshold a
 	// resync frame is pushed and the counter resets — one resync per
 	// threshold worth of drops, so a permanently stuck FE cannot trigger
 	// a resync storm.
 	dropped atomic.Int32
+}
+
+// hostFilter is the subscriber's current host filter ("" = every host).
+func (s *feSubscriber) hostFilter() string {
+	if v, ok := s.host.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// watches reports whether an event tagged evHost reaches this subscriber.
+// Hub-level events (no hostId — hosts_changed, prefs_changed, the FE
+// hello) always pass: every browser needs the registry whichever host it
+// displays.
+func (s *feSubscriber) watches(evHost string) bool {
+	if evHost == "" {
+		return true
+	}
+	f := s.hostFilter()
+	return f == "" || f == evHost
 }
 
 // Drop-tier policy for a full subscriber queue. Terminal / control events
@@ -1592,8 +1620,7 @@ func (s *feSubscriber) deliver(ev Event) {
 	// been lost that gap-pulling one-by-one would be the slower path.
 	if s.dropped.Add(1) == resyncDropThreshold {
 		s.dropped.Store(0)
-		seq := evSeq(ev)
-		resync := Event{"type": "resync", "fromSeq": seq}
+		resync := resyncFrame(ev)
 		select {
 		case s.ch <- resync:
 		case <-time.After(resyncSendTimeout):
@@ -1601,6 +1628,20 @@ func (s *feSubscriber) deliver(ev Event) {
 			// transport will reap it. Counter already reset — no storm.
 		}
 	}
+}
+
+// resyncFrame builds the slow-consumer recovery frame for one dropped
+// event. Event seq counters are PER HOST, so the frame has to name the host
+// that tripped it: an untagged resync from host B's drop storm was applied
+// to whichever host the page happened to watch, jumping that host's
+// watermark to B's sequence and silently dropping every event below it.
+// Hub-level events carry no hostId and stay untagged.
+func resyncFrame(ev Event) Event {
+	out := Event{"type": "resync", "fromSeq": evSeq(ev)}
+	if hostID, _ := ev["hostId"].(string); hostID != "" {
+		out["hostId"] = hostID
+	}
+	return out
 }
 
 // subscribeLocked registers s in the copy-on-write subscriber list. The
@@ -1633,15 +1674,24 @@ func (h *Hub) unsubscribe(s *feSubscriber) {
 	h.subs.Store(&next)
 }
 
-// TrySubscribe is Subscribe with a subscriber cap: when max > 0 and the
-// hub already has max live browser subscribers, it returns ok=false
-// instead of registering another. Each subscriber costs a 512-event
-// channel plus the caller's goroutines, so the /ws/fe endpoint uses this
-// as a resource guard when it is open to unauthenticated clients.
+// TrySubscribe is Subscribe with no host filter. TrySubscribeHost adds one.
 func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool) {
+	return h.TrySubscribeHost(max, "")
+}
+
+// TrySubscribeHost is Subscribe with a subscriber cap and an initial host
+// filter ("" = every host): when max > 0 and the hub already has max live
+// browser subscribers, it returns ok=false instead of registering another.
+// Each subscriber costs a 512-event channel plus the caller's goroutines,
+// so the /ws/fe endpoint uses this as a resource guard when it is open to
+// unauthenticated clients.
+func (h *Hub) TrySubscribeHost(max int, hostID string) (ch chan Event, unsubscribe func(), ok bool) {
 	// Larger than the old SSE path: WS fan-out still drops on a full buffer,
 	// but 512 absorbs short FE write stalls without losing a turn of chunks.
 	s := &feSubscriber{ch: make(chan Event, 512)}
+	if hostID != "" {
+		s.host.Store(hostID)
+	}
 	h.mu.Lock()
 	if cur := h.subs.Load(); cur != nil && max > 0 && len(*cur) >= max {
 		h.mu.Unlock()
@@ -1666,7 +1716,38 @@ func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool)
 	}, true
 }
 
-// SubscriberCount is the number of live browser /ws/fe clients.
+// SetSubscriberHost retargets a live subscriber's host filter, identifying
+// the subscriber by the channel TrySubscribe handed back — channel values
+// are comparable and every subscriber owns a distinct one, so no extra
+// handle type is needed on the hot path. hostID "" restores the
+// watch-every-host default.
+//
+// The change is a fan-out change for TWO hosts (the one the page left and
+// the one it joined), so it re-notifies hosts: the abandoned host drops to
+// zero viewers and pauses its event upload, the new one wakes up. Returns
+// false when ch is not (or no longer) a live subscriber.
+func (h *Hub) SetSubscriberHost(ch chan Event, hostID string) bool {
+	h.mu.Lock()
+	var found bool
+	if cur := h.subs.Load(); cur != nil {
+		for _, s := range *cur {
+			if s.ch == ch {
+				s.host.Store(hostID)
+				found = true
+				break
+			}
+		}
+	}
+	h.mu.Unlock()
+	if !found {
+		return false
+	}
+	h.notifyHostsSubscribers()
+	return true
+}
+
+// SubscriberCount is the number of live browser /ws/fe clients, whatever
+// host each of them watches.
 func (h *Hub) SubscriberCount() int {
 	if cur := h.subs.Load(); cur != nil {
 		return len(*cur)
@@ -1674,10 +1755,41 @@ func (h *Hub) SubscriberCount() int {
 	return 0
 }
 
-// notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N, gen:G} to
-// every online host WebSocket. Hosts use count==0 to stop uploading bridge
-// events (they still send host_status heartbeats). Writes run outside h.mu so
-// a slow host cannot stall the hub lock.
+// SubscriberCountFor is the number of live browser subscribers that
+// actually RECEIVE hostID's events: those filtered to hostID plus every
+// watch-all subscriber. Hosts gate event upload on this figure — a page
+// showing host A is not an audience for host B, so B can pause its uplink
+// instead of streaming into a fan-out that drops it. hostID "" is the
+// watch-all audience, i.e. every subscriber.
+func (h *Hub) SubscriberCountFor(hostID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.subscriberCountForLocked(hostID)
+}
+
+// subscriberCountForLocked runs the per-subscriber filter test. Callers
+// hold h.mu.
+func (h *Hub) subscriberCountForLocked(hostID string) int {
+	var n int
+	if cur := h.subs.Load(); cur != nil {
+		for _, s := range *cur {
+			if s.watches(hostID) {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N, gen:G}
+// to every online host WebSocket. Hosts use count==0 to stop uploading
+// bridge events (they still send host_status heartbeats). Writes run
+// outside h.mu so a slow host cannot stall the hub lock.
+//
+// N is PER HOST — the number of subscribers that actually receive that
+// host's events (see SubscriberCountFor), not the raw browser count. With
+// the /ws/fe host filter in place this is what lets an unwatched host stop
+// uploading at all.
 //
 // `gen` is a hub-monotonic generation stamp and it is load-bearing: the
 // frames are ABSOLUTE state, they are written from one fire-and-forget
@@ -1689,58 +1801,83 @@ func (h *Hub) SubscriberCount() int {
 // page shows a live-looking but permanently frozen session. Hosts keep the
 // highest gen seen and ignore anything older.
 //
-// A count that has not changed since the last notification is not resent
-// (browser churn on a multi-tab hub is otherwise a per-host write storm);
-// a lost frame is repaired by the periodic re-assert on the host ping.
+// A count that has not changed since the last notification for THAT host
+// is not resent (browser churn on a multi-tab hub is otherwise a per-host
+// write storm); a lost frame is repaired by the periodic re-assert on the
+// host ping.
 func (h *Hub) notifyHostsSubscribers() {
 	h.mu.Lock()
-	var count int
-	if cur := h.subs.Load(); cur != nil {
-		count = len(*cur)
+	type pending struct {
+		write func([]byte) error
+		host  string
+		count int
 	}
-	if h.lastNotifiedSubs != nil && *h.lastNotifiedSubs == count {
+	var todo []pending
+	for id, hs := range h.hosts {
+		if hs.conn == nil {
+			continue
+		}
+		count := h.subscriberCountForLocked(id)
+		if prev, seen := h.lastNotifiedSubs[id]; seen && prev == count {
+			continue
+		}
+		if h.lastNotifiedSubs == nil {
+			h.lastNotifiedSubs = make(map[string]int)
+		}
+		h.lastNotifiedSubs[id] = count
+		todo = append(todo, pending{write: hs.conn.write, host: id, count: count})
+	}
+	if len(todo) == 0 {
 		h.mu.Unlock()
 		return
 	}
-	h.lastNotifiedSubs = &count
 	gen := h.subsGen.Add(1)
-	writes := make([]func([]byte) error, 0, len(h.hosts))
-	for _, hs := range h.hosts {
-		if hs.conn != nil {
-			writes = append(writes, hs.conn.write)
+	writes := make([]func([]byte) error, 0, len(todo))
+	frames := make([][]byte, 0, len(todo))
+	for _, p := range todo {
+		b, err := json.Marshal(map[string]any{
+			"v": 1, "type": "subscribers", "count": p.count, "gen": gen,
+		})
+		if err != nil {
+			continue
 		}
+		frames = append(frames, b)
+		writes = append(writes, p.write)
 	}
 	h.mu.Unlock()
-	if len(writes) == 0 {
-		return
-	}
-	payload, err := json.Marshal(map[string]any{
-		"v": 1, "type": "subscribers", "count": count, "gen": gen,
-	})
-	if err != nil {
+	if len(frames) == 0 {
 		return
 	}
 	// Fire-and-forget per host: writes carry a multi-second timeout each,
 	// so one half-open host must not stall the caller (subscribe /
 	// unsubscribe). Ordering across goroutines is handled by `gen`.
-	for _, write := range writes {
-		go func(w func([]byte) error) {
+	for i, write := range writes {
+		go func(w func([]byte) error, payload []byte) {
 			_ = w(payload)
-		}(write)
+		}(write, frames[i])
 	}
 }
 
-// SubscribersState returns the live browser subscriber count together with
-// a fresh monotonic generation stamp, for transports that re-assert the
-// count on their periodic host ping. Re-asserting makes the subscriber
-// count self-healing: a `subscribers` frame lost to a write error or a
-// superseded connection is corrected within one ping interval instead of
-// leaving the host paused until the next browser connect/disconnect.
+// SubscribersState returns the total live browser subscriber count together
+// with a fresh monotonic generation stamp — the watch-all audience, i.e.
+// what every host used to be told before per-host filtering.
 func (h *Hub) SubscribersState() (count int, gen uint64) {
+	return h.subscribersStateFor("")
+}
+
+// SubscribersStateFor is SubscribersState scoped to the subscribers that
+// receive hostID's events, for transports that re-assert the count on their
+// periodic host ping. Re-asserting makes the subscriber count self-healing:
+// a `subscribers` frame lost to a write error or a superseded connection is
+// corrected within one ping interval instead of leaving the host paused
+// until the next browser connect/disconnect.
+func (h *Hub) SubscribersStateFor(hostID string) (count int, gen uint64) {
+	return h.subscribersStateFor(hostID)
+}
+
+func (h *Hub) subscribersStateFor(hostID string) (count int, gen uint64) {
 	h.mu.Lock()
-	if cur := h.subs.Load(); cur != nil {
-		count = len(*cur)
-	}
+	count = h.subscriberCountForLocked(hostID)
 	h.mu.Unlock()
 	return count, h.subsGen.Add(1)
 }
@@ -1751,16 +1888,24 @@ func (h *Hub) Broadcast(ev Event) {
 	h.broadcast(ev)
 }
 
-// broadcast fans an event out to every browser subscriber against a
-// lock-free copy-on-write snapshot of the subscriber list: registration
-// churn (browser connect/disconnect) swaps the slice under h.mu, while
-// this hot path — per host event — never touches the global lock.
+// broadcast fans an event out to the browser subscribers that watch its
+// host, against a lock-free copy-on-write snapshot of the subscriber list:
+// registration churn (browser connect/disconnect, host switch) swaps the
+// slice under h.mu, while this hot path — per host event — never touches
+// the global lock.
 func (h *Hub) broadcast(ev Event) {
 	cur := h.subs.Load()
 	if cur == nil {
 		return
 	}
+	// hostId is stamped on the Event map by both ingest paths
+	// (appendEvent / RegisterRawEvents), so the filter is a map read, not
+	// a decode. Hub-level events carry no hostId and reach everyone.
+	evHost, _ := ev["hostId"].(string)
 	for _, s := range *cur {
+		if !s.watches(evHost) {
+			continue
+		}
 		s.deliver(ev)
 	}
 }

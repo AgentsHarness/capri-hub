@@ -769,7 +769,7 @@ func writeHostHello(h *hub.Hub, hostID string, deflate bool, write func([]byte) 
 		"v":           1,
 		"type":        "hello",
 		"service":     "hub",
-		"subscribers": h.SubscriberCount(),
+		"subscribers": h.SubscriberCountFor(hostID),
 		"seq":         h.LastSeq(hostID),
 	}
 	if deflate {
@@ -809,12 +809,12 @@ func inflateUplink(b []byte) ([]byte, error) {
 }
 
 // writeHostPing sends the hub→host liveness ping. It also RE-ASSERTS the
-// browser subscriber count: the count drives whether the host uploads
-// bridge events at all, and an edge-triggered `subscribers` frame can be
-// lost (write error, superseded connection) — which would leave the host
-// paused while a browser sits watching a frozen page. Piggy-backing the
-// absolute value on the ping makes the state self-healing within one ping
-// interval. `subsGen` lets the host discard an out-of-order delivery.
+// browser subscriber count for THAT host: the count drives whether the host
+// uploads bridge events at all, and an edge-triggered `subscribers` frame
+// can be lost (write error, superseded connection) — which would leave the
+// host paused while a browser sits watching a frozen page. Piggy-backing
+// the absolute value on the ping makes the state self-healing within one
+// ping interval. `subsGen` lets the host discard an out-of-order delivery.
 //
 // `seq` piggy-backs the per-host data-plane watermark (same meaning as
 // hello.seq): it is a delivery ACK for the host's uplink events, letting
@@ -822,7 +822,7 @@ func inflateUplink(b []byte) ([]byte, error) {
 // of what it managed to enqueue. Absent on old hubs — hosts treat a
 // missing field as "no new ack".
 func writeHostPing(h *hub.Hub, hostID string, write func([]byte) error) error {
-	count, gen := h.SubscribersState()
+	count, gen := h.SubscribersStateFor(hostID)
 	frame, err := json.Marshal(map[string]any{
 		"v": 1, "type": "ping", "ts": time.Now().Unix(),
 		"subscribers": count, "subsGen": gen,
@@ -954,6 +954,10 @@ var (
 // handleFeWS: aggregated live event stream for browsers.
 //   - hello carries `seqs` (last event seq per host) so a reconnecting FE
 //     knows what it missed and can gap-pull via GET /api/events.
+//   - ?host=<id> scopes the stream to that one host: only its events (plus
+//     hub-level frames like hosts_changed) fan out to this connection, and
+//     the FE can retarget mid-session with a {"type":"subscribe"} frame.
+//     Absent/empty keeps the pre-filter behaviour of every host's stream.
 //   - events frames are flate-compressed binary when the client asks (?c=1).
 //   - auth: prefer short-lived ?ticket= (from POST /api/ws-ticket); still
 //     accepts Bearer / X-Access-Token / ?token= for the long-lived FE_TOKEN.
@@ -964,6 +968,7 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 			return
 		}
 		compress := r.URL.Query().Get("c") == "1"
+		hostID := strings.TrimSpace(r.URL.Query().Get("host"))
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			// Dev UIs may be on another origin; FE_TOKEN is the real gate.
@@ -978,7 +983,7 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 
 		// Resource guard: reject (1013 Try Again Later) once the
 		// subscriber cap is reached instead of degrading under load.
-		ch, unsub, ok := h.TrySubscribe(maxFESubscribers)
+		ch, unsub, ok := h.TrySubscribeHost(maxFESubscribers, hostID)
 		if !ok {
 			_ = conn.Close(websocket.StatusTryAgainLater, "too many subscribers")
 			return
@@ -1104,16 +1109,38 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 		defer liveness.Stop()
 
 		ctx := r.Context()
-		// Drain FE pings in background so the read side does not stall.
+		// Read FE frames in background so the read side does not stall.
 		// This reader is also what processes the peer's WS pong for the
 		// protocol-level Ping below — without an in-flight Read the pong
-		// would never be dispatched.
+		// would never be dispatched. Besides the app-level pings it carries
+		// one control frame: {"v":1,"type":"subscribe","host":ID}, which
+		// retargets this connection's event filter when the page switches
+		// hosts without reconnecting. The ack echoes the host's current seq
+		// watermark so the FE can align instead of gap-pulling from 0 (the
+		// whole per-host ring buffer).
 		go func() {
 			for {
-				_, _, err := conn.Read(ctx)
+				_, data, err := conn.Read(ctx)
 				if err != nil {
 					return
 				}
+				var ctl struct {
+					Type string `json:"type"`
+					Host string `json:"host"`
+				}
+				if json.Unmarshal(data, &ctl) != nil || ctl.Type != "subscribe" {
+					continue // pings and anything unrecognized stay a no-op
+				}
+				target := strings.TrimSpace(ctl.Host)
+				if !h.SetSubscriberHost(ch, target) {
+					continue
+				}
+				// writeJSONFrame takes the same write mutex the event
+				// batcher uses, so an ack cannot interleave a frame.
+				_ = writeJSONFrame(map[string]any{
+					"v": 1, "type": "subscribed",
+					"host": target, "seq": h.LastSeq(target),
+				})
 			}
 		}()
 
