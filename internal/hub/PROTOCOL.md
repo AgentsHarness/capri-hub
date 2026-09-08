@@ -211,7 +211,7 @@ GET /ws/fe?ticket=…&host=<hostId>&c=1          (filter from the first frame)
 (and, when it already saw events, gap-pulls only the real hole). Without it
 a host switch leaves the client at watermark 0, whose first event triggers
 `GET /api/events?host=…&after=0` — the whole per-host ring buffer (up to
-6000 events) fetched and then discarded.
+1500 events) fetched and then discarded.
 
 Fan-out rule per subscriber: an event tagged `hostId` reaches it when the
 subscriber's filter is empty or equal; hub-level frames (`hosts_changed`,
