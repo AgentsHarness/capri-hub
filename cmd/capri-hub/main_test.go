@@ -1029,6 +1029,17 @@ func TestHandleHostFrameHostStatusControl(t *testing.T) {
 
 	ch, unsub := h.Subscribe()
 	defer unsub()
+	// Fan-out is asynchronous (per-subscriber ring + pump): drain the chunk
+	// registered above so the assertion below reads the control-plane frame.
+	drainUntil := time.After(100 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-ch:
+		case <-drainUntil:
+			break drainLoop
+		}
+	}
 
 	handleHostFrame(h, "h1",
 		[]byte(`{"v":1,"type":"host_status","ready":true}`),

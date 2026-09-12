@@ -961,6 +961,10 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 
 	ch, unsub := h.Subscribe()
 	defer unsub()
+	// Fan-out is asynchronous (per-host queue, see hostState.fanout): the
+	// seed event registered before this subscription can still be in flight.
+	// Drain it first, then assert the stale/duplicate seqs stay silent.
+	drainEvents(ch, 100*time.Millisecond)
 
 	// Regressed seq: accepted (LastSeen) but no fan-out / no buffer append.
 	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "stale", "seq": uint64(50)}) {
@@ -1032,6 +1036,10 @@ func TestSetHostReady(t *testing.T) {
 
 	ch, unsub := h.Subscribe()
 	defer unsub()
+	// Asynchronous fan-out: the seed chunk registered above may still be in
+	// the queue. Drain it so the hosts_changed assertions below read the
+	// control-plane frames, not the data-plane seed.
+	drainEvents(ch, 100*time.Millisecond)
 
 	if !h.SetHostReady("h1", true) {
 		t.Fatal("SetHostReady true failed")
@@ -1235,6 +1243,9 @@ func TestResetHostSeq(t *testing.T) {
 
 	ch, unsub := h.Subscribe()
 	defer unsub()
+	// Asynchronous fan-out: drain the pre-subscription seed ("old") before
+	// asserting that the post-reset seq 1 is the one that fans out.
+	drainEvents(ch, 100*time.Millisecond)
 
 	if !h.ResetHostSeq("h1") {
 		t.Fatal("ResetHostSeq failed")
@@ -1901,34 +1912,221 @@ func TestRawTerminalToolUpdateIsCritical(t *testing.T) {
 // completion lands via the blocking fallback while a delta drops and counts
 // toward the resync threshold.
 func TestDeliverTerminalToolUpdateOnFullQueue(t *testing.T) {
-	s := &feSubscriber{ch: make(chan Event, 1)}
-	s.ch <- Event{"type": "chunk"} // queue full
+	// Delivery is asynchronous (per-subscriber ring + pump): deliver only
+	// enqueues, the pump owns ch. A wedged consumer may therefore hold the
+	// pump at the terminal event, but must never lose it.
+	s := newFeSubscriber(1)
+	defer s.stop()
+	s.deliver(Event{"type": "chunk"}) // fills ch
+	if ev := <-s.ch; ev["type"] != "chunk" {
+		t.Fatalf("first delivery = %v, want chunk", ev)
+	}
 
-	done := make(chan struct{})
-	go func() {
-		<-s.ch // free a slot so the blocking fallback can land
-		close(done)
-	}()
 	s.deliver(Event{
 		"type":                "tool_call_update",
 		terminalToolUpdateKey: true,
 	})
-	<-done
-	if n := len(s.ch); n != 1 {
-		t.Fatalf("terminal tool_call_update dropped on a full queue (len=%d)", n)
+	// The terminal event must arrive even though ch was saturated when it
+	// was enqueued (the pump waits for the slot instead of dropping it).
+	select {
+	case ev := <-s.ch:
+		if ev["type"] != "tool_call_update" {
+			t.Fatalf("delivered %v, want the terminal tool_call_update", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal tool_call_update dropped on a full queue")
 	}
 	if got := s.dropped.Load(); got != 0 {
 		t.Errorf("dropped = %d, want 0", got)
 	}
 
-	s2 := &feSubscriber{ch: make(chan Event, 1)}
-	s2.ch <- Event{"type": "chunk"}
+	// A non-terminal (in_progress) delta stays droppable under pressure: it
+	// must not displace the queued event, and it counts toward the resync
+	// threshold.
+	s2 := newFeSubscriber(1)
+	defer s2.stop()
+	s2.deliver(Event{"type": "chunk"}) // fills ch (pump delivers it)
+	if ev := <-s2.ch; ev["type"] != "chunk" {
+		t.Fatalf("first delivery = %v, want chunk", ev)
+	}
+	// Re-fill ch so the next droppable delivery has nowhere to go.
+	s2.deliver(Event{"type": "chunk"})
+	waitFor(t, func() bool { return len(s2.ch) == 1 }, time.Second)
 	s2.deliver(Event{"type": "tool_call_update"}) // no terminal flag
+	waitFor(t, func() bool { return s2.dropped.Load() == 1 }, time.Second)
 	if n := len(s2.ch); n != 1 {
 		t.Errorf("delta must not displace the queued event (len=%d)", n)
 	}
 	if got := s2.dropped.Load(); got != 1 {
 		t.Errorf("dropped = %d, want 1 (counts toward resync)", got)
+	}
+}
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(t *testing.T, cond func() bool, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !cond() {
+		t.Fatal("condition not met before deadline")
+	}
+}
+
+// TestCriticalEventTypesCoverFETurnTerminals: the hub's never-drop set must
+// match what the FE treats as a turn terminal / pending transition
+// (capri-fe store/chat/turnLifecycle.ts TURN_TERMINAL_TYPES + turnEnd.ts).
+// A gap here is silent: a dropped "cancelled"/"prompt_complete" leaves the
+// composer on "Responding…" forever, and a dropped session "error" hides
+// the failure, because no later event of that turn can reveal the hole.
+func TestCriticalEventTypesCoverFETurnTerminals(t *testing.T) {
+	for _, typ := range []string{
+		"done", "turn_completed", "cancelled", "prompt_complete",
+		"error", "client_request", "client_request_resolved",
+	} {
+		if !criticalEvent(Event{"type": typ}) {
+			t.Errorf("%q must never be dropped to a slow subscriber", typ)
+		}
+	}
+	for _, typ := range []string{"chunk", "thought", "user_chunk", "usage", "status"} {
+		if criticalEvent(Event{"type": typ}) {
+			t.Errorf("%q is streaming noise and stays droppable", typ)
+		}
+	}
+}
+
+// TestDroppedCriticalEventForcesResync: a critical event lost to a wedged
+// subscriber escalates to a resync immediately instead of waiting for
+// resyncDropThreshold drops — the FE otherwise waits on a turn that already
+// ended, with no later event to expose the seq hole.
+func TestDroppedCriticalEventForcesResync(t *testing.T) {
+	s := newFeSubscriber(1)
+	defer s.stop()
+	s.host.Store("h1")
+
+	// Saturate the consumer channel, then the ring, so the next critical
+	// event has nowhere to go (its drop is the case under test).
+	s.deliver(Event{"type": "chunk"})
+	waitFor(t, func() bool { return len(s.ch) == 1 }, time.Second)
+	s.mu.Lock()
+	for i := 0; i < len(s.ring); i++ {
+		s.ring[i] = Event{"type": "tool_call_update"}
+	}
+	s.n = len(s.ring)
+	s.mu.Unlock()
+
+	s.deliver(Event{"type": "cancelled", "seq": float64(777), "hostId": "h1"})
+
+	// Drain: the parked chunk first (it was handed over before the drop),
+	// then the resync the escalation queued ahead of the ring backlog.
+	if ev := <-s.ch; ev["type"] != "chunk" {
+		t.Fatalf("first frame = %v, want the parked chunk", ev)
+	}
+	select {
+	case ev := <-s.ch:
+		if ev["type"] != "resync" {
+			t.Fatalf("second frame = %v, want a resync for the dropped terminal", ev)
+		}
+		if got, _ := ev["fromSeq"].(uint64); got != 777 {
+			t.Errorf("resync fromSeq = %v, want 777", ev["fromSeq"])
+		}
+		if got, _ := ev["hostId"].(string); got != "h1" {
+			t.Errorf("resync hostId = %v, want h1", ev["hostId"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no resync after a dropped critical event")
+	}
+}
+
+// TestSlowSubscriberDoesNotDelayIngestOrPeers: one wedged browser must not
+// stall uplink ingestion (the old blocking fallback held the fan-out path
+// for a blocking per-event wait on the wedged subscriber) nor delay peers
+// watching the same host.
+func TestSlowSubscriberDoesNotDelayIngestOrPeers(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+
+	wedged, unsubW := h.Subscribe()
+	defer unsubW()
+	healthy, unsubH := h.Subscribe()
+	defer unsubH()
+
+	// Saturate the wedged subscriber's channel and never drain it: its pump
+	// parks on the first event it cannot hand over.
+	for i := 0; i < cap(wedged); i++ {
+		wedged <- Event{"type": "filler"}
+	}
+
+	const n = 200 // all critical: each one waits inline under the old code
+	ingestDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			h.RegisterEvent("h1", Event{"type": "done", "seq": uint64(i + 1)})
+		}
+		ingestDone <- time.Since(start)
+	}()
+	select {
+	case d := <-ingestDone:
+		if d > 2*time.Second {
+			t.Fatalf("ingest took %v behind a wedged subscriber", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ingest blocked behind a wedged subscriber")
+	}
+
+	seen := 0
+	deadline := time.After(3 * time.Second)
+	for seen < n {
+		select {
+		case ev := <-healthy:
+			if ev["type"] == "done" {
+				seen++
+			}
+		case <-deadline:
+			t.Fatalf("healthy subscriber saw %d/%d events while a peer was wedged", seen, n)
+		}
+	}
+}
+
+// TestFanoutDropsAreCountedNotBlocking: with the consumer saturated, a
+// droppable flood drops (and escalates to a queued resync) while the fan-out
+// path itself never waits on the subscriber.
+func TestFanoutDropsAreCountedNotBlocking(t *testing.T) {
+	s := newFeSubscriber(1)
+	defer s.stop()
+	s.host.Store("h1")
+	s.deliver(Event{"type": "chunk", "seq": float64(1)})
+	waitFor(t, func() bool { return len(s.ch) == 1 }, time.Second)
+
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		s.deliver(Event{"type": "chunk", "seq": float64(i + 2)})
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("droppable flood blocked the fan-out path for %v", d)
+	}
+
+	// Crossing the threshold queues one resync, which the pump parks on
+	// (critical-tier) instead of dropping further events. It lands as soon
+	// as the consumer drains.
+	if ev := <-s.ch; ev["type"] != "chunk" {
+		t.Fatalf("first frame = %v, want the parked chunk", ev)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-s.ch:
+			if ev["type"] == "resync" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("no resync after a droppable flood crossed the threshold")
+		}
 	}
 }
 

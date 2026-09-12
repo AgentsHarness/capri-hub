@@ -190,6 +190,46 @@ type hostState struct {
 	// evBufEpoch is bumped on disconnect (schedule clear) and reconnect
 	// (cancel clear). A delayed clear only runs if the epoch still matches.
 	evBufEpoch uint64
+
+	// fanout decouples uplink ingestion from browser fan-out. The host read
+	// loop only appends here (bounded, never blocks); a per-host goroutine
+	// drains it into h.broadcast. Without this the reader would run the
+	// per-subscriber fan-out itself — and a stalled reader stops draining the
+	// host socket, back-pressuring the host's entire uplink (events, responds,
+	// host_status) for every browser, not just the slow one.
+	//
+	// fanout is created (and its goroutine started) by fanoutOnce on the
+	// first enqueue, so hosts that never receive an event cost nothing.
+	fanout     chan Event
+	fanoutOnce sync.Once
+	// fanoutDropped counts events dropped because the fan-out queue was
+	// full. The event is already in evBuf, so a FE's (hostId,seq) gap-pull
+	// recovers it — this is not a loss, just deferred delivery.
+	fanoutDropped atomic.Uint64
+}
+
+// hostFanoutCap bounds the per-host pre-fan-out backlog. Overflow is
+// recoverable (see fanoutDropped): subscribers see a seq gap and pull the
+// event back out of evBuf.
+const hostFanoutCap = 2048
+
+// enqueueFanout hands one already-gated, already-buffered event to this
+// host's fan-out goroutine. Never blocks: a slow browser must not stall the
+// host read loop (see hostState.fanout).
+func (hs *hostState) enqueueFanout(h *Hub, ev Event) {
+	hs.fanoutOnce.Do(func() {
+		hs.fanout = make(chan Event, hostFanoutCap)
+		go func() {
+			for e := range hs.fanout {
+				h.broadcast(e)
+			}
+		}()
+	})
+	select {
+	case hs.fanout <- ev:
+	default:
+		hs.fanoutDropped.Add(1)
+	}
 }
 
 // Hub is the relay core. All methods are safe for concurrent use.
@@ -1076,7 +1116,7 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 				h.SetHostReady(hostID, r)
 			}
 		}
-		h.broadcast(fanout)
+		hs.enqueueFanout(h, fanout)
 	}
 	return true
 }
@@ -1273,7 +1313,7 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 		if meta.Type == "host_status" {
 			h.SetHostReady(hostID, meta.Ready)
 		}
-		h.broadcast(ev)
+		hs.enqueueFanout(h, ev)
 	}
 	return true
 }
@@ -1499,6 +1539,13 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 // feSubscriber is one browser /ws/fe registration. The channel is the
 // fan-out queue; per-subscriber pressure state hangs off this struct so
 // the copy-on-write list stays a plain slice.
+//
+// Delivery model: deliver() only appends to the per-subscriber ring (never
+// blocks), and this subscriber's own pump goroutine owns every write to ch.
+// A wedged browser therefore stalls nothing but its own pump — not the
+// host read loop that feeds fan-out, and not the other browsers watching
+// the same host (before the ring, a wedged subscriber's full channel was
+// waited on inline, on the shared fan-out path).
 type feSubscriber struct {
 	ch chan Event
 
@@ -1509,12 +1556,184 @@ type feSubscriber struct {
 	// per event by broadcast, hence the atomic.
 	host atomic.Value // string
 
-	// dropped counts events dropped for this subscriber because its
-	// channel was full (slow FE). Once it reaches resyncDropThreshold a
-	// resync frame is pushed and the counter resets — one resync per
-	// threshold worth of drops, so a permanently stuck FE cannot trigger
-	// a resync storm.
+	// dropped counts events dropped (or dropped-eligible) for this slow
+	// subscriber. Once it reaches resyncDropThreshold a resync frame is
+	// pushed and the counter resets — one resync per threshold worth of
+	// drops, so a permanently stuck FE cannot trigger a resync storm.
 	dropped atomic.Int32
+
+	mu       sync.Mutex
+	ring     []Event
+	head     int
+	n        int
+	pending  *Event // one queued resync frame, delivered ahead of the ring
+	wake     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+const (
+	// subRingCap bounds a subscriber's droppable backlog in front of its
+	// channel. Overflow drops (recoverable: the FE gap-pulls the seq hole).
+	subRingCap = 2048
+	// subRingCriticalSlack reserves ring room for critical events so a
+	// droppable flood can never displace a terminal state.
+	subRingCriticalSlack = 512
+)
+
+// newFeSubscriber registers the ring/pump for one browser subscriber.
+// chCap is the consumer-facing buffer (the /ws/fe writer's queue).
+func newFeSubscriber(chCap int) *feSubscriber {
+	s := &feSubscriber{
+		ch:   make(chan Event, chCap),
+		ring: make([]Event, subRingCap+subRingCriticalSlack),
+		wake: make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	go s.pump()
+	return s
+}
+
+// stop ends this subscriber's pump (unsubscribe path).
+func (s *feSubscriber) stop() {
+	s.stopOnce.Do(func() { close(s.done) })
+}
+
+// enqueue appends ev to the ring. Droppable events drop once the droppable
+// ceiling is reached; critical events may use the reserved slack. Never
+// blocks — the caller is the fan-out path.
+func (s *feSubscriber) enqueue(ev Event, critical bool) {
+	limit := subRingCap
+	if critical {
+		limit = len(s.ring)
+	}
+	s.mu.Lock()
+	if s.n >= limit {
+		s.mu.Unlock()
+		s.noteDrop(ev, critical)
+		return
+	}
+	s.ring[(s.head+s.n)%len(s.ring)] = ev
+	s.n++
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// pump delivers this subscriber's ring in order. Droppable events are
+// dropped the moment ch is full (transient jitter the FE repairs);
+// critical events — and a queued resync, which is flushed ahead of the ring —
+// wait for a free slot instead, so a terminal state is never lost while the
+// subscriber is live.
+func (s *feSubscriber) pump() {
+	for {
+		s.mu.Lock()
+		if s.pending != nil {
+			ev := *s.pending
+			s.pending = nil
+			s.mu.Unlock()
+			if !s.send(ev) {
+				return
+			}
+			continue
+		}
+		if s.n == 0 {
+			s.mu.Unlock()
+			select {
+			case <-s.wake:
+				continue
+			case <-s.done:
+				return
+			}
+		}
+		ev := s.ring[s.head]
+		s.mu.Unlock()
+
+		if criticalEvent(ev) {
+			if !s.send(ev) {
+				return
+			}
+		} else if !s.trySend(ev) {
+			if s.stopped() {
+				return
+			}
+			s.noteDrop(ev, false)
+		}
+
+		s.mu.Lock()
+		s.ring[s.head] = nil
+		s.head = (s.head + 1) % len(s.ring)
+		s.n--
+		s.mu.Unlock()
+	}
+}
+
+// send blocks until ev is handed to the consumer or the subscriber stops.
+func (s *feSubscriber) send(ev Event) bool {
+	select {
+	case s.ch <- ev:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
+// trySend is send without waiting.
+func (s *feSubscriber) trySend(ev Event) bool {
+	select {
+	case s.ch <- ev:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *feSubscriber) stopped() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// noteDrop records one event lost to this subscriber and decides whether to
+// escalate to a resync frame.
+//
+// A dropped CRITICAL event escalates immediately instead of waiting for the
+// threshold: the FE would otherwise sit on a turn that already ended (or a
+// permission card that will never paint) with no later event to reveal the
+// gap — the (hostId,seq) gap-pull only fires when a higher seq arrives, and
+// a terminal event is usually the last one of its turn.
+//
+// The frame is QUEUED in a dedicated slot, not pushed: noteDrop runs on the
+// fan-out path, where blocking is forbidden (a full channel must never stall
+// the host read loop), and a push would be lost exactly when the consumer is
+// behind — the moment the resync matters. The pump flushes it ahead of the
+// ring backlog as soon as the consumer drains.
+func (s *feSubscriber) noteDrop(ev Event, critical bool) {
+	n := s.dropped.Add(1)
+	if !critical && n < resyncDropThreshold {
+		return
+	}
+	s.dropped.Store(0)
+	s.queueResync(resyncFrame(ev))
+}
+
+// queueResync parks one control frame for the pump. It never blocks and never
+// competes with the ring for room; a newer resync replaces a still-pending
+// one (both mean "rebuild", and the FE only ever advances its watermark, so
+// keeping the newest boundary is the safe choice).
+func (s *feSubscriber) queueResync(ev Event) {
+	s.mu.Lock()
+	s.pending = &ev
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 }
 
 // hostFilter is the subscriber's current host filter ("" = every host).
@@ -1542,10 +1761,21 @@ func (s *feSubscriber) watches(evHost string) bool {
 // client_request waits on a turn that already ended. Bulk streaming
 // events (chunk/thought and everything else) are droppable — the FE's
 // (hostId,seq) gap-pull repairs them.
+//
+// The set MUST cover every event the FE treats as a turn terminal or a
+// pending-interaction transition (see capri-fe store/chat/turnLifecycle.ts
+// TURN_TERMINAL_TYPES + events/turnEnd.ts): dropping "cancelled" /
+// "prompt_complete" leaves the composer stuck on "Responding…" with no
+// later event to reveal the gap, and a dropped session-scoped "error"
+// hides the failure entirely.
 var criticalEventTypes = map[string]struct{}{
-	"done":           {},
-	"turn_completed": {},
-	"client_request": {},
+	"done":                    {},
+	"turn_completed":          {},
+	"cancelled":               {},
+	"prompt_complete":         {},
+	"error":                   {},
+	"client_request":          {},
+	"client_request_resolved": {},
 }
 
 // terminalToolUpdateKey flags the raw-path Event of a tool call's terminal
@@ -1557,15 +1787,9 @@ var criticalEventTypes = map[string]struct{}{
 const terminalToolUpdateKey = "\x00terminalToolUpdate"
 
 const (
-	// criticalSendTimeout bounds the blocking fallback delivery for
-	// critical events on a full queue: the FE writer drains a 512-event
-	// channel fast, so a short block rescues the event under transient
-	// pressure without pinning the hub behind a wedged subscriber.
-	criticalSendTimeout = 100 * time.Millisecond
-	// resyncSendTimeout bounds delivery of the resync frame itself.
-	resyncSendTimeout = time.Second
 	// resyncDropThreshold is the dropped-event count that triggers one
-	// {"type":"resync",fromSeq:N} frame (counter then resets).
+	// {"type":"resync",fromSeq:N} frame (counter then resets). A dropped
+	// critical event escalates immediately instead of waiting for it.
 	resyncDropThreshold = 32
 )
 
@@ -1594,40 +1818,14 @@ func criticalEvent(ev Event) bool {
 	return s == "completed" || s == "failed"
 }
 
-// deliver is one subscriber's fan-out step. Non-critical events use the
-// historical non-blocking drop; critical events block briefly first so
-// terminal/control state survives backpressure. Drops are counted, and
-// crossing the threshold pushes a resync (the FE then rebuilds via
-// GET /api/events?after=) before the counter resets.
+// deliver is one subscriber's fan-out step: a non-blocking append to this
+// subscriber's ring, drained in order by its pump. It must never block —
+// deliver runs on the host fan-out path, and waiting inline on a wedged
+// browser's full channel used to slow every other browser watching that host
+// (and, before the per-host queue, the host read loop itself). Drop
+// accounting and resync escalation live in noteDrop.
 func (s *feSubscriber) deliver(ev Event) {
-	if criticalEvent(ev) {
-		select {
-		case s.ch <- ev:
-			return
-		case <-time.After(criticalSendTimeout):
-			// Still full after a grace period (wedged FE): fall through
-			// to the drop accounting below.
-		}
-	} else {
-		select {
-		case s.ch <- ev:
-			return
-		default:
-		}
-	}
-	// Dropped for this subscriber only. seq gaps are repaired by FE
-	// gap-pull; the resync below forces a full rebuild once enough has
-	// been lost that gap-pulling one-by-one would be the slower path.
-	if s.dropped.Add(1) == resyncDropThreshold {
-		s.dropped.Store(0)
-		resync := resyncFrame(ev)
-		select {
-		case s.ch <- resync:
-		case <-time.After(resyncSendTimeout):
-			// Even the resync cannot land; the FE is gone/wedged and the
-			// transport will reap it. Counter already reset — no storm.
-		}
-	}
+	s.enqueue(ev, criticalEvent(ev))
 }
 
 // resyncFrame builds the slow-consumer recovery frame for one dropped
@@ -1686,15 +1884,16 @@ func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool)
 // so the /ws/fe endpoint uses this as a resource guard when it is open to
 // unauthenticated clients.
 func (h *Hub) TrySubscribeHost(max int, hostID string) (ch chan Event, unsubscribe func(), ok bool) {
-	// Larger than the old SSE path: WS fan-out still drops on a full buffer,
-	// but 512 absorbs short FE write stalls without losing a turn of chunks.
-	s := &feSubscriber{ch: make(chan Event, 512)}
+	// 512 absorbs short FE write stalls; the subscriber's own pump (see
+	// feSubscriber) makes the fan-out path never wait on it.
+	s := newFeSubscriber(512)
 	if hostID != "" {
 		s.host.Store(hostID)
 	}
 	h.mu.Lock()
 	if cur := h.subs.Load(); cur != nil && max > 0 && len(*cur) >= max {
 		h.mu.Unlock()
+		s.stop()
 		return nil, nil, false
 	}
 	h.subscribeLocked(s)
@@ -1704,6 +1903,7 @@ func (h *Hub) TrySubscribeHost(max int, hostID string) (ch chan Event, unsubscri
 		h.mu.Lock()
 		h.unsubscribe(s)
 		h.mu.Unlock()
+		s.stop()
 		for {
 			select {
 			case <-s.ch:

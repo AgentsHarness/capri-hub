@@ -222,6 +222,17 @@ watermark to the wrong sequence and silently drop everything below it.
 Old hubs omit the field; FEs then treat `resync` as being about their own
 host, as before.
 
+When a `resync` is emitted: after `resyncDropThreshold` (32) droppable events
+are lost to one slow subscriber, or immediately when a single **critical**
+event is lost (the FE's turn terminals — `done` / `turn_completed` /
+`cancelled` / `prompt_complete` / session `error` — plus `client_request`,
+`client_request_resolved` and a terminal `tool_call_update`). A terminal event
+is usually the last of its turn, so the FE would never see a higher `seq` to
+reveal the hole: escalating at once is what turns a silent stall into a
+rebuild. The frame is queued ahead of that subscriber's backlog and never
+blocks the fan-out path, so a wedged browser cannot slow the host uplink or
+its peers.
+
 ### 6.3 Effect on the host-facing `subscribers` count
 
 `hello.subscribers`, the `subscribers` control frame and `ping.subscribers`
