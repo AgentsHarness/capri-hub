@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/brand/capri.png" alt="Capri mark" width="88" />
+  <img src="docs/brand/banner.png" alt="Capri" />
 </p>
 
 <h1 align="center">Capri Hub</h1>
