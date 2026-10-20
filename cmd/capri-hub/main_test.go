@@ -600,17 +600,17 @@ func TestWriteHostPingCarriesSeqAck(t *testing.T) {
 
 func TestFETicketSingleUse(t *testing.T) {
 	s := newFETicketStore()
-	ticket, exp := s.issue()
+	ticket, exp := s.issue("")
 	if ticket == "" || !exp.After(time.Now()) {
 		t.Fatalf("bad ticket %q exp %v", ticket, exp)
 	}
-	if !s.consume(ticket) {
+	if _, ok := s.consume(ticket); !ok {
 		t.Fatal("first consume should succeed")
 	}
-	if s.consume(ticket) {
+	if _, ok := s.consume(ticket); ok {
 		t.Fatal("second consume must fail (single-use)")
 	}
-	if s.consume("nope") {
+	if _, ok := s.consume("nope"); ok {
 		t.Fatal("unknown ticket must fail")
 	}
 }
@@ -626,7 +626,7 @@ func TestFEAuthTicketAndLegacyToken(t *testing.T) {
 	}
 
 	// Ticket
-	ticket, _ := tickets.issue()
+	ticket, _ := tickets.issue("")
 	r = httptest.NewRequest(http.MethodGet, "/ws/fe?ticket="+ticket, nil)
 	if !auth.check(r) {
 		t.Fatal("valid ticket must allow")
@@ -2104,7 +2104,7 @@ func TestIntegrationFeWSHostFilter(t *testing.T) {
 	h2 := dialPairedHost(t, ctx, srv, h, "h2", "H2")
 	defer h2.Close(websocket.StatusNormalClosure, "")
 
-	ticket, _ := tickets.issue()
+	ticket, _ := tickets.issue("")
 	fe, _, err := websocket.Dial(ctx,
 		strings.Replace(srv.URL, "http", "ws", 1)+"/ws/fe?ticket="+ticket+"&host=h1", nil)
 	if err != nil {
@@ -2164,6 +2164,92 @@ func TestIntegrationFeWSHostFilter(t *testing.T) {
 	}
 	if n := h.SubscriberCountFor("h1"); n != 0 {
 		t.Errorf("SubscriberCountFor(h1) after retarget = %d, want 0", n)
+	}
+}
+
+// TestIntegrationFESubscriberCount: the hub hello reports the live browser
+// total (the page itself included) and every later connect/disconnect pushes
+// a hub-level `subscribers_changed` to the pages already open — that number
+// is what the FE top bar renders beside the host block.
+func TestIntegrationFESubscriberCount(t *testing.T) {
+	h := hub.NewWithDir("")
+	tickets := newFETicketStore()
+	lim := newPairLimiter()
+	const secret = "subs-secret"
+	srv := httptest.NewServer(buildHandler(h, secret, tickets, lim, nil))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	dialFE := func() (*websocket.Conn, chan map[string]any) {
+		t.Helper()
+		ticket, _ := tickets.issue("")
+		conn, _, err := websocket.Dial(ctx,
+			strings.Replace(srv.URL, "http", "ws", 1)+"/ws/fe?ticket="+ticket, nil)
+		if err != nil {
+			t.Fatalf("fe ws dial: %v", err)
+		}
+		conn.SetReadLimit(1 << 20)
+		return conn, feFrames(ctx, conn)
+	}
+
+	// Hub-level broadcasts ride inside `events` frames (the subscriber pump
+	// batches them like host events), so scan the batch for the count frame.
+	waitSubCount := func(frames chan map[string]any, want float64, d time.Duration) bool {
+		t.Helper()
+		deadline := time.After(d)
+		for {
+			select {
+			case f, ok := <-frames:
+				if !ok {
+					return false
+				}
+				if f["type"] != "events" {
+					continue
+				}
+				evs, _ := f["events"].([]any)
+				for _, evAny := range evs {
+					ev, _ := evAny.(map[string]any)
+					if ev == nil || ev["type"] != "subscribers_changed" {
+						continue
+					}
+					if n, _ := ev["count"].(float64); n == want {
+						return true
+					}
+				}
+			case <-deadline:
+				return false
+			}
+		}
+	}
+
+	fe1, frames1 := dialFE()
+	defer fe1.Close(websocket.StatusNormalClosure, "")
+	hello1 := waitForFrameType(frames1, "hello", 3*time.Second)
+	if hello1 == nil {
+		t.Fatal("no first fe hello")
+	}
+	if n, _ := hello1["feSubscribers"].(float64); n != 1 {
+		t.Fatalf("first hello feSubscribers = %v, want 1", hello1["feSubscribers"])
+	}
+
+	fe2, frames2 := dialFE()
+	defer fe2.Close(websocket.StatusNormalClosure, "")
+	hello2 := waitForFrameType(frames2, "hello", 3*time.Second)
+	if n, _ := hello2["feSubscribers"].(float64); n != 2 {
+		t.Fatalf("second hello feSubscribers = %v, want 2", hello2["feSubscribers"])
+	}
+	if !waitSubCount(frames1, 2, 3*time.Second) {
+		t.Fatal("open page got no subscribers_changed=2 when another page joined")
+	}
+
+	// Closing the second page drops its subscription immediately (the WS
+	// read goroutine's exit wakes the handler), so the first page's number
+	// falls back to 1 without waiting for a ping failure.
+	fe2.Close(websocket.StatusNormalClosure, "")
+	if !waitSubCount(frames1, 1, 3*time.Second) {
+		t.Fatal("open page got no subscribers_changed=1 after the other page left")
 	}
 }
 

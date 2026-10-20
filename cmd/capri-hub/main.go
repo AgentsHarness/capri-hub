@@ -166,29 +166,46 @@ func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairL
 	if lim == nil {
 		lim = newPairLimiter()
 	}
-	auth := feAuth{token: feToken, tickets: tickets}
+	auth := feAuth{token: feToken, tickets: tickets, hub: h}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /api/info", handleInfo)
 	// Admin pairing endpoints: require FE token when configured.
-	mux.HandleFunc("GET /api/pairing", auth.require(handlePairing(h)))
-	mux.HandleFunc("POST /api/pairing/rotate", auth.require(handleRotate(h)))
+	mux.HandleFunc("GET /api/pairing", auth.requireAdmin(handlePairing(h)))
+	mux.HandleFunc("POST /api/pairing/rotate", auth.requireAdmin(handleRotate(h)))
 	// Host-facing: authenticate with host pairing token (not FE_TOKEN).
 	mux.HandleFunc("POST /api/pair", handlePair(h, lim))
 	mux.HandleFunc("GET /ws/host", handleHostWS(h))
 	// Browser-facing: FE token gate when FE_TOKEN is set.
-	mux.HandleFunc("GET /api/hosts", auth.require(handleHosts(h)))
-	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.require(handleUnpair(h)))
-	mux.HandleFunc("POST /api/hosts/{hostId}/rename", auth.require(handleRenameHost(h)))
-	mux.HandleFunc("GET /api/events", auth.require(handleEvents(h)))
-	mux.HandleFunc("GET /api/prefs", auth.require(handlePrefsGet(h)))
-	mux.HandleFunc("PUT /api/prefs", auth.require(handlePrefsPut(h)))
-	mux.HandleFunc("POST /api/ws-ticket", auth.require(handleWSTicket(tickets)))
+	mux.HandleFunc("GET /api/hosts", auth.requireIdentified(handleHosts(h)))
+	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.requireAdmin(handleUnpair(h)))
+	mux.HandleFunc("POST /api/hosts/{hostId}/rename", auth.requireAdmin(handleRenameHost(h)))
+	// Guests do not do sequence gap-pulls: the hub filters their stream by
+	// session, so the per-host seq watermark is meaningless to them.
+	mux.HandleFunc("GET /api/events", auth.requireAdmin(handleEvents(h)))
+	mux.HandleFunc("GET /api/prefs", auth.requireAdmin(handlePrefsGet(h)))
+	mux.HandleFunc("PUT /api/prefs", auth.requireAdmin(handlePrefsPut(h)))
+	mux.HandleFunc("POST /api/ws-ticket", auth.requireAny(handleWSTicket(h, tickets)))
 	mux.HandleFunc("GET /ws/fe", handleFeWS(h, auth))
+
+	// Guest tokens (admin-only management; guests read their own identity).
+	mux.HandleFunc("GET /api/guest-tokens", auth.requireAdmin(handleGuestTokenList(h)))
+	mux.HandleFunc("POST /api/guest-tokens/create", auth.requireAdmin(handleGuestTokenCreate(h)))
+	mux.HandleFunc("POST /api/guest-tokens/update", auth.requireAdmin(handleGuestTokenUpdate(h)))
+	mux.HandleFunc("POST /api/guest-tokens/delete", auth.requireAdmin(handleGuestTokenDelete(h)))
+	mux.HandleFunc("POST /api/guest-tokens/sessions/add", auth.requireAdmin(handleGuestSessionsAdd(h)))
+	mux.HandleFunc("POST /api/guest-tokens/sessions/remove", auth.requireAdmin(handleGuestSessionsRemove(h)))
+	mux.HandleFunc("POST /api/guest-tokens/refresh", auth.requireAdmin(handleGuestTokenRefresh(h)))
+	mux.HandleFunc("GET /api/access-role", auth.requireAny(handleAccessRole(h)))
+	mux.HandleFunc("GET /api/guest/sessions", auth.requireIdentified(handleGuestSessions(h)))
+	// Live browser subscriber roster (admin only): the top-bar count is the
+	// size of it, the panel behind the count lists the rows.
+	mux.HandleFunc("GET /api/subscribers", auth.requireAdmin(handleSubscribers(h)))
+
 	// Catch-all: relay everything else under /api/* to the selected host.
-	mux.HandleFunc("GET /api/{path...}", auth.require(handleRelay(h)))
-	mux.HandleFunc("POST /api/{path...}", auth.require(handleRelay(h)))
+	mux.HandleFunc("GET /api/{path...}", auth.requireIdentified(handleRelay(h)))
+	mux.HandleFunc("POST /api/{path...}", auth.requireIdentified(handleRelay(h)))
 	return withCORS(mux, corsOrigins)
 }
 
@@ -374,6 +391,40 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// requestIP is the address to DISPLAY for a browser (the subscriber panel).
+// Unlike clientIP — which feeds the pair rate limiter and therefore must not
+// be spoofable — this one prefers forwarding headers when the peer is
+// loopback: the deployed hub listens on 127.0.0.1 behind nginx, so every row
+// would otherwise read 127.0.0.1.
+//
+// Order matters on the deployed site: Cloudflare sits in front of nginx, so
+// nginx's X-Real-IP is a CF edge address, while CF-Connecting-IP and the
+// first X-Forwarded-For hop carry the real client. Headers from a
+// non-loopback peer are ignored (direct dials cannot spoof the display).
+func requestIP(r *http.Request) string {
+	peer := clientIP(r)
+	if isLoopbackHost(peer) {
+		if real := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); real != "" {
+			return real
+		}
+		if fwd := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); fwd != "" {
+			first, _, _ := strings.Cut(fwd, ",")
+			return strings.TrimSpace(first)
+		}
+		if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+			return real
+		}
+	}
+	return peer
+}
+
+// isLoopbackHost is a string test (the panel never dials back, so a parse
+// failure simply means "not a proxy we trust").
+func isLoopbackHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Rate-limit before parsing the body: a flood of malformed
@@ -412,15 +463,23 @@ func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 // short enough that a leaked ticket in access logs ages out quickly.
 const feTicketTTL = 2 * time.Minute
 
+// feTicket is one single-use WS ticket. guestID is empty for an admin
+// ticket; otherwise it names the guests.json record the ticket was minted
+// for, so the WS can rebuild that identity without re-reading the header.
+type feTicket struct {
+	expires time.Time
+	guestID string
+}
+
 // feTicketStore issues single-use short-lived tickets for /ws/fe so the
 // long-lived FE_TOKEN need not appear in query strings / proxy logs.
 type feTicketStore struct {
 	mu      sync.Mutex
-	tickets map[string]time.Time // ticket → expiry
+	tickets map[string]feTicket
 }
 
 func newFETicketStore() *feTicketStore {
-	return &feTicketStore{tickets: make(map[string]time.Time)}
+	return &feTicketStore{tickets: make(map[string]feTicket)}
 }
 
 // StartCleanup drops expired tickets until ctx is done.
@@ -436,7 +495,7 @@ func (s *feTicketStore) StartCleanup(ctx context.Context) {
 				s.mu.Lock()
 				now := time.Now()
 				for k, exp := range s.tickets {
-					if !exp.After(now) {
+					if !exp.expires.After(now) {
 						delete(s.tickets, k)
 					}
 				}
@@ -446,49 +505,69 @@ func (s *feTicketStore) StartCleanup(ctx context.Context) {
 	}()
 }
 
-func (s *feTicketStore) issue() (ticket string, expires time.Time) {
+// issue mints a ticket; guestID != "" marks it as a guest identity.
+func (s *feTicketStore) issue(guestID string) (ticket string, expires time.Time) {
 	var b [24]byte
 	_, _ = rand.Read(b[:])
 	ticket = hex.EncodeToString(b[:])
 	expires = time.Now().Add(feTicketTTL)
 	s.mu.Lock()
-	s.tickets[ticket] = expires
+	s.tickets[ticket] = feTicket{expires: expires, guestID: guestID}
 	s.mu.Unlock()
 	return ticket, expires
 }
 
-// consume validates and burns a ticket (single-use).
-func (s *feTicketStore) consume(ticket string) bool {
+// consume validates and burns a ticket (single-use), returning the identity
+// it was minted for (guest id, or "" for admin).
+func (s *feTicketStore) consume(ticket string) (guestID string, ok bool) {
 	if ticket == "" {
-		return false
+		return "", false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	exp, ok := s.tickets[ticket]
-	if !ok {
-		return false
+	rec, found := s.tickets[ticket]
+	if !found {
+		return "", false
 	}
 	delete(s.tickets, ticket)
-	return exp.After(time.Now())
+	if !rec.expires.After(time.Now()) {
+		return "", false
+	}
+	return rec.guestID, true
 }
 
-func handleWSTicket(tickets *feTicketStore) http.HandlerFunc {
+// valid reports whether ticket is still usable WITHOUT burning it (used by
+// the WS handshake, which must not consume twice when logging).
+func (s *feTicketStore) valid(ticket string) (guestID string, ok bool) {
+	if ticket == "" {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, found := s.tickets[ticket]
+	if !found || !rec.expires.After(time.Now()) {
+		return "", false
+	}
+	return rec.guestID, true
+}
+
+func handleWSTicket(h *hub.Hub, tickets *feTicketStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ticket, exp := tickets.issue()
+		// requireAny already resolved (and burned any ?ticket=) — reusing
+		// the context identity keeps guest tickets pointable at their
+		// guests.json record.
+		ident, ok := identityFromRequest(r, h)
+		if !ok {
+			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
+			return
+		}
+		ticket, exp := tickets.issue(ident.TokenID)
 		writeJSON(w, 200, map[string]any{
 			"ok":        true,
 			"ticket":    ticket,
 			"expiresAt": exp,
 			"ttlSec":    int(feTicketTTL / time.Second),
-		})
-	}
-}
-
-func handleHosts(h *hub.Hub) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{
-			"hosts":         h.ListHosts(),
-			"defaultHostId": h.DefaultHostID(),
+			"role":      ident.Role,
 		})
 	}
 }
@@ -963,12 +1042,25 @@ var (
 //     accepts Bearer / X-Access-Token / ?token= for the long-lived FE_TOKEN.
 func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !auth.check(r) {
+		ident, ok := auth.identify(r)
+		if !ok {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
 		}
 		compress := r.URL.Query().Get("c") == "1"
 		hostID := strings.TrimSpace(r.URL.Query().Get("host"))
+		if ident.isGuest() {
+			// Pin the initial filter to a whitelisted host (the first one
+			// when the FE names none) — the guest's ?host= is never trusted
+			// verbatim.
+			if hostID == "" || !ident.allowsHost(hostID) {
+				hostID = ident.defaultHost()
+			}
+			if hostID == "" {
+				writeJSON(w, 403, map[string]any{"ok": false, "error": "访客令牌没有可用会话"})
+				return
+			}
+		}
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			// Dev UIs may be on another origin; FE_TOKEN is the real gate.
@@ -983,12 +1075,34 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 
 		// Resource guard: reject (1013 Try Again Later) once the
 		// subscriber cap is reached instead of degrading under load.
-		ch, unsub, ok := h.TrySubscribeHost(maxFESubscribers, hostID)
+		//
+		// The identity snapshot (address / browser / which credential) is
+		// what the admin subscriber panel shows; it takes no part in
+		// filtering.
+		var ch chan hub.Event
+		var unsub func()
+		var subKicked <-chan struct{}
+		info := subscriberInfoFor(ident, requestIP(r), r.UserAgent())
+		if ident.isGuest() {
+			ch, unsub, subKicked, ok = h.TrySubscribeGuestInfo(maxFESubscribers, hostID, ident.asGuestToken(), info)
+		} else {
+			ch, unsub, ok = h.TrySubscribeHostInfo(maxFESubscribers, hostID, info)
+		}
 		if !ok {
 			_ = conn.Close(websocket.StatusTryAgainLater, "too many subscribers")
 			return
 		}
 		defer unsub()
+
+		// The admin page shows its own row in the subscriber panel; the id
+		// lets it mark "this page" without guessing by address.
+		subID, _ := h.SubscriberIDFor(ch)
+		// The session the page opened with (?session=) — a guest names it at
+		// connect time and only re-sends a subscribe frame when it switches.
+		// Without this the panel shows a guest row with no transcript.
+		if s := strings.TrimSpace(r.URL.Query().Get("session")); s != "" {
+			h.SetSubscriberSession(ch, s)
+		}
 
 		var writeMu sync.Mutex
 		writeFrame := func(b []byte, binary bool) error {
@@ -1056,14 +1170,27 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 			return err
 		}
 
-		if err := writeJSONFrame(map[string]any{
+		hello := map[string]any{
 			"v":             1,
 			"type":          "hello",
 			"service":       "hub",
-			"hosts":         h.ListHosts(),
-			"defaultHostId": h.DefaultHostID(),
-			"seqs":          h.SeqByHost(),
-		}); err != nil {
+			"hosts":         helloHosts(h, ident),
+			"defaultHostId": helloDefaultHost(h, ident),
+			"seqs":          helloSeqs(h, ident),
+			"role":          ident.Role,
+			// This socket's row id in the admin subscriber panel (0 when
+			// the registration was already gone). Guests get it too; it
+			// is their own id, not anyone else's.
+			"subscriberId": subID,
+		}
+		// Live browser /ws/fe clients, this connection included — the admin
+		// top bar shows it beside the host block. Changes arrive as
+		// hub-level `subscribers_changed` frames, which guests never receive
+		// (hub-level fan-out is admin-only), so their hello stays without it.
+		if !ident.isGuest() {
+			hello["feSubscribers"] = h.SubscriberCount()
+		}
+		if err := writeJSONFrame(hello); err != nil {
 			return
 		}
 
@@ -1109,6 +1236,11 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 		defer liveness.Stop()
 
 		ctx := r.Context()
+		// readDone closes when the browser socket goes away. Without it a
+		// closed tab stays in the subscriber set (and in the count the other
+		// pages display) until the next write fails or the liveness ping
+		// times out — up to 20s of a stale number.
+		readDone := make(chan struct{})
 		// Read FE frames in background so the read side does not stall.
 		// This reader is also what processes the peer's WS pong for the
 		// protocol-level Ping below — without an in-flight Read the pong
@@ -1119,28 +1251,68 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 		// watermark so the FE can align instead of gap-pulling from 0 (the
 		// whole per-host ring buffer).
 		go func() {
+			defer close(readDone)
 			for {
 				_, data, err := conn.Read(ctx)
 				if err != nil {
 					return
 				}
 				var ctl struct {
-					Type string `json:"type"`
-					Host string `json:"host"`
+					Type    string `json:"type"`
+					Host    string `json:"host"`
+					Session string `json:"session"`
 				}
-				if json.Unmarshal(data, &ctl) != nil || ctl.Type != "subscribe" {
+				if json.Unmarshal(data, &ctl) != nil {
+					continue
+				}
+				if ctl.Type == "viewing" {
+					// 管理员页面单独声明「正在看哪个会话」（纯台账，供
+					// 在线订阅者面板展示；不改事件过滤，故不回执）。
+					// 访客的会话走下面的 subscribe 帧，要过白名单校验。
+					if ident.isGuest() {
+						continue
+					}
+					h.SetSubscriberSession(ch, strings.TrimSpace(ctl.Session))
+					continue
+				}
+				if ctl.Type != "subscribe" {
 					continue // pings and anything unrecognized stay a no-op
 				}
 				target := strings.TrimSpace(ctl.Host)
+				session := strings.TrimSpace(ctl.Session)
+				if ident.isGuest() {
+					// A guest may only retarget within its whitelist. An
+					// out-of-scope frame is ignored and the previous
+					// subscription stays as it was — no ack, no state
+					// change (the FE never learns about other hosts).
+					if !ident.allowsHost(target) {
+						continue
+					}
+					if session != "" && !hub.GuestAllowsSession(ident.asGuestToken(), target, session) {
+						continue
+					}
+				}
 				if !h.SetSubscriberHost(ch, target) {
 					continue
 				}
+				// Both roles record the session they display: for a guest
+				// it is whitelist bookkeeping (an out-of-scope name was
+				// already rejected above), for an admin it is what the
+				// subscriber panel lists under "viewing". An empty session
+				// clears the row — a host switch starts before the page
+				// names its next session, and a stale name would point at
+				// a transcript on the host it just left.
+				h.SetSubscriberSession(ch, session)
 				// writeJSONFrame takes the same write mutex the event
 				// batcher uses, so an ack cannot interleave a frame.
-				_ = writeJSONFrame(map[string]any{
+				ack := map[string]any{
 					"v": 1, "type": "subscribed",
 					"host": target, "seq": h.LastSeq(target),
-				})
+				}
+				if ident.isGuest() && session != "" {
+					ack["session"] = session
+				}
+				_ = writeJSONFrame(ack)
 			}
 		}()
 
@@ -1148,6 +1320,17 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 			select {
 			case <-ctx.Done():
 				_ = flush()
+				return
+			case <-readDone:
+				// Browser closed the socket: drop the registration right
+				// away (the deferred unsub is idempotent) so the other
+				// pages' subscriber count corrects itself immediately.
+				_ = flush()
+				return
+			case <-subKicked:
+				// Guest token revoked / deleted: close the socket now.
+				_ = flush()
+				_ = conn.Close(websocket.StatusPolicyViolation, "guest token revoked")
 				return
 			case <-ping.C:
 				if err := flush(); err != nil {
@@ -1195,12 +1378,311 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 	}
 }
 
+// guestRelayPaths is the read-only surface a guest token may relay. Every
+// entry is a session-history / session-metadata read; anything else under
+// /api/* is 403 for guests. Rewriting (sessionId/cwd forced into the
+// whitelist) happens for the session-scoped subset below.
+var guestRelayPaths = map[string]bool{
+	"/api/session-updates":       true,
+	"/api/session-running-tasks": true,
+	"/api/session-stats":         true,
+	"/api/session-plan":          true,
+	"/api/session-info":          true,
+	"/api/session/info":          true,
+	"/api/session/usage":         true,
+	"/api/git-info":              true,
+	"/api/subagent/get":          true,
+	"/api/subagent/list-running": true,
+	"/api/task-list":             true,
+	"/api/task-output":           true,
+	"/api/status":                true,
+}
+
+// guestSessionPaths take a top-level sessionId, and most also a cwd. The
+// guest relay force-rewrites both to a whitelisted (session, cwd) pair so a
+// hand-crafted request cannot read another session.
+var guestCwdPaths = map[string]bool{
+	"/api/session-updates":       true,
+	"/api/session-running-tasks": true,
+	"/api/session-stats":         true,
+	"/api/session-plan":          true,
+	"/api/session-info":          true,
+	"/api/git-info":              true,
+	"/api/task-output":           true,
+}
+
+// guestSessionPaths are those whose body carries sessionId at the top level.
+var guestSessionPaths = map[string]bool{
+	"/api/session-updates":       true,
+	"/api/session-running-tasks": true,
+	"/api/session-stats":         true,
+	"/api/session-plan":          true,
+	"/api/session-info":          true,
+	"/api/session/info":          true,
+	"/api/session/usage":         true,
+	"/api/git-info":              true,
+	"/api/subagent/list-running": true,
+	"/api/task-list":             true,
+	"/api/task-output":           true,
+}
+
+// guestStatusAllowlist is what a guest sees of /api/status: the fields the
+// read-only shell needs. roster / pendingRequests / authMeta are removed —
+// roster enumerates every session on the host and pendingRequests carries
+// other sessions' permission cards. The guest's own session state arrives
+// separately as `sessionState` / `pendingInput` (see deriveGuestPending).
+var guestStatusAllowlist = []string{
+	"ready", "busy", "booting", "sessionId", "cwd", "hostId", "hostName",
+	"homeDir", "models", "modes", "configOptions", "agentStartedAt",
+	"permissionMode", "error", "bootError", "sessionMeta",
+}
+
+// guestPendingKinds maps a pending client-request method to the coarse kind a
+// guest is allowed to see. A guest never learns the request's method, params,
+// or id — only that the session it is watching is blocked on something.
+var guestPendingKinds = map[string]string{
+	"session/request_permission": "permission",
+	"x.ai/ask_user_question":     "question",
+	"x.ai/exit_plan_mode":        "plan",
+	"x.ai/folder_trust/request":  "folder_trust",
+	"x.ai/diff_review":           "diff_review",
+	"x.ai/mcp/elicit":            "mcp_elicit",
+}
+
+// deriveGuestPending summarizes one session's pending client requests for the
+// guest shell. kind is "" when nothing is pending; count / receivedAt cover
+// all pending requests of that session, while kind names the oldest one (the
+// one actually blocking the turn). Unrecognized methods still count — the
+// guest should know the session is stuck, just not what on.
+func deriveGuestPending(reqs []any, sessionID string) (kind string, count int, receivedAt int64) {
+	oldest := int64(0)
+	for _, raw := range reqs {
+		req, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if sid, _ := req["sessionId"].(string); sid != sessionID {
+			continue
+		}
+		count++
+		switch at := req["receivedAt"].(type) {
+		case float64:
+			if oldest == 0 || int64(at) < oldest {
+				oldest = int64(at)
+				kind = guestPendingKind(req)
+			}
+		default:
+			if kind == "" {
+				kind = guestPendingKind(req)
+			}
+		}
+	}
+	if kind == "" && count > 0 {
+		kind = "other"
+	}
+	return kind, count, oldest
+}
+
+func guestPendingKind(req map[string]any) string {
+	method, _ := req["method"].(string)
+	if k, ok := guestPendingKinds[method]; ok {
+		return k
+	}
+	return "other"
+}
+
+// enforceGuestRelay checks the guest whitelist and rewrites the request body
+// so the target session is always one the token was granted. Returns the
+// (possibly new) body and whether the request may proceed.
+//
+// 子代理子会话：白名单通常只有父会话，而子代理的时间线读的是子会话的
+// updates.jsonl。hub 在 subagent_spawned 时记下父子关系（NoteGuestChild），
+// 这里对「父在白名单里」的子会话参数原样放行（子代理可能用自己 cwd），
+// 其余参数照旧夹到白名单。
+func enforceGuestRelay(h *hub.Hub, ident identity, hostID, path string, body []byte) ([]byte, bool) {
+	if !guestRelayPaths[path] {
+		return nil, false
+	}
+	if !ident.allowsHost(hostID) {
+		return nil, false
+	}
+	if !guestSessionPaths[path] {
+		return body, true
+	}
+	var obj map[string]any
+	if len(bytes.TrimSpace(body)) > 0 {
+		if json.Unmarshal(body, &obj) != nil || obj == nil {
+			obj = map[string]any{}
+		}
+	} else {
+		obj = map[string]any{}
+	}
+	requested, _ := obj["sessionId"].(string)
+	// 子代理子会话：保留子会话 id，但 cwd 仍夹到白名单（父会话那条），
+	// 别让访客自带的 cwd 参与 host 的路径拼接。host 找不到 (id, cwd) 时会
+	// 按 id 回落到扫描，子代理真实的 cwd 由它自己解析。
+	if requested != "" && h != nil && h.GuestChildAllowed(ident.asGuestToken(), hostID, requested) {
+		if parent, parentCwd := ident.sessionFor(hostID, h.GuestParentOf(hostID, requested)); parent != "" {
+			_, bodyHasCwd := obj["cwd"]
+			if bodyHasCwd || guestCwdPaths[path] {
+				if parentCwd != "" {
+					obj["cwd"] = parentCwd
+				} else {
+					delete(obj, "cwd")
+				}
+			}
+			out, err := json.Marshal(obj)
+			if err != nil {
+				return nil, false
+			}
+			return out, true
+		}
+	}
+	sid, cwd := ident.sessionFor(hostID, requested)
+	if sid == "" {
+		return nil, false
+	}
+	obj["sessionId"] = sid
+	_, bodyHasCwd := obj["cwd"]
+	if bodyHasCwd || guestCwdPaths[path] {
+		if cwd != "" {
+			obj["cwd"] = cwd
+		} else {
+			delete(obj, "cwd")
+		}
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// redactGuestStatus trims a /api/status body to the guest allowlist and
+// pins the reported session to one the token may see (the host's active
+// session may be someone else's, or another whitelisted session). `wanted`
+// is the session the guest is displaying (?session= on the request); it
+// wins when it is whitelisted for this host.
+func redactGuestStatus(ident identity, hostID, wanted string, body []byte) []byte {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return []byte(`{"ok":false,"error":"status unreadable"}`)
+	}
+	out := make(map[string]any, len(guestStatusAllowlist))
+	for _, k := range guestStatusAllowlist {
+		if v, ok := raw[k]; ok {
+			out[k] = v
+		}
+	}
+	g := ident.asGuestToken()
+	sid, _ := out["sessionId"].(string)
+	switch {
+	case wanted != "" && hub.GuestAllowsSession(g, hostID, wanted):
+		// The guest is looking at this whitelisted session: report it, with
+		// the cwd the whitelist recorded for it.
+		out["sessionId"] = wanted
+		if _, cwd := ident.sessionFor(hostID, wanted); cwd != "" {
+			out["cwd"] = cwd
+		}
+	case hub.GuestAllowsSession(g, hostID, sid):
+		// The host's own active session is whitelisted — keep the live cwd.
+	default:
+		whitelisted, cwd := ident.sessionFor(hostID, "")
+		if whitelisted == "" {
+			delete(out, "sessionId")
+			delete(out, "cwd")
+		} else {
+			out["sessionId"] = whitelisted
+			if cwd != "" {
+				out["cwd"] = cwd
+			} else {
+				delete(out, "cwd")
+			}
+		}
+	}
+	// The guest's own session state: the flat `busy` above is the host-wide
+	// OR, which says nothing about the session this guest is watching. Report
+	// that one session's busy/awaiting plus a countdown for whatever it is
+	// blocked on — no request ids, methods, or params cross the wire.
+	pending, _ := raw["pendingRequests"].([]any)
+	if sid, _ := out["sessionId"].(string); sid != "" {
+		// Old hosts have no roster: the flat busy is all we have, and it only
+		// describes the host's ACTIVE session. Trust it only when that is the
+		// session being displayed; otherwise report idle rather than painting
+		// someone else's turn onto this viewer.
+		hostActive, _ := raw["sessionId"].(string)
+		busy := hostActive == sid && boolOf(out["busy"])
+		awaiting := false
+		if roster, ok := raw["roster"].([]any); ok {
+			for _, row := range roster {
+				rr, ok := row.(map[string]any)
+				if !ok {
+					continue
+				}
+				if id, _ := rr["sessionId"].(string); id != sid {
+					continue
+				}
+				busy = boolOf(rr["busy"])
+				awaiting = boolOf(rr["awaitingInput"])
+				break
+			}
+		}
+		kind, count, receivedAt := deriveGuestPending(pending, sid)
+		blocked := awaiting || kind != ""
+		state := "idle"
+		switch {
+		case blocked:
+			// A pending request is proof the session is stuck on it — report
+			// awaiting even if the host's busy flag has not caught up yet.
+			state = "awaiting"
+		case busy:
+			state = "active"
+		}
+		out["busy"] = busy
+		out["sessionState"] = state
+		out["awaitingInput"] = blocked
+		if kind != "" {
+			out["pendingInput"] = map[string]any{
+				"kind":  kind,
+				"count": count,
+			}
+			if receivedAt > 0 {
+				out["pendingInput"].(map[string]any)["receivedAt"] = receivedAt
+			}
+		}
+	}
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return []byte(`{"ok":false,"error":"status unreadable"}`)
+	}
+	return b
+}
+
+// boolOf reads a JSON boolean without caring whether it decoded as bool or
+// was absent (false for anything else).
+func boolOf(v any) bool {
+	b, _ := v.(bool)
+	return b
+}
+
 // handleRelay forwards a browser request to the host selected by the
 // ?host= query param (default: hub's default host) and streams the
-// host's answer back.
+// host's answer back. For guests the target host and session are forced
+// onto the token's whitelist before anything reaches a host.
 func handleRelay(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ident, _ := identityOf(r)
 		hostID := r.URL.Query().Get("host")
+		if ident.isGuest() {
+			if hostID == "" {
+				hostID = ident.defaultHost()
+			}
+			if hostID == "" || !ident.allowsHost(hostID) {
+				writeJSON(w, 403, map[string]any{"ok": false, "error": "访客无权访问该 Host"})
+				return
+			}
+		}
 		if hostID == "" {
 			hostID = h.DefaultHostID()
 			if hostID == "" {
@@ -1225,6 +1707,14 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 			}
 			body = b
 		}
+		if ident.isGuest() {
+			next, ok := enforceGuestRelay(h, ident, hostID, r.URL.Path, body)
+			if !ok {
+				writeJSON(w, 403, map[string]any{"ok": false, "error": "访客无权访问该接口"})
+				return
+			}
+			body = next
+		}
 		resp, err := h.Dispatch(r.Context(), hostID, r.Method, r.URL.Path, body)
 		if err != nil {
 			var re *hub.RelayError
@@ -1241,7 +1731,23 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 		if status < 100 || status > 599 {
 			status = 502
 		}
-		writeRelayResponse(w, r, status, resp.Body)
+		respBody := resp.Body
+		if ident.isGuest() && status >= 200 && status < 300 {
+			switch r.URL.Path {
+			case "/api/status":
+				respBody = redactGuestStatus(ident, hostID, r.URL.Query().Get("session"), respBody)
+			case "/api/session-updates":
+				// 访客读历史时才补父子关系：早于本次页面打开（或早于 hub
+				// 重启）派出的子代理，subagent_spawned 事件没经过本进程，
+				// 这里从父会话的 updates.jsonl 里补回来。回退用的父会话取
+				// 改写后的请求体（那是 host 实际读的那条会话）。
+				h.NoteHistoryChildren(hostID, relayedSessionID(body), respBody)
+			case "/api/subagent/list-running":
+				// 注册表同样带父子关系，且不受历史分页影响。
+				h.NoteRunningSubagents(hostID, relayedSessionID(body), respBody)
+			}
+		}
+		writeRelayResponse(w, r, status, respBody)
 	}
 }
 
@@ -1585,46 +2091,233 @@ func quicFrameReader(stream *quic.Stream) func() ([]byte, error) {
 
 // ── helpers ───────────────────────────────────────────────────────────
 
-// feAuth gates browser-facing routes. Empty token disables the gate (dev).
+// identity is who a browser-facing request speaks for. Admin = the
+// deployment's FE_TOKEN. Guest = one record from guests.json, restricted
+// to that record's session whitelist.
+type identity struct {
+	Role      string // "admin" | "guest"
+	TokenID   string // guests.json id (guest only)
+	Label     string
+	ExpiresAt int64
+	Sessions  []hub.GuestSession
+}
+
+func (id identity) isGuest() bool { return id.Role == "guest" }
+
+// allowsHost reports whether this identity may address hostID. Admins may
+// address every paired host; guests only hosts named by their whitelist.
+func (id identity) allowsHost(hostID string) bool {
+	if !id.isGuest() {
+		return true
+	}
+	for _, s := range id.Sessions {
+		if s.HostID == hostID {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultHost is the host a guest falls back to when the request names
+// none: the first whitelisted session's host. Empty for admins (the hub's
+// registry default applies).
+func (id identity) defaultHost() string {
+	for _, s := range id.Sessions {
+		if s.HostID != "" {
+			return s.HostID
+		}
+	}
+	return ""
+}
+
+// sessionFor resolves the (sessionId, cwd) a guest request must be
+// rewritten to on hostID: the requested session when whitelisted, else the
+// host's first whitelisted session. ("", "") when the host has none.
+func (id identity) sessionFor(hostID, sessionID string) (string, string) {
+	var first *hub.GuestSession
+	for i := range id.Sessions {
+		s := &id.Sessions[i]
+		if s.HostID != hostID {
+			continue
+		}
+		if first == nil {
+			first = s
+		}
+		if sessionID != "" && s.SessionID == sessionID {
+			return s.SessionID, s.Cwd
+		}
+	}
+	if first == nil {
+		return "", ""
+	}
+	return first.SessionID, first.Cwd
+}
+
+// asGuestToken rebuilds the guests.json record shape for subscription
+// bookkeeping (the hub's subscriber filter wants the whitelist).
+func (id identity) asGuestToken() hub.GuestToken {
+	return hub.GuestToken{ID: id.TokenID, Label: id.Label, ExpiresAt: id.ExpiresAt, Sessions: id.Sessions}
+}
+
+// relayedSessionID reads the sessionId a (rewritten) relay body targets.
+func relayedSessionID(body []byte) string {
+	var obj struct {
+		SessionID string `json:"sessionId"`
+	}
+	if json.Unmarshal(body, &obj) != nil {
+		return ""
+	}
+	return obj.SessionID
+}
+
+// feAuth gates browser-facing routes. Empty FE_TOKEN leaves the admin door
+// open (dev); guest tokens from guests.json are accepted regardless, since
+// they are the whole point of the guest feature.
+//
 // Prefer short-lived tickets for WebSocket query auth.
 type feAuth struct {
 	token   string
 	tickets *feTicketStore
+	// hub resolves guest tokens and (for tickets) the identity behind a
+	// guest id. Nil in tests that only exercise the admin path.
+	hub *hub.Hub
 }
 
-func (a feAuth) require(next http.HandlerFunc) http.HandlerFunc {
+// identify resolves the identity behind r, in this order:
+//  1. admin Bearer / X-Access-Token (FE_TOKEN),
+//  2. a guest token in Bearer / X-Access-Token,
+//  3. a single-use ?ticket= (guest or admin identity),
+//  4. the legacy admin ?token=.
+//
+// A guest lookup also rejects revoked / expired records.
+func (a feAuth) identify(r *http.Request) (identity, bool) {
+	if a.token != "" {
+		for _, tok := range []string{
+			bearerToken(r.Header.Get("Authorization")),
+			strings.TrimSpace(r.Header.Get("X-Access-Token")),
+		} {
+			if tokenEqual(tok, a.token) {
+				return identity{Role: "admin"}, true
+			}
+		}
+	} else if strings.TrimSpace(r.Header.Get("Authorization")) == "" &&
+		strings.TrimSpace(r.Header.Get("X-Access-Token")) == "" {
+		// Open dev hub with no FE_TOKEN: anonymous = admin, as before.
+		if r.URL.Query().Get("ticket") == "" && r.URL.Query().Get("token") == "" {
+			return identity{Role: "admin"}, true
+		}
+	}
+
+	// Guest bearer / header token.
+	if a.hub != nil {
+		for _, tok := range []string{
+			bearerToken(r.Header.Get("Authorization")),
+			strings.TrimSpace(r.Header.Get("X-Access-Token")),
+		} {
+			if g, ok := a.hub.LookupGuestToken(tok); ok {
+				return guestIdentity(g), true
+			}
+		}
+	}
+
+	// Short-lived ticket (preferred for WebSocket).
+	if a.tickets != nil {
+		if t := strings.TrimSpace(r.URL.Query().Get("ticket")); t != "" {
+			guestID, ok := a.tickets.consume(t)
+			if !ok {
+				return identity{}, false
+			}
+			if guestID == "" {
+				return identity{Role: "admin"}, true
+			}
+			if a.hub == nil {
+				return identity{}, false
+			}
+			g, found := a.hub.GuestByID(guestID)
+			if !found || !g.Active(time.Now()) {
+				return identity{}, false
+			}
+			return guestIdentity(g), true
+		}
+	}
+
+	// Legacy: long-lived secret in query (still accepted for back-compat).
+	if tok := strings.TrimSpace(r.URL.Query().Get("token")); tok != "" {
+		if tokenEqual(tok, a.token) {
+			return identity{Role: "admin"}, true
+		}
+		if a.hub != nil {
+			if g, ok := a.hub.LookupGuestToken(tok); ok {
+				return guestIdentity(g), true
+			}
+		}
+	}
+	return identity{}, false
+}
+
+func guestIdentity(g hub.GuestToken) identity {
+	return identity{
+		Role:      "guest",
+		TokenID:   g.ID,
+		Label:     g.Label,
+		ExpiresAt: g.ExpiresAt,
+		Sessions:  g.Sessions,
+	}
+}
+
+// check is the boolean form (kept for tests / callers that only gate).
+func (a feAuth) check(r *http.Request) bool {
+	_, ok := a.identify(r)
+	return ok
+}
+
+// requireAny allows admin and guest identities (access-role, ws-ticket).
+// The resolved identity rides in the request context so downstream handlers
+// never re-resolve (a ?ticket= is single-use — a second lookup would fail).
+func (a feAuth) requireAny(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !a.check(r) {
+		id, ok := a.identify(r)
+		if !ok {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(withIdentity(r.Context(), id)))
 	}
 }
 
-// check reports whether r is allowed for browser routes.
-// Order: long-lived Bearer/header, single-use ?ticket=, legacy ?token=.
-func (a feAuth) check(r *http.Request) bool {
-	if a.token == "" {
-		return true
-	}
-	if tok := bearerToken(r.Header.Get("Authorization")); tokenEqual(tok, a.token) {
-		return true
-	}
-	if tok := strings.TrimSpace(r.Header.Get("X-Access-Token")); tokenEqual(tok, a.token) {
-		return true
-	}
-	// Prefer short-lived ticket for WebSocket (avoids FE_TOKEN in logs).
-	if a.tickets != nil {
-		if t := strings.TrimSpace(r.URL.Query().Get("ticket")); t != "" {
-			return a.tickets.consume(t)
+// requireAdmin allows only the admin identity; guests get 403 so the FE can
+// tell "you are not allowed to manage tokens" from "your token is dead".
+func (a feAuth) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := a.identify(r)
+		if !ok {
+			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
+			return
 		}
+		if id.isGuest() {
+			writeJSON(w, 403, map[string]any{"ok": false, "error": "访客模式不支持该操作"})
+			return
+		}
+		next(w, r.WithContext(withIdentity(r.Context(), id)))
 	}
-	// Legacy: long-lived secret in query (still accepted for back-compat).
-	if tok := strings.TrimSpace(r.URL.Query().Get("token")); tokenEqual(tok, a.token) {
-		return true
+}
+
+// require is the legacy alias for requireAdmin (admin-only endpoints).
+func (a feAuth) require(next http.HandlerFunc) http.HandlerFunc {
+	return a.requireAdmin(next)
+}
+
+// requireAnyIdentity attaches the resolved identity to the request context
+// so the relay can enforce host/session scope without resolving twice.
+func (a feAuth) requireIdentified(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := a.identify(r)
+		if !ok {
+			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
+			return
+		}
+		next(w, r.WithContext(withIdentity(r.Context(), id)))
 	}
-	return false
 }
 
 // requireFEToken is kept for tests; production code uses feAuth.

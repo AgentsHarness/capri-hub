@@ -538,6 +538,55 @@ func TestSubscribersNoRedundantNotify(t *testing.T) {
 	}
 }
 
+// TestSubscribersChangedBroadcast: the browser-facing total (what the FE top
+// bar shows) is pushed to every page on connect/disconnect, unfiltered — a
+// page watching h1 still needs the hub-wide figure. Unchanged counts are not
+// re-sent, and the frame carries no hostId so the per-host filter cannot
+// swallow it.
+func TestSubscribersChangedBroadcast(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	testPair(t, h, "h2", "H2")
+
+	ch1, unsub1 := h.Subscribe()
+	defer unsub1()
+	scoped, scopedUnsub, ok := h.TrySubscribeHost(0, "h2")
+	if !ok {
+		t.Fatal("TrySubscribeHost refused")
+	}
+	defer scopedUnsub()
+
+	// First subscriber's count=1 (pushed before ch2 existed) is irrelevant;
+	// what matters is the current total reaching BOTH filters.
+	counts := func(evs []Event) []int {
+		var out []int
+		for _, ev := range evs {
+			if ev["type"] != "subscribers_changed" {
+				continue
+			}
+			if _, hasHost := ev["hostId"]; hasHost {
+				t.Fatalf("subscribers_changed must not carry hostId: %v", ev)
+			}
+			if c, ok := ev["count"].(int); ok {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	// The second subscriber's join announces the new total to the first one
+	// (a hub-level subscribers_changed frame) — that is the FE top-bar count.
+	if got := counts(drainEvents(ch1, 200*time.Millisecond)); len(got) == 0 || got[len(got)-1] != 2 {
+		t.Fatalf("watch-all page counts = %v, want the latest 2", got)
+	}
+
+	// A page leaving pushes the new total to the rest — including pages
+	// filtered to a single host (the frame is hub-level, not per-host).
+	unsub1()
+	if got := counts(drainEvents(scoped, 300*time.Millisecond)); len(got) == 0 || got[len(got)-1] != 1 {
+		t.Fatalf("after one page left, counts = %v, want 1", got)
+	}
+}
+
 func TestStreamLifecycle(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
@@ -2056,9 +2105,17 @@ func TestSlowSubscriberDoesNotDelayIngestOrPeers(t *testing.T) {
 	defer unsubH()
 
 	// Saturate the wedged subscriber's channel and never drain it: its pump
-	// parks on the first event it cannot hand over.
+	// parks on the first event it cannot hand over. Filling is non-blocking
+	// because the join above may already have queued a subscribers_changed
+	// frame (its hello-time count is not the point here); "full" is what
+	// this setup needs, not "exactly cap frames".
+fill:
 	for i := 0; i < cap(wedged); i++ {
-		wedged <- Event{"type": "filler"}
+		select {
+		case wedged <- Event{"type": "filler"}:
+		default:
+			break fill
+		}
 	}
 
 	const n = 200 // all critical: each one waits inline under the old code

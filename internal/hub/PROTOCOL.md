@@ -213,14 +213,56 @@ a host switch leaves the client at watermark 0, whose first event triggers
 `GET /api/events?host=…&after=0` — the whole per-host ring buffer (up to
 1500 events) fetched and then discarded.
 
+The browser `hello` carries `feSubscribers`: the number of live `/ws/fe`
+clients on the hub, this connection included (admin only — guest hellos
+omit it, and hub-level frames never reach guests). Every connect/disconnect
+then pushes a hub-level frame to the pages already open:
+
+```
+{"v":1,"type":"subscribers_changed","count":N}
+```
+
+It has no `hostId` (the figure is hub-wide, not per-host), so the per-host
+filter never swallows it; the page that just joined is skipped because its
+hello already carries the same number. The FE top bar renders this count
+beside the host block; old hubs send neither field nor frame and the badge
+stays hidden.
+
+The same `hello` carries `subscriberId`: this socket's row id in
+`GET /api/subscribers` (admin only, along with the count). The FE uses it to
+mark "this page" in the detail panel — two tabs on one machine share an
+address and a User-Agent, so the id is the only stable discriminator. The
+endpoint answers who is watching, not just how many:
+
+```json
+{"ok":true,"count":2,"subscribers":[
+  {"id":7,"ip":"203.0.113.9","userAgent":"Mozilla/5.0 …","role":"admin",
+   "hostId":"h1","sessionId":"s-42","connectedAt":1760000000000},
+  {"id":8,"ip":"198.51.100.4","userAgent":"Mozilla/5.0 …","role":"guest",
+   "guestId":"g_ab12cd","guestLabel":"小王","hostId":"h1",
+   "sessionId":"s-9","connectedAt":1760000300000}
+]}
+```
+
+`ip` is the client address without the port; when the peer is loopback (the
+deployed hub listens on 127.0.0.1 behind nginx) the proxy's `X-Real-IP` /
+first `X-Forwarded-For` hop is used instead — headers from non-loopback
+peers are ignored, so the display cannot be spoofed by a direct dial. Guest
+rows carry the guests.json record id and label, never the token. `hostId`
+and `sessionId` are the page's current subscription and the transcript it
+declares it is reading; the admin page reports the session with a
+`{"v":1,"type":"viewing","host":ID,"session":S}` control frame (or the
+`session` field of a `subscribe` frame) — bookkeeping only, no reply, and
+it never widens what any subscriber receives.
+
 Fan-out rule per subscriber: an event tagged `hostId` reaches it when the
 subscriber's filter is empty or equal; hub-level frames (`hosts_changed`,
-`prefs_changed`, `hello`) carry no `hostId` and always fan out. The `resync`
-slow-consumer frame now also carries the `hostId` of the event that tripped
-it — untagged, one host's drop storm used to jump another host's FE
-watermark to the wrong sequence and silently drop everything below it.
-Old hubs omit the field; FEs then treat `resync` as being about their own
-host, as before.
+`prefs_changed`, `subscribers_changed`, `hello`) carry no `hostId` and
+always fan out. The `resync` slow-consumer frame now also carries the `hostId`
+of the event that tripped it — untagged, one host's drop storm used to jump
+another host's FE watermark to the wrong sequence and silently drop
+everything below it. Old hubs omit the field; FEs then treat `resync` as
+being about their own host, as before.
 
 When a `resync` is emitted: after `resyncDropThreshold` (32) droppable events
 are lost to one slow subscriber, or immediately when a single **critical**

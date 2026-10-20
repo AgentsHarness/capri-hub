@@ -252,18 +252,46 @@ type Hub struct {
 
 	nextReq    atomic.Int64
 	nextConnID atomic.Int64
+	// nextSubID stamps each browser subscriber with a stable id so the
+	// admin's subscriber panel can point at one row (hello carries it).
+	nextSubID atomic.Int64
 	// subsGen stamps every subscriber-count frame so hosts can discard an
 	// out-of-order delivery (see notifyHostsSubscribers).
 	subsGen atomic.Uint64
 	// lastNotifiedSubs is the count each host was last told (hostID →
 	// count), used to skip no-op resends. Missing key = never notified.
 	lastNotifiedSubs map[string]int
+	// lastFESubs is the browser subscriber total last pushed to FE pages
+	// (see notifySubscribersCount); subsSeen marks whether any push
+	// happened yet. The top bar renders this number, so a reconnect storm
+	// that leaves it unchanged must not re-broadcast.
+	lastFESubs int
+	subsSeen   bool
 
 	dataFile string
 	// prefsFile holds the browser prefs document (prefs.json, sibling of
 	// hub.json). Written on SetPrefs only.
 	prefsFile string
 	prefs     BrowserPrefs
+	// guestsFile holds the guest-token table (guests.json, sibling of
+	// hub.json, 0600). guests is the in-memory copy; every write persists
+	// it atomically. guestPersistedAt throttles lastUsedAt rewrites.
+	guestsFile       string
+	guests           []GuestToken
+	guestPersistedAt time.Time
+	// guestPersistMu serializes guests.json snapshots so concurrent writers
+	// cannot rename an older table over a newer one (lock order:
+	// guestPersistMu → h.mu, never the reverse).
+	guestPersistMu sync.Mutex
+	// guestChildren maps a subagent child session (and its subagent id) to the
+	// parent session that spawned it, per host. Learned from the
+	// subagent_spawned typed event, so a guest token may follow the transcript
+	// of a child whose PARENT is whitelisted. Readers (fan-out filter, HTTP
+	// relay) load the snapshot lock-free; writes replace it under h.mu.
+	// In-memory only: after a hub restart the map refills as subagents spawn.
+	guestChildren atomic.Pointer[map[string]string]
+	// guestChildKeys is the FIFO used to bound guestChildren (guarded by h.mu).
+	guestChildKeys []string
 	// prefsVersion is the CAS version of prefs: bumped on every accepted
 	// write, persisted in prefs.json, and echoed in GET/broadcast so FEs
 	// can make conditional (baseVersion) writes. 0 = never written.
@@ -295,6 +323,8 @@ func NewWithDir(dir string) *Hub {
 		h.load()
 		h.prefsFile = filepath.Join(dir, "prefs.json")
 		h.loadPrefs()
+		h.guestsFile = filepath.Join(dir, "guests.json")
+		h.loadGuests()
 	}
 	h.rotateCode()
 	return h
@@ -1108,6 +1138,14 @@ func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
 	h.mu.Unlock()
 
 	if fanout := hs.appendEvent(cp, hostID, hostName); fanout != nil {
+		// 子代理派发（旧 host 走 map 通道时）：记下父子关系，见 noteGuestChild。
+		if t, _ := cp["type"].(string); t == "subagent_spawned" {
+			up, _ := cp["update"].(map[string]any)
+			child, _ := up["child_session_id"].(string)
+			subID, _ := up["subagent_id"].(string)
+			parent, _ := cp["sessionId"].(string)
+			h.noteGuestChild(hostID, parent, child, subID)
+		}
 		// Back-compat: old hosts still send host_status inside events
 		// frames — flip Ready (and fire hosts_changed) via the same
 		// control-plane path WS host_status uses.
@@ -1210,12 +1248,197 @@ type rawEventMeta struct {
 	Seq   uint64 `json:"seq"`
 	Type  string `json:"type"`
 	Ready bool   `json:"ready"`
+	// SessionID is lifted for the guest whitelist filter: raw events keep
+	// their original bytes (see rawWireKey), so the map itself has no
+	// sessionId member to filter on.
+	SessionID string `json:"sessionId"`
 	// Only tool_call_update has a payload member here; every other event
 	// type leaves it zero. Read for the drop-tier decision (criticalEvent) —
 	// the alternative is decoding the body per subscriber.
 	ToolCallUpdate struct {
 		Status string `json:"status"`
 	} `json:"toolCallUpdate"`
+}
+
+// spawnMeta is decoded only for subagent_spawned frames (see
+// noteSpawnFromRaw): carrying `update` in rawEventMeta would make every raw
+// event pay a full decode of its payload, including tool outputs.
+type spawnMeta struct {
+	SessionID string `json:"sessionId"`
+	Update    struct {
+		ChildSessionID string `json:"child_session_id"`
+		SubagentID     string `json:"subagent_id"`
+	} `json:"update"`
+}
+
+// noteSpawnFromRaw records the child/parent relation of one raw
+// subagent_spawned frame (see noteGuestChild).
+func (h *Hub) noteSpawnFromRaw(hostID string, raw json.RawMessage) {
+	var m spawnMeta
+	if json.Unmarshal(raw, &m) != nil {
+		return
+	}
+	h.noteGuestChild(hostID, m.SessionID, m.Update.ChildSessionID, m.Update.SubagentID)
+}
+
+// rawSessionKey carries the shallow-parsed sessionId of a raw event through
+// the fan-out path without touching the wire bytes (MarshalEvent returns the
+// original bytes verbatim, so this key never reaches a browser).
+const rawSessionKey = "\x00sessionId"
+
+// eventSessionID reads an event's top-level sessionId (map path or the
+// lifted raw-path copy).
+func eventSessionID(ev Event) string {
+	if s, ok := ev["sessionId"].(string); ok && s != "" {
+		return s
+	}
+	s, _ := ev[rawSessionKey].(string)
+	return s
+}
+
+// ── 子代理子会话台账 ──────────────────────────────────────────────────
+//
+// 访客白名单按「host + session」授权。子代理是独立会话，事件与
+// updates.jsonl 都挂在子会话 id 下，白名单里通常只有父会话。这里记录
+// subagent_spawned 给出的父子关系，让白名单父会话的访客能读到该子代理的
+// 时间线（WS 事件 + /api/session-updates），只跟一层：子代理再派出的子代理
+// 不自动继承，授权范围保持与管理员分享的那条会话一致。
+
+// guestChildCap bounds the relation table (FIFO). Spawns are rare; the cap
+// exists so a long-lived hub cannot grow without limit.
+const guestChildCap = 4096
+
+// noteGuestChild records that childSID (and its subagent id, when it differs)
+// belongs to parentSID on hostID.
+func (h *Hub) noteGuestChild(hostID, parentSID, childSID, subagentID string) {
+	if hostID == "" || parentSID == "" || childSID == "" || parentSID == childSID {
+		return
+	}
+	h.mu.Lock()
+	next := make(map[string]string, guestChildCap)
+	if cur := h.guestChildren.Load(); cur != nil {
+		for k, v := range *cur {
+			next[k] = v
+		}
+	}
+	ids := []string{childSID}
+	if subagentID != "" && subagentID != childSID {
+		ids = append(ids, subagentID)
+	}
+	for _, id := range ids {
+		key := GuestSessionKey(hostID, id)
+		if _, ok := next[key]; ok {
+			continue
+		}
+		next[key] = parentSID
+		h.guestChildKeys = append(h.guestChildKeys, key)
+	}
+	if over := len(h.guestChildKeys) - guestChildCap; over > 0 {
+		for _, key := range h.guestChildKeys[:over] {
+			delete(next, key)
+		}
+		h.guestChildKeys = append([]string(nil), h.guestChildKeys[over:]...)
+	}
+	h.guestChildren.Store(&next)
+	h.mu.Unlock()
+}
+
+// guestParentOf returns the parent session recorded for (host, session), or "".
+// Lock-free: readers get the whole map snapshot.
+func (h *Hub) guestParentOf(hostID, sessionID string) string {
+	cur := h.guestChildren.Load()
+	if cur == nil || sessionID == "" {
+		return ""
+	}
+	return (*cur)[GuestSessionKey(hostID, sessionID)]
+}
+
+// GuestChildAllowed reports whether sessionID on hostID is a subagent child of
+// a session the token was granted. The whitelist itself stays read-only: this
+// only widens the READ scope to the child transcripts of shared sessions.
+func (h *Hub) GuestChildAllowed(g GuestToken, hostID, sessionID string) bool {
+	parent := h.guestParentOf(hostID, sessionID)
+	if parent == "" {
+		return false
+	}
+	return GuestAllowsSession(g, hostID, parent)
+}
+
+// GuestParentOf is GuestChildAllowed's building block: the parent session
+// recorded for a child, "" when unknown.
+func (h *Hub) GuestParentOf(hostID, sessionID string) string {
+	return h.guestParentOf(hostID, sessionID)
+}
+
+// NoteHistoryChildren learns parent/child links from a session history page
+// relayed to a guest. Live spawns fill the same table from
+// subagent_spawned events; this covers subagents that spawned before the
+// guest's page opened (or before a hub restart), which is exactly when the
+// timeline is fetched from disk. fallbackParent is the session the page was
+// requested for (envelopes of older hosts may omit params.sessionId).
+//
+// Cheap by construction: no "subagent_spawned" substring ⇒ nothing is
+// unmarshalled.
+func (h *Hub) NoteHistoryChildren(hostID, fallbackParent string, body []byte) {
+	if hostID == "" || !bytes.Contains(body, []byte(`subagent_spawned`)) {
+		return
+	}
+	var page struct {
+		Updates []struct {
+			Params struct {
+				SessionID string `json:"sessionId"`
+				Update    struct {
+					SessionUpdate  string `json:"sessionUpdate"`
+					ChildSessionID string `json:"child_session_id"`
+					SubagentID     string `json:"subagent_id"`
+				} `json:"update"`
+			} `json:"params"`
+		} `json:"updates"`
+	}
+	if json.Unmarshal(body, &page) != nil {
+		return
+	}
+	for _, u := range page.Updates {
+		if u.Params.Update.SessionUpdate != "subagent_spawned" {
+			continue
+		}
+		parent := u.Params.SessionID
+		if parent == "" {
+			parent = fallbackParent
+		}
+		h.noteGuestChild(hostID, parent, u.Params.Update.ChildSessionID, u.Params.Update.SubagentID)
+	}
+}
+
+// NoteRunningSubagents learns parent/child links from a subagent registry
+// response relayed to a guest (`x.ai/subagent/list_running` →
+// {ok, result:{subagents:[{subagentId, childSessionId, parentSessionId}]}}).
+// Spawn events and history pages feed the same table; the registry is the
+// source that still knows a child whose spawn envelope is missing from the
+// history page the guest happened to load.
+func (h *Hub) NoteRunningSubagents(hostID, fallbackParent string, body []byte) {
+	if hostID == "" || !bytes.Contains(body, []byte(`subagents`)) {
+		return
+	}
+	var doc struct {
+		Result struct {
+			Subagents []struct {
+				SubagentID      string `json:"subagentId"`
+				ChildSessionID  string `json:"childSessionId"`
+				ParentSessionID string `json:"parentSessionId"`
+			} `json:"subagents"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(body, &doc) != nil {
+		return
+	}
+	for _, row := range doc.Result.Subagents {
+		parent := row.ParentSessionID
+		if parent == "" {
+			parent = fallbackParent
+		}
+		h.noteGuestChild(hostID, parent, row.ChildSessionID, row.SubagentID)
+	}
 }
 
 // spliceRawEvent builds the FE-bound wire bytes for one raw event by
@@ -1302,12 +1525,22 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 			"hostId":   hostID,
 			"hostName": hostName,
 		}
+		if meta.SessionID != "" {
+			ev[rawSessionKey] = meta.SessionID
+		}
 		switch meta.ToolCallUpdate.Status {
 		case "completed", "failed":
 			ev[terminalToolUpdateKey] = true
 		}
 		hs.bufferEventLocked(ev)
 		hs.mu.Unlock()
+		// 子代理派发：记下子会话归属，访客才能顺着白名单父会话读到这条
+		// 时间线（见 noteGuestChild）。同一事件既带顶层 sessionId（父）也带
+		// update 里的 child_session_id（子）。放在入环/扇出之前：该事件本身
+		// 是父会话的（白名单直接放行），但紧跟着到达的子会话事件要能命中。
+		if meta.Type == "subagent_spawned" {
+			h.noteSpawnFromRaw(hostID, r)
+		}
 		// Back-compat: old hosts still send host_status inside events
 		// frames (see RegisterEvent).
 		if meta.Type == "host_status" {
@@ -1549,12 +1782,53 @@ func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 type feSubscriber struct {
 	ch chan Event
 
+	// id is this subscriber's registration stamp (hub-monotonic). The admin
+	// subscriber panel lists rows by it, and a page learns its own id from
+	// the hello it receives, so the panel can mark "this page".
+	id int64
+	// connectedAt is when TrySubscribe registered this socket. Reported to
+	// the admin panel as "how long has this page been open".
+	connectedAt time.Time
+	// info is the browser-supplied identity (IP as seen by the hub minus
+	// port, User-Agent, role label). Set before the subscriber is published
+	// to the list and never mutated afterwards, so readers of the
+	// copy-on-write snapshot see a complete value.
+	info SubscriberInfo
+
 	// host is this subscriber's event filter: a host ID fans out only
 	// that host's events, the empty string (or nothing stored) fans out
 	// every host — the behaviour pre-filtering FE clients get. Written by
 	// the /ws/fe reader when the page switches hosts and read lock-free
 	// per event by broadcast, hence the atomic.
 	host atomic.Value // string
+
+	// session is the session the page currently displays (the `subscribe`
+	// control frame). Admin pages report it too — the subscriber panel
+	// shows which transcript each tab is looking at. A sessionId, never a
+	// filter: visibility is decided by watchesEvent.
+	session atomic.Value // string
+
+	// Guest subscribers (a browser authenticated with a guest token) are
+	// additionally scoped to a whitelist: hub-level events, hosts outside
+	// allowedHosts and events whose top-level sessionId is outside
+	// allowedSessions never reach them. The maps are built once at
+	// subscribe time and never mutated, so the fan-out path reads them
+	// without a lock.
+	guest           bool
+	guestTokenID    string
+	allowedHosts    map[string]bool
+	allowedSessions map[string]bool
+	// guestParentOf resolves a subagent child session to the parent that
+	// spawned it (see Hub.noteGuestChild). A guest may read a child whose
+	// parent is whitelisted — the subagent timeline lives under the child id.
+	// Nil for admin subscribers.
+	guestParentOf func(hostID, sessionID string) string
+
+	// kicked is closed when the guest token behind this subscriber is
+	// revoked or deleted, so /ws/fe can close the socket immediately
+	// instead of waiting for the next request to be rejected.
+	kicked   chan struct{}
+	kickOnce sync.Once
 
 	// dropped counts events dropped (or dropped-eligible) for this slow
 	// subscriber. Once it reaches resyncDropThreshold a resync frame is
@@ -1746,14 +2020,60 @@ func (s *feSubscriber) hostFilter() string {
 
 // watches reports whether an event tagged evHost reaches this subscriber.
 // Hub-level events (no hostId — hosts_changed, prefs_changed, the FE
-// hello) always pass: every browser needs the registry whichever host it
-// displays.
+// hello) pass for admin subscribers: every browser needs the registry
+// whichever host it displays. Guest subscribers never see hub-level
+// events — their shell renders from /api/access-role instead.
 func (s *feSubscriber) watches(evHost string) bool {
 	if evHost == "" {
-		return true
+		return !s.guest
+	}
+	if s.guest && !s.allowedHosts[evHost] {
+		return false
 	}
 	f := s.hostFilter()
 	return f == "" || f == evHost
+}
+
+// watchesEvent is watches plus the guest session whitelist: a guest only
+// receives an event whose top-level sessionId is one of the sessions its
+// token was granted — or a subagent child of one (the child transcript is
+// part of what the shared session is doing). Events without a top-level
+// sessionId are dropped for guests (the hub can only judge by that field —
+// subagent metadata keeps reaching guests through /api/subagent/get).
+func (s *feSubscriber) watchesEvent(ev Event) bool {
+	evHost, _ := ev["hostId"].(string)
+	if !s.watches(evHost) {
+		return false
+	}
+	if !s.guest {
+		return true
+	}
+	sid := eventSessionID(ev)
+	if sid == "" {
+		return false
+	}
+	if s.allowedSessions[GuestSessionKey(evHost, sid)] {
+		return true
+	}
+	if s.guestParentOf == nil {
+		return false
+	}
+	parent := s.guestParentOf(evHost, sid)
+	return parent != "" && s.allowedSessions[GuestSessionKey(evHost, parent)]
+}
+
+// kick ends a guest subscriber's socket (token revoked or deleted).
+func (s *feSubscriber) kick() {
+	s.kickOnce.Do(func() { close(s.kicked) })
+}
+
+// kickedChan is nil for admin subscribers so a select on it stays blocked
+// forever (nil channel semantics).
+func (s *feSubscriber) kickedChan() <-chan struct{} {
+	if !s.guest {
+		return nil
+	}
+	return s.kicked
 }
 
 // Drop-tier policy for a full subscriber queue. Terminal / control events
@@ -1884,21 +2204,77 @@ func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool)
 // so the /ws/fe endpoint uses this as a resource guard when it is open to
 // unauthenticated clients.
 func (h *Hub) TrySubscribeHost(max int, hostID string) (ch chan Event, unsubscribe func(), ok bool) {
+	return h.TrySubscribeHostInfo(max, hostID, SubscriberInfo{})
+}
+
+// TrySubscribeHostInfo is TrySubscribeHost with the browser identity the
+// admin subscriber panel shows (remote IP, User-Agent, role). The info is
+// display-only bookkeeping; it takes no part in filtering.
+func (h *Hub) TrySubscribeHostInfo(max int, hostID string, info SubscriberInfo) (
+	ch chan Event, unsubscribe func(), ok bool,
+) {
+	ch, unsub, _, ok := h.trySubscribe(max, hostID, nil, info)
+	return ch, unsub, ok
+}
+
+// TrySubscribeGuest is TrySubscribeHost for a guest token's browser: the
+// subscriber additionally carries the token's whitelist (hosts + sessions),
+// and it is automatically kicked (kicked closed) when that token is revoked
+// or deleted.
+func (h *Hub) TrySubscribeGuest(max int, hostID string, guest GuestToken) (
+	ch chan Event, unsubscribe func(), kicked <-chan struct{}, ok bool,
+) {
+	return h.TrySubscribeGuestInfo(max, hostID, guest, SubscriberInfo{})
+}
+
+// TrySubscribeGuestInfo is TrySubscribeGuest with the browser identity for
+// the admin subscriber panel.
+func (h *Hub) TrySubscribeGuestInfo(max int, hostID string, guest GuestToken, info SubscriberInfo) (
+	ch chan Event, unsubscribe func(), kicked <-chan struct{}, ok bool,
+) {
+	ch, unsubscribe, sock, ok := h.trySubscribe(max, hostID, &guest, info)
+	if !ok || sock == nil {
+		return ch, unsubscribe, nil, ok
+	}
+	return ch, unsubscribe, sock.kicked, true
+}
+
+func (h *Hub) trySubscribe(max int, hostID string, guest *GuestToken, info SubscriberInfo) (
+	ch chan Event, unsubscribe func(), sub *feSubscriber, ok bool,
+) {
 	// 512 absorbs short FE write stalls; the subscriber's own pump (see
 	// feSubscriber) makes the fan-out path never wait on it.
 	s := newFeSubscriber(512)
+	s.id = h.nextSubID.Add(1)
+	s.connectedAt = nowStamp()
+	s.info = info
 	if hostID != "" {
 		s.host.Store(hostID)
+	}
+	if guest != nil {
+		s.guest = true
+		s.guestTokenID = guest.ID
+		s.kicked = make(chan struct{})
+		s.allowedHosts = make(map[string]bool, len(guest.Sessions))
+		s.allowedSessions = make(map[string]bool, len(guest.Sessions))
+		for _, gs := range guest.Sessions {
+			s.allowedHosts[gs.HostID] = true
+			s.allowedSessions[GuestSessionKey(gs.HostID, gs.SessionID)] = true
+		}
+		s.guestParentOf = h.guestParentOf
 	}
 	h.mu.Lock()
 	if cur := h.subs.Load(); cur != nil && max > 0 && len(*cur) >= max {
 		h.mu.Unlock()
 		s.stop()
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	h.subscribeLocked(s)
 	h.mu.Unlock()
 	h.notifyHostsSubscribers()
+	// The newcomer learns the total from its hello; only the pages already
+	// open need the push.
+	h.notifySubscribersCount(s)
 	return s.ch, func() {
 		h.mu.Lock()
 		h.unsubscribe(s)
@@ -1913,7 +2289,8 @@ func (h *Hub) TrySubscribeHost(max int, hostID string) (ch chan Event, unsubscri
 		}
 	drained:
 		h.notifyHostsSubscribers()
-	}, true
+		h.notifySubscribersCount(nil)
+	}, s, true
 }
 
 // SetSubscriberHost retargets a live subscriber's host filter, identifying
@@ -2082,8 +2459,45 @@ func (h *Hub) subscribersStateFor(hostID string) (count int, gen uint64) {
 	return count, h.subsGen.Add(1)
 }
 
-// Broadcast fans an event out to browser subscribers (drops for slow
-// consumers). Callers typically use RegisterEvent instead.
+// notifySubscribersCount pushes {v:1, type:"subscribers_changed", count:N}
+// to the browser subscribers when the total live /ws/fe client count
+// changes. The FE top bar renders it next to the host block, so it is the
+// raw browser total (every host's audience) — unlike the per-host
+// `subscribers` frames above, which drive the host upload gate.
+//
+// except is the page whose hello is about to carry the same figure (its own
+// subscribe): skipping it keeps a freshly opened socket's channel empty
+// until real host traffic arrives. Callers on the leave path pass nil.
+//
+// Hub-level, so it goes out unfiltered: a page watching host A still needs
+// the global figure. An unchanged count is not re-sent; a missed frame is
+// repaired by the next connect/disconnect (or the next page's hello).
+func (h *Hub) notifySubscribersCount(except *feSubscriber) {
+	h.mu.Lock()
+	var cur []*feSubscriber
+	if p := h.subs.Load(); p != nil {
+		cur = *p
+	}
+	count := len(cur)
+	if h.subsSeen && h.lastFESubs == count {
+		h.mu.Unlock()
+		return
+	}
+	h.subsSeen = true
+	h.lastFESubs = count
+	h.mu.Unlock()
+	ev := Event{
+		"type":  "subscribers_changed",
+		"count": count,
+	}
+	for _, s := range cur {
+		if s == except || !s.watchesEvent(ev) {
+			continue
+		}
+		s.deliver(ev)
+	}
+}
+
 func (h *Hub) Broadcast(ev Event) {
 	h.broadcast(ev)
 }
@@ -2100,14 +2514,52 @@ func (h *Hub) broadcast(ev Event) {
 	}
 	// hostId is stamped on the Event map by both ingest paths
 	// (appendEvent / RegisterRawEvents), so the filter is a map read, not
-	// a decode. Hub-level events carry no hostId and reach everyone.
-	evHost, _ := ev["hostId"].(string)
+	// a decode. Guest subscribers additionally need the top-level
+	// sessionId against their whitelist (see watchesEvent).
 	for _, s := range *cur {
-		if !s.watches(evHost) {
+		if !s.watchesEvent(ev) {
 			continue
 		}
 		s.deliver(ev)
 	}
+}
+
+// DropGuestSubscribers kicks every live subscriber authenticated with the
+// given guest token (revoked / deleted). Closing the socket is what makes
+// a revocation take effect on an already-open tab; the client's next
+// request would be rejected anyway, but a read-only page makes none.
+func (h *Hub) DropGuestSubscribers(tokenID string) {
+	cur := h.subs.Load()
+	if cur == nil || tokenID == "" {
+		return
+	}
+	for _, s := range *cur {
+		if s.guest && s.guestTokenID == tokenID {
+			s.kick()
+		}
+	}
+}
+
+// SetSubscriberSession records which session a page currently displays. For
+// guests it is whitelist bookkeeping; for admins it is what the subscriber
+// panel shows as "viewing". Either way visibility is unchanged — broadcast
+// decides that, and an admin already receives every host's events.
+//
+// Reports false when ch is not (or no longer) a live subscriber.
+func (h *Hub) SetSubscriberSession(ch chan Event, sessionID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	cur := h.subs.Load()
+	if cur == nil {
+		return false
+	}
+	for _, s := range *cur {
+		if s.ch == ch {
+			s.session.Store(sessionID)
+			return true
+		}
+	}
+	return false
 }
 
 func hostsChanged() Event {
