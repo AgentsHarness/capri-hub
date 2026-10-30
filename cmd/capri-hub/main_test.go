@@ -15,10 +15,12 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/AgentsHarness/capri-hub/internal/hub"
+	"github.com/AgentsHarness/capri-wire"
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 )
@@ -158,42 +160,6 @@ func TestBearerToken(t *testing.T) {
 	}
 	if got := bearerToken(""); got != "" {
 		t.Errorf("empty should be empty, got %q", got)
-	}
-}
-
-// TestHandleHostFramePreservesHostSeq: events frames carry host-assigned
-// seqs (seqStart = first event's seq); they must be preserved so the
-// per-host counter tracks the host's sequence exactly. Renumbering would
-// shift every event and trigger spurious FE gap-pulls / replays.
-func TestHandleHostFramePreservesHostSeq(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatalf("pair: %v", err)
-	}
-	ch, unsub := h.Subscribe()
-	defer unsub()
-
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","seqStart":100,"events":[{"type":"chunk","text":"a","seq":100},{"type":"chunk","text":"b","seq":101}]}`),
-		func([]byte) error { return nil })
-
-	if got := h.LastSeq("h1"); got != 101 {
-		t.Errorf("LastSeq = %d, want 101 (host seq preserved)", got)
-	}
-	var seen []float64
-	for len(seen) < 2 {
-		select {
-		case ev := <-ch:
-			if s, ok := ev["seq"].(float64); ok {
-				seen = append(seen, s)
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("only got %v", seen)
-		}
-	}
-	if seen[0] != 100 || seen[1] != 101 {
-		t.Errorf("broadcast seqs = %v, want [100 101]", seen)
 	}
 }
 
@@ -524,85 +490,6 @@ func TestHandleRelayErrorBranchesStayPlain(t *testing.T) {
 	})
 }
 
-// TestHandleHostFrameRejectsSeqLessEvents: every uplink event carries the
-// host's own seq, so a seq-less event is a protocol violation. It must not
-// advance the counter (which would reopen a gap the FE can never fill) and
-// must not be fanned out.
-func TestHandleHostFrameRejectsSeqLessEvents(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatalf("pair: %v", err)
-	}
-	ch, unsub := h.Subscribe()
-	defer unsub()
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","seqStart":42,"events":[{"type":"chunk","text":"a","seq":42}]}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 42 {
-		t.Fatalf("LastSeq after seq frame = %d, want 42", got)
-	}
-	select {
-	case <-ch:
-	case <-time.After(time.Second):
-		t.Fatal("the seq-carrying event was never fanned out")
-	}
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","events":[{"type":"chunk","text":"no-seq"}]}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 42 {
-		t.Errorf("LastSeq after seq-less event = %d, want 42 (unchanged)", got)
-	}
-	select {
-	case ev := <-ch:
-		t.Fatalf("seq-less event was fanned out: %v", ev)
-	case <-time.After(100 * time.Millisecond):
-	}
-}
-
-// TestWriteHostPingCarriesSeqAck: the hub→host ping piggy-backs the
-// per-host data-plane watermark (same meaning as hello.seq) so the host
-// can anchor drop-repairs at what actually reached the hub. Absent field
-// would silently strand old-host compatibility, so assert it explicitly.
-func TestWriteHostPingCarriesSeqAck(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatalf("pair: %v", err)
-	}
-	for i := uint64(1); i <= 7; i++ {
-		raw, _ := json.Marshal(hub.Event{"type": "chunk", "text": "x", "seq": i})
-		if !h.RegisterRawEvents("h1", []json.RawMessage{raw}) {
-			t.Fatalf("ingest %d rejected", i)
-		}
-	}
-	var frame []byte
-	if err := writeHostPing(h, "h1", func(p []byte) error { frame = p; return nil }); err != nil {
-		t.Fatalf("writeHostPing: %v", err)
-	}
-	var f struct {
-		Type        string  `json:"type"`
-		Seq         *uint64 `json:"seq"`
-		Subscribers int     `json:"subscribers"`
-	}
-	if err := json.Unmarshal(frame, &f); err != nil {
-		t.Fatalf("bad ping frame: %.60s (%v)", frame, err)
-	}
-	if f.Type != "ping" {
-		t.Fatalf("frame type = %q, want ping", f.Type)
-	}
-	if f.Seq == nil || *f.Seq != 7 {
-		t.Fatalf("ping seq = %v, want 7 (the host's data-plane watermark)", f.Seq)
-	}
-	// A host with no events yet acks 0 (field still present, not null).
-	if err := writeHostPing(h, "ghost", func(p []byte) error { frame = p; return nil }); err != nil {
-		t.Fatalf("writeHostPing(ghost): %v", err)
-	}
-	if err := json.Unmarshal(frame, &f); err != nil || f.Seq == nil || *f.Seq != 0 {
-		t.Fatalf("unknown-host ping seq = %v, want 0", f.Seq)
-	}
-}
-
 func TestFETicketSingleUse(t *testing.T) {
 	s := newFETicketStore()
 	ticket, exp := s.issue("")
@@ -736,32 +623,8 @@ func TestIntegrationHostWSRelayAndFeWS(t *testing.T) {
 	// Host WS
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	hostConn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Authorization":   []string{"Bearer " + pairRes.Token},
-			"X-Hub-Deflate":   []string{"1"},
-			"X-Hub-State-Ack": []string{"1"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("host ws dial: %v", err)
-	}
+	hostConn := dialHostWithToken(t, ctx, srv, "h1", pairRes.Token, 9001)
 	defer hostConn.Close(websocket.StatusNormalClosure, "")
-	hostConn.SetReadLimit(1 << 20)
-
-	// Read hello
-	_, helloRaw, err := hostConn.Read(ctx)
-	if err != nil {
-		t.Fatalf("host hello: %v", err)
-	}
-	var hello map[string]any
-	if json.Unmarshal(helloRaw, &hello) != nil || hello["type"] != "hello" {
-		t.Fatalf("hello frame = %s", helloRaw)
-	}
-	// The WS transport is the one the probe capability belongs to.
-	if hello["probe"] != true {
-		t.Errorf("WS hello probe = %v, want true: %s", hello["probe"], helloRaw)
-	}
 
 	// Host uplink loop: answer requests + push an event
 	hostDone := make(chan struct{})
@@ -778,9 +641,11 @@ func TestIntegrationHostWSRelayAndFeWS(t *testing.T) {
 			}
 			if frame["type"] == "request" {
 				reqID, _ := frame["reqId"].(string)
+				seq, _ := frame["seq"].(float64)
 				out, _ := json.Marshal(map[string]any{
-					"v": 1, "type": "respond", "reqId": reqID,
-					"status": 200, "body": map[string]any{"ok": true, "via": "ws"},
+					"v": 2, "type": "respond", "reqId": reqID, "seq": 0,
+					"ack": uint64(seq), "status": 200,
+					"body": map[string]any{"ok": true, "via": "ws"},
 				})
 				_ = hostConn.Write(ctx, websocket.MessageText, out)
 			}
@@ -823,7 +688,7 @@ func TestIntegrationHostWSRelayAndFeWS(t *testing.T) {
 	// Host pushes an event; FE should receive (may be in hosts_changed first
 	// from connect, then events batch).
 	evFrame, _ := json.Marshal(map[string]any{
-		"v": 1, "type": "events", "seqStart": 1,
+		"v": 2, "type": "events", "seq": 1, "ack": 0,
 		"events": []map[string]any{{"type": "chunk", "text": "hi", "seq": 1}},
 	})
 	if err := hostConn.Write(ctx, websocket.MessageText, evFrame); err != nil {
@@ -939,38 +804,30 @@ func TestIntegrationQUICHostAuthAndEvent(t *testing.T) {
 		return buf, err
 	}
 
-	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "stateAck": true})
-	if err := writeFrame(auth); err != nil {
+	helloFrame, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "hello", "epoch": 6001, "token": tok,
+		"resume": map[string]any{"up": 0, "down": 0},
+	})
+	if err := writeFrame(helloFrame); err != nil {
 		t.Fatal(err)
 	}
 	hello, err := readFrame()
 	if err != nil {
-		t.Fatalf("hello: %v", err)
+		t.Fatalf("hello_ack: %v", err)
 	}
 	var hm map[string]any
-	if json.Unmarshal(hello, &hm) != nil || hm["type"] != "hello" {
-		t.Fatalf("hello = %s", hello)
-	}
-	// QUIC has no protocol-level pong, so the probe capability must not be
-	// advertised there: a host that believed it would slow its heartbeat
-	// while nothing refreshes LastSeen.
-	if v, ok := hm["probe"]; ok {
-		t.Errorf("QUIC hello must omit probe, got %v: %s", v, hello)
+	if json.Unmarshal(hello, &hm) != nil || hm["type"] != "hello_ack" {
+		t.Fatalf("hello_ack = %s", hello)
 	}
 
-	// Wait until host is online (ConnectStream after hello write on server).
+	// Wait until the session is attached.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && h.DefaultHostID() == "" {
 		time.Sleep(10 * time.Millisecond)
 	}
 	// Push event
 	ev, _ := json.Marshal(map[string]any{
-		"v": 1, "type": "events",
-		"events": []map[string]any{{"type": "chunk", "text": "q", "seq": float64(1)}},
-	})
-	// seq as number in JSON becomes float64 on decode — fine.
-	ev, _ = json.Marshal(map[string]any{
-		"v": 1, "type": "events",
+		"v": 2, "type": "events", "seq": 1, "ack": 0,
 		"events": []any{map[string]any{"type": "chunk", "text": "q", "seq": 1}},
 	})
 	if err := writeFrame(ev); err != nil {
@@ -1017,168 +874,6 @@ func TestHandleUnpair(t *testing.T) {
 	}
 }
 
-// TestHandleHostFrameRespondAfterSupersede: a respond for a request that
-// was stranded on a superseded connection must not panic; the hub drops
-// unknown reqIds cleanly.
-func TestHandleHostFrameRespondUnknown(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatal(err)
-	}
-	// No pending request — respond is a no-op log path.
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"respond","reqId":"missing","status":200,"body":{"ok":true}}`),
-		func([]byte) error { return nil })
-}
-
-// TestHandleHostFrameHostStatusControl: control-plane host_status frames
-// update Ready without advancing LastSeq or appearing as sequenced events.
-func TestHandleHostFrameHostStatusControl(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatalf("pair: %v", err)
-	}
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","seqStart":10,"events":[{"type":"chunk","text":"a","seq":10}]}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 10 {
-		t.Fatalf("LastSeq = %d, want 10", got)
-	}
-
-	ch, unsub := h.Subscribe()
-	defer unsub()
-	// Fan-out is asynchronous (per-subscriber ring + pump): drain the chunk
-	// registered above so the assertion below reads the control-plane frame.
-	drainUntil := time.After(100 * time.Millisecond)
-drainLoop:
-	for {
-		select {
-		case <-ch:
-		case <-drainUntil:
-			break drainLoop
-		}
-	}
-
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"host_status","ready":true}`),
-		func([]byte) error { return nil })
-
-	if got := h.LastSeq("h1"); got != 10 {
-		t.Errorf("LastSeq after control host_status = %d, want 10", got)
-	}
-	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
-		t.Errorf("ready not set: %+v", hosts)
-	}
-	select {
-	case ev := <-ch:
-		if ev["type"] != "hosts_changed" {
-			t.Errorf("event = %v, want hosts_changed", ev["type"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("no hosts_changed from control host_status")
-	}
-}
-
-// TestHandleHostFrameHostStatusLive: host_status frames carrying the
-// transient registry fields (busy/booting/pendingCount) apply them to the
-// registry and broadcast hosts_changed; older ready-only frames leave
-// them untouched.
-func TestHandleHostFrameHostStatusLive(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatalf("pair: %v", err)
-	}
-
-	ch, unsub := h.Subscribe()
-	defer unsub()
-
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"host_status","ready":true,"busy":true,"booting":false,"pendingCount":3}`),
-		func([]byte) error { return nil })
-	if hosts := h.ListHosts(); len(hosts) != 1 {
-		t.Fatalf("hosts len = %d", len(hosts))
-	} else {
-		got := hosts[0]
-		if !got.Ready || !got.Busy || got.Booting || got.PendingCount != 3 {
-			t.Errorf("registry = %+v, want ready+busy, booting=false, pending=3", got)
-		}
-	}
-	select {
-	case ev := <-ch:
-		if ev["type"] != "hosts_changed" {
-			t.Errorf("event = %v, want hosts_changed", ev["type"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("no hosts_changed from live host_status")
-	}
-
-	// Older host shape (ready only): transient fields must survive.
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"host_status","ready":true}`),
-		func([]byte) error { return nil })
-	if hosts := h.ListHosts(); len(hosts) != 1 {
-		t.Fatalf("hosts len = %d", len(hosts))
-	} else if hosts[0].Busy != true || hosts[0].PendingCount != 3 {
-		t.Errorf("registry = %+v, want busy/pending kept by ready-only frame", hosts[0])
-	}
-}
-
-// TestHandleHostFrameSeqReset: host process restart control frame clears
-// LastSeq so subsequent low seqs fan out instead of being skipped.
-func TestHandleHostFrameSeqReset(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatalf("pair: %v", err)
-	}
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","seqStart":100,"events":[{"type":"chunk","text":"old","seq":100}]}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 100 {
-		t.Fatalf("LastSeq = %d, want 100", got)
-	}
-
-	ch, unsub := h.Subscribe()
-	defer unsub()
-
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"seq_reset"}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 0 {
-		t.Errorf("LastSeq after seq_reset = %d, want 0", got)
-	}
-
-	// Drain any residual hosts_changed from pair/connect noise, then
-	// assert seq=1 fans out.
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","seqStart":1,"events":[{"type":"chunk","text":"fresh","seq":1}]}`),
-		func([]byte) error { return nil })
-	deadline := time.After(time.Second)
-	for {
-		select {
-		case ev := <-ch:
-			// Raw-path events carry the body as pre-encoded wire bytes
-			// (hub.MarshalEvent); "type"/"seq" are the shallow fields.
-			if ev["type"] != "chunk" {
-				continue
-			}
-			wire, err := hub.MarshalEvent(ev)
-			if err != nil {
-				t.Fatalf("MarshalEvent: %v", err)
-			}
-			var m map[string]any
-			if json.Unmarshal(wire, &m) != nil || m["text"] == "fresh" {
-				return
-			}
-		case <-deadline:
-			t.Fatal("seq 1 after seq_reset was not broadcast")
-		}
-	}
-}
-
 // A superseded host connection must stop feeding the hub: after a second
 // connection for the same hostId registers, events uplinked on the old
 // one are ignored (never fanned out to the FE) and the old transport is
@@ -1211,31 +906,34 @@ func TestIntegrationSupersededHostConnIgnoredAndDropped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	dialHost := func(name string) *websocket.Conn {
+	dialHost := func(name string, epoch uint64) *websocket.Conn {
 		t.Helper()
 		c, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-			HTTPHeader: http.Header{
-				"Authorization":   []string{"Bearer " + pairRes.Token},
-				"X-Hub-Deflate":   []string{"1"},
-				"X-Hub-State-Ack": []string{"1"},
-			},
+			HTTPHeader: http.Header{"Authorization": []string{"Bearer " + pairRes.Token}},
 		})
 		if err != nil {
 			t.Fatalf("%s dial: %v", name, err)
 		}
-		c.SetReadLimit(1 << 20)
+		c.SetReadLimit(32 << 20)
+		hello, _ := json.Marshal(map[string]any{
+			"v": 2, "type": "hello", "epoch": epoch, "token": pairRes.Token,
+			"resume": map[string]any{"up": 0, "down": 0},
+		})
+		if err := c.Write(ctx, websocket.MessageText, hello); err != nil {
+			t.Fatalf("%s hello write: %v", name, err)
+		}
 		_, raw, err := c.Read(ctx)
 		if err != nil {
-			t.Fatalf("%s hello: %v", name, err)
+			t.Fatalf("%s hello_ack: %v", name, err)
 		}
-		var hello map[string]any
-		if json.Unmarshal(raw, &hello) != nil || hello["type"] != "hello" {
-			t.Fatalf("%s hello frame = %s", name, raw)
+		var ack map[string]any
+		if json.Unmarshal(raw, &ack) != nil || ack["type"] != "hello_ack" {
+			t.Fatalf("%s hello_ack frame = %s", name, raw)
 		}
 		return c
 	}
 
-	conn1 := dialHost("conn1")
+	conn1 := dialHost("conn1", 11)
 	defer conn1.Close(websocket.StatusNormalClosure, "")
 
 	// FE subscriber
@@ -1268,15 +966,13 @@ func TestIntegrationSupersededHostConnIgnoredAndDropped(t *testing.T) {
 		t.Fatalf("fe hello = %s", feHello)
 	}
 
-	sendEvents := func(c *websocket.Conn, seq int, text string) {
+	sendEvents := func(c *websocket.Conn, seq int, text string) error {
 		t.Helper()
 		frame, _ := json.Marshal(map[string]any{
-			"v": 1, "type": "events", "seqStart": seq,
+			"v": 2, "type": "events", "seq": seq, "ack": 0,
 			"events": []map[string]any{{"type": "chunk", "text": text, "seq": seq}},
 		})
-		if err := c.Write(ctx, websocket.MessageText, frame); err != nil {
-			t.Fatalf("write seq %d: %v", seq, err)
-		}
+		return c.Write(ctx, websocket.MessageText, frame)
 	}
 
 	// Collect FE chunk events until want is seen; assert never contains bad.
@@ -1316,67 +1012,48 @@ func TestIntegrationSupersededHostConnIgnoredAndDropped(t *testing.T) {
 	}
 
 	// conn1 event seq 1 reaches the FE.
-	sendEvents(conn1, 1, "first")
+	if err := sendEvents(conn1, 1, "first"); err != nil {
+		t.Fatal(err)
+	}
 	waitFEChunk(1, -1, "first")
 
-	// conn2 supersedes conn1.
-	conn2 := dialHost("conn2")
+	// conn2 supersedes conn1 with a NEW epoch.
+	conn2 := dialHost("conn2", 12)
 	defer conn2.Close(websocket.StatusNormalClosure, "")
 
-	// conn1 uplink after supersede: ignored, and the hub drops conn1.
-	sendEvents(conn1, 2, "stale")
-	// Drain buffered frames (e.g. a subscribers frame) until the hub's
-	// close arrives.
+	// conn1 uplink after supersede: it may fail on the dead socket or be
+	// ignored by the closing session; either way it must never be applied.
+	_ = sendEvents(conn1, 2, "stale")
+	// Drain buffered frames until the hub's close arrives, and check the
+	// close reason the host's reconnect policy switches on.
 	closed := false
+	closeReason := ""
 	drainDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(drainDeadline) && !closed {
 		rctx, rcancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		_, _, rerr := conn1.Read(rctx)
 		rcancel()
-		closed = rerr != nil
+		if rerr == nil {
+			continue
+		}
+		closed = true
+		var ce websocket.CloseError
+		if errors.As(rerr, &ce) {
+			closeReason = ce.Reason
+		}
 	}
 	if !closed {
-		t.Error("hub should close the superseded connection")
+		t.Fatal("hub should close the superseded connection")
+	}
+	if closeReason != wire.CloseSuperseded.String() {
+		t.Errorf("close reason = %q, want %q", closeReason, wire.CloseSuperseded)
 	}
 
-	// FE must never see seq 2; conn2's seq 3 must arrive.
-	sendEvents(conn2, 3, "fresh")
-	waitFEChunk(3, 2, "fresh")
-}
-
-// TestHandleHostFrameSeqStartMismatchRejected: a frame whose seqStart
-// disagrees with the first event's seq is corrupted / mis-assembled and
-// must be rejected whole — neither its events nor the per-host watermark
-// may advance.
-func TestHandleHostFrameSeqStartMismatchRejected(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatalf("pair: %v", err)
+	// FE must never see the stale event; the new epoch's seq 1 must arrive.
+	if err := sendEvents(conn2, 1, "fresh"); err != nil {
+		t.Fatal(err)
 	}
-	ch, unsub := h.Subscribe()
-	defer unsub()
-
-	// seqStart claims 100 but the first event carries 200.
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","seqStart":100,"events":[{"type":"chunk","text":"a","seq":200},{"type":"chunk","text":"b","seq":201}]}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 0 {
-		t.Errorf("LastSeq = %d, want 0 (mismatched frame must be rejected)", got)
-	}
-	select {
-	case ev := <-ch:
-		t.Fatalf("rejected frame must not fan out, got %v", ev)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	// A matching frame still passes through unchanged.
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","seqStart":200,"events":[{"type":"chunk","text":"a","seq":200}]}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 200 {
-		t.Errorf("LastSeq = %d, want 200 (valid frame accepted)", got)
-	}
+	waitFEChunk(1, 2, "fresh")
 }
 
 // TestPairConstantTimeCompareIsValueExact: after switching the pairing
@@ -1402,10 +1079,10 @@ func TestPairConstantTimeCompareIsValueExact(t *testing.T) {
 	}
 }
 
-// TestUplinkDeflateWSRoundtrip: a host that negotiates uplink deflate
-// (X-Hub-Deflate: 1) gets "deflate":true echoed in hello and may send
-// flate-compressed binary frames; the hub inflates them and fans the
-// events out as usual. Without negotiation, binary frames are dropped.
+// TestUplinkDeflateWSRoundtrip: a host that offers caps.deflate in hello gets
+// the capability echoed in hello_ack and may then send flate-compressed binary
+// frames; the hub inflates them and fans the events out as usual. Plain text
+// frames keep working alongside.
 func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 	h := hub.NewWithDir("")
 	tickets := newFETicketStore()
@@ -1420,45 +1097,52 @@ func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	dial := func(header http.Header) *websocket.Conn {
-		conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{HTTPHeader: header})
-		if err != nil {
-			t.Fatalf("host ws dial: %v", err)
-		}
-		conn.SetReadLimit(1 << 20)
-		return conn
-	}
 
 	feCh, feUnsub := h.Subscribe()
 	defer feUnsub()
 
-	// Negotiated connection.
-	conn := dial(http.Header{
-		"Authorization":   []string{"Bearer " + tok},
-		"X-Hub-Deflate":   []string{"1"},
-		"X-Hub-State-Ack": []string{"1"},
+	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + tok}},
 	})
-	defer conn.Close(websocket.StatusNormalClosure, "")
-	_, helloRaw, err := conn.Read(ctx)
 	if err != nil {
+		t.Fatalf("host ws dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	conn.SetReadLimit(32 << 20)
+	hello, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "hello", "epoch": 7001, "token": tok,
+		"resume": map[string]any{"up": 0, "down": 0},
+		"caps":   map[string]any{"deflate": true},
+	})
+	if err := conn.Write(ctx, websocket.MessageText, hello); err != nil {
 		t.Fatal(err)
 	}
-	var hello map[string]any
-	if json.Unmarshal(helloRaw, &hello) != nil {
-		t.Fatalf("hello = %s", helloRaw)
+	_, helloRaw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("hello_ack: %v", err)
 	}
-	if hello["deflate"] != true {
-		t.Fatalf("hello must echo deflate:true, got %s", helloRaw)
+	var ack struct {
+		Type string `json:"type"`
+		Caps *struct {
+			Deflate bool `json:"deflate"`
+		} `json:"caps"`
 	}
+	if json.Unmarshal(helloRaw, &ack) != nil || ack.Type != "hello_ack" {
+		t.Fatalf("hello_ack = %s", helloRaw)
+	}
+	if ack.Caps == nil || !ack.Caps.Deflate {
+		t.Fatalf("hello_ack must echo caps.deflate:true, got %s", helloRaw)
+	}
+
 	waitChunk := func(want string) {
 		deadline := time.After(3 * time.Second)
 		for {
 			select {
 			case ev := <-feCh:
 				if typ, _ := ev["type"].(string); typ == "chunk" {
-					wire, _ := hub.MarshalEvent(ev)
+					wireBytes, _ := hub.MarshalEvent(ev)
 					var m map[string]any
-					_ = json.Unmarshal(wire, &m)
+					_ = json.Unmarshal(wireBytes, &m)
 					if m["text"] == want {
 						return
 					}
@@ -1470,7 +1154,7 @@ func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 	}
 
 	// flate-compressed events frame as a BINARY message.
-	payload := []byte(`{"v":1,"type":"events","seqStart":1,"events":[{"type":"chunk","text":"deflated","seq":1}]}`)
+	payload := []byte(`{"v":2,"type":"events","seq":1,"events":[{"type":"chunk","text":"deflated","seq":1}]}`)
 	var buf bytes.Buffer
 	fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
 	fw.Write(payload)
@@ -1480,30 +1164,18 @@ func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 	}
 	waitChunk("deflated")
 
-	// Below-threshold / plain text frames still work alongside.
-	plain := []byte(`{"v":1,"type":"events","seqStart":2,"events":[{"type":"chunk","text":"plain","seq":2}]}`)
+	// Plain text frames still work alongside.
+	plain := []byte(`{"v":2,"type":"events","seq":2,"events":[{"type":"chunk","text":"plain","seq":2}]}`)
 	if err := conn.Write(ctx, websocket.MessageText, plain); err != nil {
 		t.Fatal(err)
 	}
 	waitChunk("plain")
-
-	// A handshake without the capability headers is an older peer: the hub
-	// refuses it instead of running on bare JSON.
-	conn2 := dial(http.Header{
-		"Authorization": []string{"Bearer " + tok},
-		"X-Hub-Deflate": []string{"1"},
-	})
-	defer conn2.Close(websocket.StatusNormalClosure, "")
-	if _, _, err := conn2.Read(ctx); err == nil {
-		t.Fatal("handshake without X-Hub-State-Ack must be refused")
-	}
 }
 
-// A binary frame the hub cannot inflate ends the session instead of being
-// skipped. Skipping it (the old `continue`) let the next frame's higher seq
-// move the delivery watermark past the hole, and the host then deleted its
-// replay copies on that ack — permanent loss. QUIC already ended the session
-// on the same error; the two transports must agree.
+// A binary frame the hub cannot inflate ends the session with unreadable
+// instead of being skipped: skipping it let a later frame's higher seq move
+// the delivery watermark past the hole, and the host then deleted its replay
+// copies on that ack — permanent loss.
 func TestUplinkInflateFailureEndsSession(t *testing.T) {
 	h := hub.NewWithDir("")
 	srv := httptest.NewServer(buildHandler(h, "", newFETicketStore(), newPairLimiter(), nil))
@@ -1516,20 +1188,7 @@ func TestUplinkInflateFailureEndsSession(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Authorization":   []string{"Bearer " + tok},
-			"X-Hub-Deflate":   []string{"1"},
-			"X-Hub-State-Ack": []string{"1"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("host ws dial: %v", err)
-	}
-	defer conn.Close(websocket.StatusNormalClosure, "")
-	if _, _, err := conn.Read(ctx); err != nil {
-		t.Fatalf("hello: %v", err)
-	}
+	conn := dialHostWithToken(t, ctx, srv, "h1", tok, 7002)
 
 	// Pure garbage: flate.NewReader succeeds (it is lazy) but io.ReadAll
 	// fails at the first block header.
@@ -1544,11 +1203,47 @@ func TestUplinkInflateFailureEndsSession(t *testing.T) {
 	if !errors.As(err, &ce) {
 		t.Fatalf("read error = %v, want a close frame", err)
 	}
-	if ce.Reason != reasonUnreadable {
-		t.Fatalf("close reason = %q, want %q", ce.Reason, reasonUnreadable)
+	if ce.Reason != wire.CloseUnreadable.String() {
+		t.Fatalf("close reason = %q, want %q", ce.Reason, wire.CloseUnreadable)
 	}
 	if got := h.LastSeq("h1"); got != 0 {
 		t.Fatalf("watermark = %d; an undecodable frame must not advance it", got)
+	}
+}
+
+// TestHostWSCloseReasonMapping: the handshake verdicts travel as the one
+// wire.CloseReason enum — a peer speaking another protocol version is closed
+// with `protocol`, not with a free-form string the host would have to parse.
+func TestHostWSCloseReasonMapping(t *testing.T) {
+	h := hub.NewWithDir("")
+	srv := httptest.NewServer(buildHandler(h, "", newFETicketStore(), newPairLimiter(), nil))
+	defer srv.Close()
+	code, _ := h.PairingCode()
+	tok, err := h.Pair(code, "h1", "H1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + tok}},
+	})
+	if err != nil {
+		t.Fatalf("host ws dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	// A v1 hello: the envelope version is not this protocol.
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"hello"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = conn.Read(ctx)
+	var ce websocket.CloseError
+	if !errors.As(err, &ce) {
+		t.Fatalf("read error = %v, want a close frame", err)
+	}
+	if _, want := wire.CloseProtocol.WS(); ce.Reason != want {
+		t.Fatalf("close reason = %q, want %q", ce.Reason, want)
 	}
 }
 
@@ -1568,10 +1263,10 @@ func TestUplinkParseLenFlag(t *testing.T) {
 	}
 }
 
-// TestIntegrationQUICUplinkDeflate: QUIC auth with "deflate":true is
-// confirmed by the hello echo; a compressed events frame (length-prefix
-// bit 31 set, raw-deflate body) is inflated and registered, and a plain
-// frame still works alongside.
+// TestIntegrationQUICUplinkDeflate: a QUIC hello offering caps.deflate is
+// confirmed by the hello_ack echo; a compressed events frame (length-prefix
+// bit 31 set, raw-deflate body) is inflated and registered, and a plain frame
+// still works alongside.
 func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 	h := hub.NewWithDir("")
 	code, _ := h.PairingCode()
@@ -1631,22 +1326,29 @@ func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 		return buf, err
 	}
 
-	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true, "stateAck": true})
-	if err := writeFrame(auth, false); err != nil {
+	hello, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "hello", "epoch": 6101, "token": tok,
+		"resume": map[string]any{"up": 0, "down": 0},
+		"caps":   map[string]any{"deflate": true},
+	})
+	if err := writeFrame(hello, false); err != nil {
 		t.Fatal(err)
 	}
-	hello, err := readFrame()
+	ack, err := readFrame()
 	if err != nil {
-		t.Fatalf("hello: %v", err)
+		t.Fatalf("hello_ack: %v", err)
 	}
-	var hm map[string]any
-	if json.Unmarshal(hello, &hm) != nil || hm["type"] != "hello" || hm["deflate"] != true {
-		t.Fatalf("hello must echo deflate:true, got %s", hello)
+	var hm struct {
+		Type string `json:"type"`
+		Caps *struct {
+			Deflate bool `json:"deflate"`
+		} `json:"caps"`
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && h.DefaultHostID() == "" {
-		time.Sleep(10 * time.Millisecond)
+	if json.Unmarshal(ack, &hm) != nil || hm.Type != "hello_ack" {
+		t.Fatalf("hello_ack = %s", ack)
+	}
+	if hm.Caps == nil || !hm.Caps.Deflate {
+		t.Fatalf("hello_ack must echo caps.deflate:true, got %s", ack)
 	}
 
 	flateBytes := func(v any) []byte {
@@ -1658,20 +1360,20 @@ func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 		return buf.Bytes()
 	}
 	if err := writeFrame(flateBytes(map[string]any{
-		"v": 1, "type": "events", "seqStart": 1,
+		"v": 2, "type": "events", "seq": 1,
 		"events": []any{map[string]any{"type": "chunk", "text": "z", "seq": 1}},
 	}), true); err != nil {
 		t.Fatal(err)
 	}
-	// Plain frame alongside (host skips compression under 256 bytes).
+	// Plain frame alongside (host skips compression under its floor).
 	plain, _ := json.Marshal(map[string]any{
-		"v": 1, "type": "events", "seqStart": 2,
+		"v": 2, "type": "events", "seq": 2,
 		"events": []any{map[string]any{"type": "chunk", "text": "p", "seq": 2}},
 	})
 	if err := writeFrame(plain, false); err != nil {
 		t.Fatal(err)
 	}
-	deadline = time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if h.LastSeq("qh2") == 2 {
 			return
@@ -1681,11 +1383,9 @@ func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 	t.Fatalf("LastSeq = %d, want 2", h.LastSeq("qh2"))
 }
 
-// TestIntegrationQUICMultiStreamRequestPlane: T1 multi-stream sessions.
-// Control stream (first accepted) carries auth + events and receives the
-// relayed request; additional request-plane streams carry respond frames
-// (plus the no-op pong that materializes a freshly opened stream). EOF on
-// a request stream must NOT end the session.
+// TestIntegrationQUICMultiStreamRequestPlane: the control stream carries the
+// session (hello, events, relayed requests); additional request streams carry
+// `respond` frames only, and EOF on one must NOT end the session.
 func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 	h := hub.NewWithDir("")
 	code, _ := h.PairingCode()
@@ -1744,13 +1444,17 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 		return buf, err
 	}
 
-	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true, "stateAck": true})
-	if err := wf(control, auth, false); err != nil {
+	hello, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "hello", "epoch": 6201, "token": tok,
+		"resume": map[string]any{"up": 0, "down": 0},
+		"caps":   map[string]any{"deflate": true},
+	})
+	if err := wf(control, hello, false); err != nil {
 		t.Fatal(err)
 	}
-	hello, err := rf(control)
-	if err != nil || json.Unmarshal(hello, &map[string]any{}) != nil {
-		t.Fatalf("hello: %v %s", err, hello)
+	helloAck, err := rf(control)
+	if err != nil || json.Unmarshal(helloAck, &map[string]any{}) != nil {
+		t.Fatalf("hello_ack: %v %s", err, helloAck)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && h.DefaultHostID() == "" {
@@ -1761,14 +1465,14 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 	}
 
 	// An event on the control stream advances the watermark.
-	ev1, _ := json.Marshal(map[string]any{"v": 1, "type": "events", "seqStart": 1,
+	ev1, _ := json.Marshal(map[string]any{"v": 2, "type": "events", "seq": 1,
 		"events": []any{map[string]any{"type": "chunk", "text": "a", "seq": 1}}})
 	if err := wf(control, ev1, false); err != nil {
 		t.Fatal(err)
 	}
 
-	// Relay round-trip: Dispatch pushes a request down the CONTROL stream;
-	// we answer with a respond on a fresh REQUEST stream.
+	// Relay round-trip: the request goes down the CONTROL stream; we answer
+	// with a respond on a fresh REQUEST stream.
 	type resp struct {
 		Status int
 		Body   string
@@ -1784,9 +1488,10 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 		respCh <- resp{Status: r.Status, Body: string(r.Body)}
 	}()
 
-	// Read the request frame off the control stream (hello already
-	// consumed; ping frames may interleave — skip to the request).
+	// Read the request frame off the control stream (heartbeats may
+	// interleave — skip to the request).
 	var reqID string
+	var reqSeq uint64
 	for reqID == "" {
 		data, err := rf(control)
 		if err != nil {
@@ -1795,29 +1500,24 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 		var f struct {
 			Type  string `json:"type"`
 			ReqID string `json:"reqId"`
+			Seq   uint64 `json:"seq"`
 		}
 		if json.Unmarshal(data, &f) == nil && f.Type == "request" {
-			reqID = f.ReqID
+			reqID, reqSeq = f.ReqID, f.Seq
 		}
 	}
 
-	// Request stream: no-op pong materializes it, then the respond. Send
-	// the respond COMPRESSED — the deflate flag is session-scoped and
-	// must be honored on request streams too (PROTOCOL.md §4).
+	// Request stream: the respond, sent COMPRESSED — the deflate flag is
+	// session-scoped and must be honored on request streams too.
 	rs, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
-	if err := wf(rs, pong, false); err != nil {
-		t.Fatal(err)
-	}
 	rbody, _ := json.Marshal(map[string]any{"ok": true, "via": "request-stream"})
-	var rbuf bytes.Buffer
-	fw, _ := flate.NewWriter(&rbuf, flate.BestSpeed)
-	fw.Write(rbody)
-	fw.Close()
-	frameJSON, _ := json.Marshal(map[string]any{"v": 1, "type": "respond", "reqId": reqID, "status": 234, "body": json.RawMessage(rbody)})
+	frameJSON, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "respond", "reqId": reqID, "seq": 0, "ack": reqSeq,
+		"status": 234, "body": json.RawMessage(rbody),
+	})
 	var zbuf bytes.Buffer
 	zw, _ := flate.NewWriter(&zbuf, flate.BestSpeed)
 	zw.Write(frameJSON)
@@ -1841,7 +1541,7 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 
 	// The session must survive the request stream's EOF: another control
 	// event still lands.
-	ev2, _ := json.Marshal(map[string]any{"v": 1, "type": "events", "seqStart": 2,
+	ev2, _ := json.Marshal(map[string]any{"v": 2, "type": "events", "seq": 2,
 		"events": []any{map[string]any{"type": "chunk", "text": "b", "seq": 2}}})
 	if err := wf(control, ev2, false); err != nil {
 		t.Fatal(err)
@@ -1936,31 +1636,8 @@ func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Authorization":   []string{"Bearer " + tok},
-			"X-Hub-Deflate":   []string{"1"},
-			"X-Hub-State-Ack": []string{"1"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("host ws dial: %v", err)
-	}
+	conn := dialHostWithToken(t, ctx, srv, "h1", tok, 6301)
 	defer conn.Close(websocket.StatusNormalClosure, "")
-	conn.SetReadLimit(32 << 20)
-
-	_, helloRaw, err := conn.Read(ctx)
-	if err != nil {
-		t.Fatalf("host hello: %v", err)
-	}
-	var hello map[string]any
-	if json.Unmarshal(helloRaw, &hello) != nil || hello["type"] != "hello" {
-		t.Fatalf("hello frame = %s", helloRaw)
-	}
-	// The WS transport is the one the probe capability belongs to.
-	if hello["probe"] != true {
-		t.Errorf("WS hello probe = %v, want true: %s", hello["probe"], helloRaw)
-	}
 
 	// The "host's" answer: one history page big enough to compress.
 	page := relayPage(80)
@@ -1975,9 +1652,10 @@ func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
 				continue
 			}
 			reqID, _ := frame["reqId"].(string)
+			seq, _ := frame["seq"].(float64)
 			out, _ := json.Marshal(map[string]any{
-				"v": 1, "type": "respond", "reqId": reqID,
-				"status": 200, "body": json.RawMessage(page),
+				"v": 2, "type": "respond", "reqId": reqID, "seq": 0,
+				"ack": uint64(seq), "status": 200, "body": json.RawMessage(page),
 			})
 			if err := conn.Write(ctx, websocket.MessageText, out); err != nil {
 				return
@@ -2037,8 +1715,13 @@ func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
 	}
 }
 
-// dialPairedHost pairs a host and opens its /ws/host WebSocket, returning the
-// connection. The host's hello is consumed here.
+// hostEpochSeq hands every test host connection a distinct epoch, so a
+// re-dial in a test is a new sequence space unless it deliberately reuses one.
+var hostEpochSeq atomic.Uint64
+
+// dialPairedHost pairs a host, opens its /ws/host WebSocket and performs the
+// v2 handshake (hello → hello_ack). The connection is returned ready for
+// events / requests.
 func dialPairedHost(t *testing.T, ctx context.Context, srv *httptest.Server, h *hub.Hub, hostID, name string) *websocket.Conn {
 	t.Helper()
 	code, _ := h.PairingCode()
@@ -2046,29 +1729,40 @@ func dialPairedHost(t *testing.T, ctx context.Context, srv *httptest.Server, h *
 	if err != nil {
 		t.Fatalf("pair %s: %v", hostID, err)
 	}
+	return dialHostWithToken(t, ctx, srv, hostID, token, 1000+hostEpochSeq.Add(1))
+}
+
+// dialHostWithToken opens /ws/host for token and completes the handshake with
+// the given epoch.
+func dialHostWithToken(t *testing.T, ctx context.Context, srv *httptest.Server, hostID, token string, epoch uint64) *websocket.Conn {
+	t.Helper()
 	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Authorization":   []string{"Bearer " + token},
-			"X-Hub-Deflate":   []string{"1"},
-			"X-Hub-State-Ack": []string{"1"},
-		},
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
 	})
 	if err != nil {
 		t.Fatalf("host ws dial %s: %v", hostID, err)
 	}
-	conn.SetReadLimit(1 << 20)
-	_, raw, err := conn.Read(ctx)
-	if err != nil {
+	conn.SetReadLimit(32 << 20)
+	hello, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "hello", "epoch": epoch, "token": token,
+		"resume": map[string]any{"up": 0, "down": 0},
+	})
+	if err := conn.Write(ctx, websocket.MessageText, hello); err != nil {
 		t.Fatalf("host hello %s: %v", hostID, err)
 	}
-	var hello map[string]any
-	if json.Unmarshal(raw, &hello) != nil || hello["type"] != "hello" {
-		t.Fatalf("host hello frame %s = %s", hostID, raw)
+	_, raw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("host hello_ack %s: %v", hostID, err)
+	}
+	var ack map[string]any
+	if json.Unmarshal(raw, &ack) != nil || ack["type"] != "hello_ack" {
+		t.Fatalf("host hello_ack frame %s = %s", hostID, raw)
 	}
 	return conn
 }
 
-// pushHostEvent sends one events frame from a host uplink.
+// pushHostEvent sends one events frame from a host uplink. The session seq
+// space is the event seq space, so the frame seq is the event's seq.
 func pushHostEvent(t *testing.T, ctx context.Context, conn *websocket.Conn, seq int, body map[string]any) {
 	t.Helper()
 	ev := map[string]any{"seq": seq}
@@ -2076,7 +1770,8 @@ func pushHostEvent(t *testing.T, ctx context.Context, conn *websocket.Conn, seq 
 		ev[k] = v
 	}
 	frame, _ := json.Marshal(map[string]any{
-		"v": 1, "type": "events", "seqStart": seq, "events": []map[string]any{ev},
+		"v": 2, "type": "events", "seq": seq, "ack": 0,
+		"events": []map[string]any{ev},
 	})
 	if err := conn.Write(ctx, websocket.MessageText, frame); err != nil {
 		t.Fatalf("host write: %v", err)
@@ -2371,11 +2066,7 @@ func TestSubscribeFrameKeepsViewingAll(t *testing.T) {
 		}
 	}
 
-	v, _, ok := h.ViewingFrameFor("h1")
-	if !ok {
-		t.Fatal("no viewing set for a host with a live page")
-	}
-	if !v.All || len(v.Sessions) != 0 {
-		t.Fatalf("viewing after a legacy subscribe = %+v, want all:true (old FE must never lose transcript)", v)
-	}
+	// The viewing-set decision itself is covered in internal/hub
+	// (TestViewingAllWhenPageSilent): a subscribe-only page must keep the set
+	// at all:true. Here it is enough that the frame was accepted and acked.
 }

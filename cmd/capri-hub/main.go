@@ -3,12 +3,12 @@
 //		Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──QUIC/WS /ws/host──▶ capri-host × N ──stdio──▶ grok
 //
 //	  - 配对：Host 用配对码换取 token（POST /api/pair），token 持久化在 ~/.capri-hub。
-//	  - Host 出站连接（GET /ws/host 或 QUIC UDP）：下行 request/subscribers，上行 events/respond。
+//	  - Host 出站连接（GET /ws/host 或 QUIC UDP）：v2 会话协议，下行 request/audience，上行 events/respond/hb。
 //	  - 浏览器 WebSocket（GET /ws/fe）：聚合 live 事件；/api/* 按 ?host= 中转给对应 Host。
 //	  - 可选 FE_TOKEN：部署时设置后，浏览器侧接口必须带同一 token（Bearer / 头）。
 //	    WebSocket 优先用短期 ?ticket=（POST /api/ws-ticket）；仍兼容 ?token=。
-//	  - 可靠性：事件带 seq（host 分配），hub 缓冲每 host 最近 4000 条，
-//	    GET /api/events?host=X&after=SEQ 供缺口补拉。
+//	  - 可靠性：事件带 seq（host 分配，会话按事件推进水位），hub 缓冲每 host
+//	    最近的 gap-pull 环，GET /api/events?host=X&after=SEQ 供缺口补拉。
 package main
 
 import (
@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/AgentsHarness/capri-hub/internal/hub"
+	"github.com/AgentsHarness/capri-wire"
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 )
@@ -88,15 +89,6 @@ func main() {
 	runCtx, runCancel := context.WithCancel(context.Background())
 	defer runCancel()
 	h.StartPairingCodeMaintainer(runCtx)
-	// 上行静默兜底：连接对象还在、但 host 心跳早已停止时，主动判定掉线。
-	// 传输层的 hostReadTimeout 覆盖绝大多数情况；这里兜住它漏掉的
-	// （写入端被内核缓冲接住、读端还没报错的中间态），保证浏览器侧看到的
-	// 离线状态与中继失败速度一致。
-	h.StartLivenessWatchdog(runCtx)
-	// Confirmed state delivery: edge-triggered `subscribers` / `viewing`
-	// frames are retransmitted until the host acks them, which is what
-	// replaces the periodic full re-assert for state-ack-capable hosts.
-	h.StartStateAckRetry(runCtx)
 
 	code, exp := h.PairingCode()
 	log.Printf("[capri-hub] pairing code: %s (expires %s)", code, exp.Format("15:04:05"))
@@ -695,216 +687,102 @@ func handleRenameHost(h *hub.Hub) http.HandlerFunc {
 	}
 }
 
-// Liveness time scales, fastest first. A host's link is judged dead by
-// whichever of these fires — the hub must therefore be the QUICKEST judge,
-// or browsers keep seeing "online" while the host has already given up (or
-// vice versa, and each end reconnects for reasons the other never saw).
+// ── host transports ───────────────────────────────────────────────────
 //
-//   - hostProbeInterval/Timeout/Failures → ~16s worst case, and only on an
-//     IDLE link (see hostProbeIdleAfter). WS protocol pings, answered by the
-//     peer's library from its read loop without touching the host's JSON
-//     path, so a stalled writer cannot fake a timeout. THE liveness
-//     authority for a half-open socket.
-//   - hub.HostSilenceTimeout (30s) → the registry sweep: no application
-//     uplink (host_status, events, respond, state_ack, seq_reset) for this
-//     long and the host is marked offline, its pending relays failed, and
-//     its conn suspended. Pongs do not count. Worst case is one sweep
-//     tick later, 33s. Sized above two 15s host_status beats so one lost
-//     beat does not flap a quiet host. The probe is a different question:
-//     it proves the SOCKET, and only on an idle link.
-//   - hostReadTimeout (45s) → transport backstop, and the slowest one.
-//     The sweep has already flipped the registry. QUIC has no control
-//     ping, so this is also what drops a socket whose reads never error.
-//   - hostPingInterval (5s) → the cadence of the JSON DATA ping, not a
-//     timeout. Also the downlink heartbeat the HOST's own watchdog counts
-//     on, so hello advertises it (see writeHostHello): the host derives its
-//     idle budget from these numbers instead of hard-coding one.
-//
-// The host's downlink watchdog (acp-host defaultSessionIdleTimeout) is the
-// LAST of these to fire by design: hello advertises this hub's own
-// HostSilenceTimeout + two sweep intervals as the host's budget, so the hub
-// always flips the registry (browsers see "offline") before the host tears
-// its session down. The sweep flips the REGISTRY, while the host's watchdog
-// drops the SESSION. If the link is truly dead both fire, the host
-// reconnects, and ConnectStream restores Online — neither interrupts the
-// other.
-//
-// Two independent jobs ride the ping cadence, which is why it is 5s and not
-// slower:
-//   - The data-plane delivery ack: the ping carries seq, the per-host
-//     watermark, so the host anchors its drop-repairs at what actually
-//     reached the hub. Absolute state (subscribers / viewing) does NOT ride
-//     this frame — it is retransmitted until the host confirms it (see
-//     hub.Hub.StartStateAckRetry).
-//   - The host's OWN downlink watchdog. Only decoded JSON frames call
-//     markRecv; WS control frames (pong) do NOT. The hub's periodic ping is
-//     what keeps that watchdog armed, so the interval must stay well under
-//     the hello.idleTimeout we advertise.
-//
-// hostRequestStreamTimeout is separate: a QUIC request stream is silent BY
-// DESIGN between dispatch and the host's respond, so it tracks RelayTimeout.
-// Reusing the 30s control budget would close streams for legitimately slow
-// endpoints (session updates, memory flush) before their answer exists.
-//
-// hostWriteTimeout caps downlink writes so a half-open peer cannot pin
-// writeMu / subscriber-notify goroutines forever (WS already used 30s;
-// QUIC now matches).
-const (
-	hostRequestStreamTimeout = hub.RelayTimeout
-	hostWriteTimeout         = 30 * time.Second
+// One Transport adapter per wire. Both hand the hub a stream of JSON frames
+// and let hub.ServeHost own the session — handshake, seq/ack, retransmit,
+// liveness and the close reason all live there. Nothing below interprets the
+// protocol.
 
-	// Two consecutive failed probes are required to drop the link. One
-	// failure is not evidence: the library takes the write lock with a
-	// fixed 5s budget (coder/websocket writeControl), so a single ~28MB
-	// respond still in flight can make one probe time out on a live host.
-	// Two in a row, each after probeTimeout, cannot be explained that way.
-	hostProbeFailures = 2
-)
+// hostWriteTimeout caps one downlink write so a half-open peer cannot pin the
+// session loop forever.
+const hostWriteTimeout = 30 * time.Second
 
-// Protocol-level liveness probe (WS only). The JSON ping above is a DATA
-// channel — it re-asserts subscribers/seq/viewing — so it has to stay slow;
-// this one is the health check and runs on its own cadence.
-//
-// Every tick issues a WS ping control frame and waits for its pong on the
-// read goroutine. A blackholed uplink shows up here long before
-// hostReadTimeout: nothing in the host's JSON path can delay the pong,
-// because the library answers it from read.go (handleControl) without
-// touching the host's sendCh or its ~28MB relay respond frames.
-//
-// Atomics rather than vars so integration tests can shrink them: a host
-// handler may still be running when its test returns (httptest.Server.Close
-// does not track a hijacked WebSocket), so a test's cleanup races the
-// handler no matter how early the handler reads them.
-var (
-	hostProbeInterval atomic.Int64 // default 2s
-	// Pong budget: generous next to a real RTT (single-digit ms on the
-	// loopback hop, tens to hundreds over mobile), because one slow reply
-	// must never count as a dead peer. Worst-case detection is
-	// hostProbeIdleAfter + hostProbeFailures * (interval + timeout).
-	hostProbeTimeout atomic.Int64 // default 3s
-	// hostProbeIdleAfter is how long the link must have been without a
-	// peer-originated frame before a probe is worth sending. Our own
-	// writes do not count: they fill a kernel buffer on a host that has
-	// stopped reading. A probe also takes the write lock the ~28MB relay
-	// frames use, so it stays off the path while the peer is talking.
-	//
-	// 6s is a ceiling, not a preference. Worst-case detection has to stay
-	// inside the sweep's HostSilenceTimeout + LivenessCheckInterval: 6 +
-	// 2*(2+3) = 16s, comfortably below 30 + 3.
-	//
-	// Atomic for the same reason as the other two knobs, and additionally
-	// because the probe goroutine re-reads it on every tick.
-	hostProbeIdleAfter atomic.Int64
+// hostFrameLimit bounds one frame (compressed or not) on either transport. A
+// relayed respond carries up to 28MB of body, so a tighter cap would kill the
+// link on a large history read.
+const hostFrameLimit = 32 << 20
 
-	// hostReadTimeout is the slowest backstop. The sweep flips the
-	// registry first (30s + one tick), the host's advertised watchdog
-	// (36s) drops the session next, and only then does a read that
-	// never errors give up. 45s leaves that order intact. disconnectStream
-	// still fails pending relays when it does fire.
-	//
-	// A var rather than a const for the same reason as the probe knobs: a
-	// test that wants to observe the transport backstop cannot wait 45s for
-	// it. Read once per handler and once per QUIC read, so such a test must
-	// not run these in parallel with anything depending on the real value.
-	hostReadTimeout = 45 * time.Second
+// ── WebSocket ─────────────────────────────────────────────────────────
 
-	// hostPingInterval is the JSON DATA ping cadence (see the liveness block
-	// above). A var for the same reason as the other knobs: a test that needs
-	// the ping path cannot wait 5s for the first tick. Read once per handler.
-	hostPingInterval = 5 * time.Second
-)
-
-func init() {
-	hostProbeInterval.Store(int64(2 * time.Second))
-	hostProbeTimeout.Store(int64(3 * time.Second))
-	hostProbeIdleAfter.Store(int64(hostProbeIdleAfterDefault))
+// wsTransport adapts one /ws/host WebSocket. A text message is one plain JSON
+// frame; a binary message is one raw-deflate stream of a JSON frame, allowed
+// only after hello.caps.deflate was echoed in hello_ack.
+type wsTransport struct {
+	conn *websocket.Conn
+	// deflate is set by the session once the capability was negotiated.
+	deflate atomic.Bool
+	// stop ends the transport keepalive loop.
+	stop      chan struct{}
+	closeOnce sync.Once
 }
 
-// hostProbeIdleAfterDefault is the production value; see the field comment
-// on hostProbeIdleAfter for the derivation.
-const hostProbeIdleAfterDefault = 6 * time.Second
-
-// hostClose is the close frame a host WebSocket session ends with.
-//
-// The reason is protocol, not decoration: acp-host classifies the close BY
-// it (classifyClose in acp-host/internal/hub/client.go) to choose between
-// re-pairing, redialing and backing off. Every reason is therefore a fixed
-// short string — never err.Error(), and never extended in place; a new
-// meaning gets a new reason. Changing one silently changes the reconnect
-// policy of every deployed host.
-type hostClose struct {
-	code   websocket.StatusCode
-	reason string
+func newWSTransport(conn *websocket.Conn) *wsTransport {
+	return &wsTransport{conn: conn, stop: make(chan struct{})}
 }
 
-// The reasons a host WebSocket session can end with. The pairs are distinct
-// per meaning even when the code is shared: 1000 = nothing is wrong (come
-// back when convenient), 1001 = going away (retry with backoff), 1008 =
-// this link must not be reused as-is (re-pair, or expect no pongs), 1011 =
-// this hub failed to serve it. That mapping is the contract; the host
-// switches on the REASON (the code alone cannot separate shutdown from
-// superseded, and 1008 already means three different things).
-const (
-	reasonShutdown   = "shutdown"
-	reasonSuperseded = "superseded"
-	reasonPeerGone   = "peer closed"
-	reasonLiveness   = "liveness probe timeout"
-	reasonPingWrite  = "ping write failed"
-	reasonUplinkIdle = "uplink idle timeout"
-	reasonAuth       = "auth"
-	reasonHelloWrite = "hello write failed"
-	reasonInternal   = "internal error"
-	reasonProtocol   = "protocol version"
-	// reasonUnreadable: an uplink frame could not be decoded, so the seqs it
-	// carried are spent and the hub cannot tell how far the host got. Ending
-	// the session lets the host replay from the hub's real watermark with
-	// its replay ring intact. Retrying on the same socket cannot recover.
-	reasonUnreadable = "uplink unreadable"
-)
+func (t *wsTransport) Send(payload []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), hostWriteTimeout)
+	defer cancel()
+	return t.conn.Write(ctx, websocket.MessageText, payload)
+}
 
-var (
-	closeShutdown   = hostClose{websocket.StatusNormalClosure, reasonShutdown}
-	closeSuperseded = hostClose{websocket.StatusNormalClosure, reasonSuperseded}
-	closePeerGone   = hostClose{websocket.StatusNormalClosure, reasonPeerGone}
-	closeLiveness   = hostClose{websocket.StatusPolicyViolation, reasonLiveness}
-	closePingWrite  = hostClose{websocket.StatusGoingAway, reasonPingWrite}
-	closeUplinkIdle = hostClose{websocket.StatusGoingAway, reasonUplinkIdle}
-	closeAuth       = hostClose{websocket.StatusPolicyViolation, reasonAuth}
-	// 1001, not 1011: the hello lives on the wire, so a failed write is the
-	// PEER's link going away (it may be a half-open socket), not a bug here.
-	closeHelloWrite = hostClose{websocket.StatusGoingAway, reasonHelloWrite}
-	// 1011: the frame itself was broken, which is this side failing to
-	// serve the session, not the peer's link going away.
-	closeUnreadable = hostClose{websocket.StatusInternalError, reasonUnreadable}
-	closeInternal   = hostClose{websocket.StatusInternalError, reasonInternal}
-	// A handshake that does not speak this protocol version cannot be served:
-	// the host must be upgraded, and a protocol-level reason says so.
-	closeProtocol = hostClose{websocket.StatusProtocolError, reasonProtocol}
-)
+func (t *wsTransport) Recv() ([]byte, error) {
+	typ, data, err := t.conn.Read(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if typ != websocket.MessageBinary {
+		return data, nil
+	}
+	if !t.deflate.Load() {
+		return nil, fmt.Errorf("%w: binary frame without deflate negotiation", wire.ErrUnreadable)
+	}
+	out, err := inflateUplink(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: inflate: %v", wire.ErrUnreadable, err)
+	}
+	return out, nil
+}
 
-// QUIC has no close-reason channel, so it carries the same table in the
-// application error code of CloseWithError. The mapping is the contract the
-// host's classifyClose reads; a new meaning gets a new code, and the reason
-// string travels along for logs only.
-//
-// Codes start at 2: quic-go reserves 0 (NO_ERROR, used for a routine close)
-// and 1 is kept for the panic path, which is genuinely "internal error"
-// rather than one of the session verdicts.
-const (
-	errCodeNone       = 0 // routine close, nothing to interpret
-	errCodeSuperseded = 2
-	errCodeAuth       = 3
-	errCodeProtocol   = 4
-	errCodeLiveness   = 5
-	errCodeUplinkIdle = 6
-	errCodePingWrite  = 7
-	errCodeShutdown   = 8
-	errCodeUnreadable = 9
-	errCodeInternal   = 1
-)
+func (t *wsTransport) SetDeflate(v bool) { t.deflate.Store(v) }
 
-// handleHostWS: host outbound WebSocket. Downlink: hello / subscribers / request.
-// Uplink: events / respond / ping.
+// SetKeepalive runs WS control pings at the negotiated cadence. The ping is
+// not a protocol signal: it keeps NAT bindings alive and surfaces half-open
+// sockets. Idle is enforced by the session's own received-frame clock.
+func (t *wsTransport) SetKeepalive(d time.Duration) {
+	if d <= 0 {
+		d = 10 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(d)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-t.stop:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), d)
+				err := t.conn.Ping(ctx)
+				cancel()
+				if err != nil {
+					return // the session's next read or write ends it
+				}
+			}
+		}
+	}()
+}
+
+// Close maps the session verdict onto the one WS close table.
+func (t *wsTransport) Close(r wire.CloseReason) error {
+	t.closeOnce.Do(func() { close(t.stop) })
+	code, reason := r.WS()
+	return t.conn.Close(websocket.StatusCode(code), reason)
+}
+
+// handleHostWS: host outbound WebSocket. The bearer token authenticates the
+// upgrade; hello carries the epoch and the same token, and the session checks
+// the two agree.
 func handleHostWS(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, ok := authHost(h, r)
@@ -916,432 +794,43 @@ func handleHostWS(h *hub.Hub) http.HandlerFunc {
 			writeJSON(w, 403, map[string]any{"ok": false, "error": "host 与 token 不匹配"})
 			return
 		}
-
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			// Hosts are non-browser clients; skip Origin checks.
 			InsecureSkipVerify: true,
-			// A control pong proves the socket, which the probe loop
-			// already observes via Ping() returning. It does not refresh
-			// the registry: host_status owns LastSeen.
 		})
 		if err != nil {
 			log.Printf("[capri-hub] host ws accept: %v", err)
 			return
 		}
-		// Long-lived relay; prompts can run tens of minutes. 32MB matches
-		// the QUIC frame cap: host respond frames carry up to 28MB of
-		// relayed body (the host's maxRelayResponseBytes) plus envelope, and
-		// a tighter limit would kill the connection on large responses
-		// (e.g. fs/read-file of a big log). The host's own downlink read
-		// cap is 16MB.
-		conn.SetReadLimit(32 << 20)
-		// The session reports how it ended and this is the single place a
-		// close frame is written. Ordering matters twice over:
-		//   - the reader's context must NOT be the request's, or a shutdown
-		//     (which cancels it) would have coder/websocket tear the socket
-		//     down before the frame is written — the peer would see an
-		//     unexplained EOF instead of the reason. WithoutCancel plus an
-		//     explicit cancel after Close keeps the frame deliverable.
-		//   - serveHostWS's own defers (registry stop, probe cancel) run as
-		//     it returns, so the transport is released before the peer is
-		//     told the socket is over.
-		readCtx, cancelRead := context.WithCancel(context.WithoutCancel(r.Context()))
-		reason := serveHostWS(r, readCtx, conn, h, hostID)
-		_ = conn.Close(reason.code, reason.reason)
-		// Only now may the reader be torn down: Close has written the frame
-		// and waited for the peer's answer, or given up after its budget.
-		cancelRead()
+		conn.SetReadLimit(hostFrameLimit)
+		reason := h.ServeHost(hostID, newWSTransport(conn))
+		log.Printf("[capri-hub] host %s ws session ended (%s)", hostID, reason)
 	}
 }
 
-// serveHostWS runs one host WebSocket session to its end and reports the
-// frame to close with. Returning the reason instead of closing here keeps
-// the close at one site, so an exit path cannot end the socket without
-// naming why (a bare `return` does not compile).
-func serveHostWS(r *http.Request, readCtx context.Context, conn *websocket.Conn, h *hub.Hub, hostID string) hostClose {
-	// lastActive is when the PEER last proved this link is carrying
-	// traffic: an uplink frame, or a pong answering our control ping.
-	// A downlink write does not count. It only proves we filled the
-	// kernel buffer, and counting it kept the probe shut on a host
-	// that had stopped reading.
-	var lastActive atomic.Int64
-	touch := func() { lastActive.Store(time.Now().UnixNano()) }
-
-	var writeMu sync.Mutex
-	// writeBusy marks "a data frame is on the wire right now". The
-	// liveness probe consults it: the WS library's control writes take
-	// the same frame lock with a fixed 5s budget, so a probe that
-	// fails while a ~28MB respond is still being written measured our
-	// own backpressure, not the peer's death.
-	var writeBusy atomic.Bool
-	// write serializes every downlink frame. It does not touch
-	// lastActive: see the comment on that clock.
-	write := func(payload []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		writeBusy.Store(true)
-		defer writeBusy.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), hostWriteTimeout)
-		defer cancel()
-		return conn.Write(ctx, websocket.MessageText, payload)
-	}
-	// The socket itself being up is not evidence about the peer: a link
-	// can be blackholed the instant the upgrade completes. Start the
-	// idle clock at zero so the first probe goes out one
-	// hostProbeIdleAfter after connect unless frames show up first.
-	touch()
-
-	// Both capabilities are mandatory parts of the protocol: the host
-	// announces them in the handshake, the hello echoes compression, and the
-	// hub then relies on compressed uplink frames and state_ack. A peer
-	// missing either is an older build, refused rather than degraded.
-	if r.Header.Get("X-Hub-Deflate") != "1" || r.Header.Get("X-Hub-State-Ack") != "1" {
-		log.Printf("[capri-hub] host %s: handshake lacks a protocol capability, dropping", hostID)
-		return closeProtocol
-	}
-	upDeflate := true
-
-	// hello must reach the host BEFORE ConnectStream registers it:
-	// once registered, Dispatch may push a relayed request into the
-	// stream, and a host that has not acked hello yet would miss it.
-	// hello carries the subscriber count, so the host is never blind
-	// to subscriber state either.
-	helloState, err := writeHostHello(h, hostID, upDeflate, true, write)
-	if err != nil {
-		return closeHelloWrite
-	}
-	sc, stop, err := h.ConnectStream(hostID, write)
-	if err != nil {
-		// Closed as auth because ErrHostUnknown is exactly "the token is no
-		// longer in the registry" (unpaired between the upgrade and here):
-		// the only recovery is a fresh pairing, and the reason is what tells
-		// the host so. The error text stays in the log only — a reason the
-		// peer parses must never be free-form.
-		log.Printf("[capri-hub] host %s: connect stream: %v", hostID, err)
-		if errors.Is(err, hub.ErrHostUnknown) {
-			return closeAuth
-		}
-		return closeInternal
-	}
-	defer stop()
-	h.CommitHelloState(hostID, *helloState)
-	log.Printf("[capri-hub] host %s connected (ws)", hostID)
-
-	// The reader's context is owned by handleHostWS (it must outlive this
-	// function's return, which is when the close frame goes out).
-	ctx := r.Context()
-	frames := make(chan hostReadFrame, 16)
-	go func() {
-		for {
-			typ, data, err := conn.Read(readCtx)
-			if err != nil {
-				select {
-				case frames <- hostReadFrame{err: err}:
-				case <-readCtx.Done():
-				}
-				return
-			}
-			// WS wire rule (PROTOCOL.md): a BINARY message is one
-			// raw-deflate stream of the JSON frame; TEXT is bare JSON.
-			if typ == websocket.MessageBinary {
-				if !upDeflate {
-					log.Printf("[capri-hub] host %s: binary frame without deflate negotiation, dropping", hostID)
-					continue
-				}
-				inflated, err := inflateUplink(data)
-				if err != nil {
-					// A frame we cannot decode is not a frame we may skip:
-					// it carries an events batch whose seqs are already
-					// spent, and the hub cannot tell how far the host got.
-					// Skipping it (the old `continue`) left the watermark
-					// free to be pushed past the hole by the NEXT frame, and
-					// the host then deleted its replay copies on that ack —
-					// permanent loss. QUIC already ends the session here
-					// (quicFrameReader returns the error); the two
-					// transports must agree, and a reconnect resumes at the
-					// real watermark with the replay ring intact.
-					log.Printf("[capri-hub] host %s: uplink inflate: %v, ending session so the host can replay", hostID, err)
-					select {
-					case frames <- hostReadFrame{err: fmt.Errorf("uplink inflate: %w", err), undecodable: true}:
-					case <-readCtx.Done():
-					}
-					return
-				}
-				data = inflated
-			}
-			select {
-			case frames <- hostReadFrame{data: data}:
-			case <-readCtx.Done():
-				return
-			}
-		}
-	}()
-
-	// Protocol-level liveness probe. Runs beside the frame loop so a
-	// probe failure can end the handler even while no frames arrive.
-	// The host needs no change: coder/websocket answers pings from its
-	// read loop (opPing -> writeControl(opPong)) before any of the
-	// host's own goroutines see the frame.
-	//
-	// The probe only fires on an IDLE link, and reports the idle span
-	// once per idle run: a host that talks continuously is never probed
-	// at all, so a per-tick log would be either noise or a lie.
-	probeCtx, stopProbe := context.WithCancel(ctx)
-	probeLost := make(chan error, 1)
-	// Read the cadence once, on this goroutine: the loop below re-reads
-	// only hostProbeIdleAfter, which is atomic for exactly that reason,
-	// so nothing it does can race a test rewriting the knobs.
-	probeInterval := time.Duration(hostProbeInterval.Load())
-	probeTimeout := time.Duration(hostProbeTimeout.Load())
-	probeDone := make(chan struct{})
-	// Cancel, then wait. Returning without the wait would leave the loop
-	// running against a dead handler, which is the race -race reports
-	// between a test's cleanup restore and the loop's reads.
-	defer func() {
-		stopProbe()
-		<-probeDone
-	}()
-	go func() {
-		defer close(probeDone)
-		failures := 0
-		reportedIdle := false
-		for {
-			select {
-			case <-probeCtx.Done():
-				return
-			case <-time.After(probeInterval):
-			}
-			// Skip the sample entirely while our own data frame holds
-			// the lock: a probe queued behind a big respond says
-			// nothing about the peer, and counting it would drop live
-			// hosts on every large file read. The skip breaks the
-			// failure streak: the next real timeout starts from zero,
-			// so one raced timeout plus a later one is not "two in a row".
-			if writeBusy.Load() {
-				failures = 0
-				continue
-			}
-			// Peer traffic is the evidence a ping would ask for. Our
-			// own writes do not count (see lastActive). A streak does
-			// not survive a period where the peer was heard from.
-			quiet := time.Since(time.Unix(0, lastActive.Load()))
-			if idleAfter := time.Duration(hostProbeIdleAfter.Load()); quiet < idleAfter {
-				failures = 0
-				reportedIdle = false
-				continue
-			} else if !reportedIdle && hub.Verbose() {
-				// Once per idle run, not per tick: the loop wakes every
-				// hostProbeInterval and a dead peer stays idle for many.
-				reportedIdle = true
-				hub.Verbosef("[capri-hub] host %s: link idle %s, probing", hostID, quiet.Truncate(time.Millisecond))
-			}
-			pctx, cancel := context.WithTimeout(probeCtx, probeTimeout)
-			err := conn.Ping(pctx)
-			cancel()
-			if err == nil {
-				failures = 0
-				// The pong just proved the link is carrying traffic;
-				// refresh or the next tick sees the same stale quiet
-				// span and immediately probes again.
-				touch()
-				continue
-			}
-			if probeCtx.Err() != nil {
-				return
-			}
-			// The write lock was taken after we decided to probe. The
-			// timeout measured our own respond, not a dead peer.
-			if writeBusy.Load() {
-				failures = 0
-				continue
-			}
-			failures++
-			if failures < hostProbeFailures {
-				continue
-			}
-			select {
-			case probeLost <- err:
-			default:
-			}
-			return
-		}
-	}()
-
-	ping := time.NewTicker(hostPingInterval)
-	defer ping.Stop()
-	idle := time.NewTimer(hostReadTimeout)
-	defer idle.Stop()
-	for {
-		select {
-		case f := <-frames:
-			if f.err != nil {
-				if f.undecodable {
-					// The socket is intact but the frame is not: the seqs it
-					// carried are spent and the hub cannot tell how far the
-					// host got, so it must replay from the real watermark.
-					log.Printf("[capri-hub] host %s: undecodable uplink frame (%v), ending session", hostID, f.err)
-					return closeUnreadable
-				}
-				// The peer hung up (or the socket broke under us): the
-				// close frame below is best-effort, so the reason only
-				// describes our side of a session nobody ended on purpose.
-				return closePeerGone
-			}
-			// Any uplink frame is activity, whatever it is: the probe
-			// exists to notice a link that has gone quiet, and this one
-			// just talked.
-			touch()
-			// Superseded connection (host reconnected, or a second
-			// host process paired under the same hostId): its uplink
-			// must not interleave with the current connection's seq
-			// space — drop the stale transport on its next frame.
-			if !h.IsCurrentConn(hostID, sc) {
-				log.Printf("[capri-hub] host %s: superseded ws connection dropped", hostID)
-				return closeSuperseded
-			}
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
-			idle.Reset(hostReadTimeout)
-			if handleHostFrame(h, hostID, f.data, write) {
-				return closeUnreadable
-			}
-		case <-ping.C:
-			if h.HostWritable(hostID, sc) {
-				// A failed control write means the socket is already
-				// broken: return now instead of waiting out the read
-				// timer, which is what leaves the host "online" while
-				// every relay hangs.
-				if err := writeHostPing(h, hostID, write); err != nil {
-					log.Printf("[capri-hub] host %s: ping write failed: %v, dropping", hostID, err)
-					return closePingWrite
-				}
-			}
-		case err := <-probeLost:
-			log.Printf("[capri-hub] host %s: %d liveness probes unanswered (%v), dropping", hostID, hostProbeFailures, err)
-			return closeLiveness
-		case <-idle.C:
-			log.Printf("[capri-hub] host %s: no uplink for %s, dropping", hostID, hostReadTimeout)
-			return closeUplinkIdle
-		case <-ctx.Done():
-			return closeShutdown
-		}
-	}
-}
-
-// hostReadFrame is one uplink frame (or terminal read error) delivered
-// from the host WebSocket reader goroutine.
-type hostReadFrame struct {
-	data []byte
-	err  error
-	// undecodable marks a frame THIS hub could not decode (a bad deflate
-	// stream). The socket is fine, so it must not be reported as the peer
-	// hanging up; the session ends because the seq space is unknowable.
-	undecodable bool
-}
-
-// hostIdleTimeout is the downlink watchdog budget this hub asks a host to
-// run, advertised as hello.idleTimeout.
+// ── host→hub uplink flate compression ─────────────────────────────────
 //
-// It is NOT HostSilenceTimeout. Two sweep intervals are added on top:
-//   - one because the sweep only acts on its ticker, so a host that goes
-//     silent right after a tick is actually buried at
-//     HostSilenceTimeout + one interval;
-//   - one as ordering margin. The host's watchdog checks on its own timer
-//     too, so matching the sweep's worst case exactly would let it give up
-//     in the same instant the registry flips.
-//
-// The budget must outlast the registry flip, or the host reconnects while
-// browsers still see it online — the two-sides-disagree failure this
-// number exists to remove. Rounded up to whole seconds because the wire
-// field is an integer; derived at call time so retuning either knob cannot
-// silently invert the ordering.
-func hostIdleTimeout() time.Duration {
-	d := hub.HostSilenceTimeout + 2*hub.LivenessCheckInterval
-	return (d + time.Second - 1) / time.Second * time.Second
-}
+// Hub side: frames arrive either as bare JSON (WS text message / QUIC length
+// prefix without the flag bit) or as one raw-deflate stream of the JSON
+// payload (WS binary message / QUIC length prefix with the top bit set).
+// Payloads below the host's compression floor are never compressed, but the
+// hub accepts any flagged frame regardless of size.
 
-// writeHostHello sends the hub hello (subscribers + last host seq) down a
-// host transport. seq lets a reconnecting host resume events it buffered
-// while offline; subscribers drives the upload gate. Both are mandatory
-// fields: a host that does not find them fails the session.
-//
-// The absolute state in the hello (subscribers, viewing) is the SAME family
-// the edge-triggered frames carry, so it is registered for confirmation like
-// them (trackUnackedLocked): a hello that reached the host without its
-// subscribers count leaves the host paused while a page waits, and the next
-// edge frame only comes on the next browser connect/disconnect — minutes or
-// hours later. Binding each value to the current generation stamp lets the
-// retry timer resend the identical bytes, and the host's generation gate
-// drops the duplicate if the original did land.
-func writeHostHello(h *hub.Hub, hostID string, deflate, probe bool, write func([]byte) error) (*hub.HelloState, error) {
-	track := h.PrepareHelloState(hostID)
-	hello := map[string]any{
-		"v":            1,
-		"type":         "hello",
-		"service":      "hub",
-		"subscribers":  track.Subscribers,
-		"seq":          h.LastSeq(hostID),
-		"deflate":      deflate,
-		"pingInterval": int(hostPingInterval / time.Second),
-		"idleTimeout":  int(hostIdleTimeout() / time.Second),
-	}
-	if track.SubsGen > 0 {
-		hello["subsGen"] = track.SubsGen
-	}
-	// The sessions this host's pages are displaying. Carried in the hello
-	// as well as in a standalone `viewing` frame so a reconnecting host
-	// starts up already filtered instead of uploading a burst before the
-	// next notify lands.
-	if track.Viewing != nil {
-		hello["viewing"] = track.Viewing
-	}
-	if probe {
-		hello["probe"] = true
-	}
-	b, err := json.Marshal(hello)
-	if err != nil {
-		return nil, err
-	}
-	if err := write(b); err != nil {
-		return nil, err
-	}
-	// The caller registers it once the transport is attached: a hello that
-	// never left must not arm the retry timer, and ConnectStream deliberately
-	// drops the PREVIOUS session's unconfirmed entries.
-	return &track, nil
-}
-
-// ── host→hub uplink flate compression (T2) ───────────────────────────
-//
-// Negotiation and wire format are specified byte-precisely in
-// internal/hub/PROTOCOL.md. Hub side: frames arrive either as bare JSON
-// (WS text message / QUIC length prefix without the flag bit) or as one
-// raw-deflate stream of the JSON payload (WS binary message / QUIC
-// length prefix with the top bit set). Payloads below
-// uplinkMinCompressSize are never compressed by the host, but the hub
-// accepts any flagged frame regardless of size.
-
-// uplinkCompressedFlag is bit 31 of the QUIC 4-byte length prefix,
-// marking the frame body as a raw-deflate stream.
+// uplinkCompressedFlag is bit 31 of the QUIC 4-byte length prefix, marking the
+// frame body as a raw-deflate stream.
 const uplinkCompressedFlag = 1 << 31
 
-// parseUplinkLen splits a QUIC uplink length prefix into the true frame
-// length and the compressed flag (top bit).
+// parseUplinkLen splits a QUIC uplink length prefix into the true frame length
+// and the compressed flag (top bit).
 func parseUplinkLen(n uint32) (length uint32, compressed bool) {
 	return n &^ uplinkCompressedFlag, n&uplinkCompressedFlag != 0
 }
 
 // maxInflatedFrame caps the DECOMPRESSED size of one uplink frame. Both
-// transports bound the compressed bytes only (the WS read limit and the QUIC
-// length prefix are 32MB), and a deflate stream expands far beyond its
-// input — a small frame could otherwise balloon to gigabytes inside the hub.
-// It stays above the host's 28MB relay-response ceiling (the largest legal
-// single respond) so a big but valid response is not mistaken for a bad
-// frame and does not end the session.
+// transports bound the compressed bytes only, and a deflate stream expands far
+// beyond its input — a small frame could otherwise balloon to gigabytes inside
+// the hub. It stays above the 28MB relay-response ceiling so a big but valid
+// response is not mistaken for a bad frame.
 var maxInflatedFrame = 32 << 20
 
 // inflateUplink decompresses one raw-deflate uplink payload back into the
@@ -1358,156 +847,6 @@ func inflateUplink(b []byte) ([]byte, error) {
 		return nil, fmt.Errorf("inflated uplink frame exceeds %d bytes", maxInflatedFrame)
 	}
 	return out, nil
-}
-
-// writeHostPing sends the hub→host ping. It is the downlink beat the
-// host's watchdog counts, and it carries seq, the delivery watermark.
-// Absolute state does not ride this frame; it is retransmitted until
-// the host confirms it. The ping is sent on every tick: trimming the
-// payload must not become "stop pinging".
-//
-// The watermark is h.LastSeq (contiguous), never the highest number seen:
-// the host treats it as "1..N all arrived", drops the replay copies below
-// it and anchors its drop-repairs there. A number that stepped over a hole
-// would erase the very events the hole still needs.
-func writeHostPing(h *hub.Hub, hostID string, write func([]byte) error) error {
-	// Data-plane delivery ack only. Absolute state (subscribers / viewing)
-	// rides its own confirmed frames, retransmitted until the host acks.
-	frame := map[string]any{
-		"v": 1, "type": "ping", "ts": time.Now().Unix(),
-		"seq": h.LastSeq(hostID),
-	}
-	b, err := json.Marshal(frame)
-	if err != nil {
-		return err
-	}
-	return write(b)
-}
-
-// handleHostFrame processes one uplink frame from a host (events/respond/
-// host_status/seq_reset/ping). Shared by the WebSocket and QUIC transports.
-//
-// It returns a close verdict for a frame that has already been judged
-// undecodable in a way that leaves the seq space unknowable; both transports
-// end the session on it, because a skipped events frame cannot be repaired
-// (see the inflate failure in the WS reader).
-func handleHostFrame(h *hub.Hub, hostID string, data []byte, write func([]byte) error) (fatal bool) {
-	var frame struct {
-		Type     string            `json:"type"`
-		SeqStart *uint64           `json:"seqStart"`
-		Events   []json.RawMessage `json:"events"`
-		ReqID    string            `json:"reqId"`
-		Status   int               `json:"status"`
-		Body     json.RawMessage   `json:"body"`
-		// Chunked respond (bodies over the host's relay chunk size): the
-		// slice as base64, its encoding name, and whether another chunk
-		// follows. A frame with any of these set takes the assembly path;
-		// small answers keep the single `body` shape.
-		Chunk    string `json:"chunk"`
-		Encoding string `json:"encoding"`
-		More     bool   `json:"more"`
-		Ready    bool   `json:"ready"`
-		// state_ack (see hub.Hub.AckState): which absolute-state family the
-		// host applied, and at which generation.
-		Kind string `json:"kind"`
-		Gen  uint64 `json:"gen"`
-		// Transient registry fields (absent on older hosts → nil leaves
-		// the hub's current value untouched).
-		Busy         *bool `json:"busy"`
-		Booting      *bool `json:"booting"`
-		PendingCount *int  `json:"pendingCount"`
-		Port         *int  `json:"port"`
-	}
-	if err := json.Unmarshal(data, &frame); err != nil {
-		log.Printf("[capri-hub] host %s bad frame: %v", hostID, err)
-		return false
-	}
-	// Any JSON frame proves the uplink. Pongs count here and nowhere
-	// in the registry clock.
-	h.NoteUplink(hostID)
-	switch frame.Type {
-	case "events":
-		// Frame-level integrity check: the host stamps seqStart with the
-		// first event's seq. A mismatch means the frame was corrupted or
-		// assembled wrong (e.g. a bug in the batching/replay packing) —
-		// rejecting the whole frame keeps the hub's per-host watermark
-		// aligned with the host's own sequence instead of silently
-		// accepting truncated/reordered events. Frames without per-event
-		// frames without a seqStart are exempt.
-		if frame.SeqStart != nil && len(frame.Events) > 0 {
-			var first struct {
-				Seq uint64 `json:"seq"`
-			}
-			if json.Unmarshal(frame.Events[0], &first) == nil && first.Seq > 0 && first.Seq != *frame.SeqStart {
-				// Rejecting this frame and carrying on would let the NEXT
-				// frame's higher seq park the hole in `gapped` (the
-				// watermark now stays put), but the events in this frame are
-				// still spent on the host side and would need a repair it
-				// cannot know about. Ending the session is the cheaper,
-				// honest answer: the hub keeps its real watermark and the
-				// host replays from it.
-				log.Printf("[capri-hub] host %s events frame seqStart mismatch: seqStart=%d first event seq=%d, ending session over %d events",
-					hostID, *frame.SeqStart, first.Seq, len(frame.Events))
-				return true
-			}
-		}
-		// Raw fast path: event bodies stay json.RawMessage — the hub
-		// shallow-parses only seq/type and splices its tags into the
-		// original bytes for fan-out (no per-event map decode, no
-		// re-encode per FE). See hub.RegisterRawEvents.
-		h.RegisterRawEvents(hostID, frame.Events)
-	case "host_status":
-		// Control-plane status heartbeat: no seq, not an event. Updates
-		// Ready/Busy/Booting/PendingCount + LastSeen (and hosts_changed
-		// on any flip) without advancing the per-host counter or the
-		// transcript buffer.
-		h.UpdateHostStatus(hostID, hub.HostStatusPatch{
-			Ready:        &frame.Ready,
-			Busy:         frame.Busy,
-			Booting:      frame.Booting,
-			PendingCount: frame.PendingCount,
-			Port:         frame.Port,
-		})
-	case "seq_reset":
-		// Host process restarted: bridge seq recounts from 1. Clear the
-		// hub watermark so new low seqs are not treated as stale and
-		// dropped by the per-host seq gate's s <= last skip.
-		h.ResetHostSeq(hostID)
-	case "respond":
-		if frame.ReqID == "" {
-			return false
-		}
-		// Chunked answers (see hub.RespondChunk): every chunk repeats
-		// reqId/status and carries `chunk` + `encoding`, with `more` set on
-		// all but the last. `more` alone counts too: a frame that claims a
-		// continuation but carries no chunk is a protocol error for that
-		// request, not a body-less answer.
-		if frame.Chunk != "" || frame.Encoding != "" || frame.More {
-			if !h.RespondChunk(hostID, frame.ReqID, frame.Status, frame.Encoding, frame.Chunk, frame.More) {
-				log.Printf("[capri-hub] host %s respond chunk unknown reqId %s", hostID, frame.ReqID)
-			}
-			return false
-		}
-		if !h.Respond(hostID, frame.ReqID, hub.RelayResponse{Status: frame.Status, Body: frame.Body}) {
-			log.Printf("[capri-hub] host %s respond unknown reqId %s", hostID, frame.ReqID)
-		}
-	case "state_ack":
-		// The host applied an edge-triggered absolute-state frame; stop
-		// retransmitting that generation. Unknown kinds and stale gens are
-		// a no-op, so a host that acks more than this hub tracks stays
-		// harmless.
-		h.AckState(hostID, frame.Kind, frame.Gen)
-	case "ping":
-		pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
-		_ = write(pong)
-	case "pong":
-		// NoteUplink already recorded it. A pong is not host_status:
-		// it does not refresh LastSeen.
-	default:
-		// ignore unknown: older hubs must survive newer host frames (the
-		// same contract that keeps `state_ack` harmless to them).
-	}
-	return false
 }
 
 // maxFESubscribers caps concurrent browser /ws/fe connections: each one
@@ -2416,223 +1755,164 @@ func serveQUIC(ln *quic.Listener, h *hub.Hub) {
 	}
 }
 
-// serveQUICConn serves one host QUIC connection. QUIC has no close-reason
-// frame, so every exit names its verdict in the application error code
-// (errCode* above). The host's classifyClose reads those codes with the same
-// meanings the WebSocket reasons carry — without it, a superseded QUIC
-// session looked like an ordinary drop and the old process re-acquired the
-// same hostId on a 10s cycle while the new one held it.
-func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
-	// A panic in a bare goroutine (no net/http recover) would kill the
-	// whole hub; contain it and drop just this connection.
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[capri-hub] quic conn panic recovered: %v", r)
-			_ = conn.CloseWithError(errCodeInternal, reasonInternal)
-		}
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	// The host opens the stream; we accept it.
-	stream, err := conn.AcceptStream(ctx)
-	cancel()
-	if err != nil {
-		_ = conn.CloseWithError(errCodeNone, "no stream")
-		return
-	}
-	defer stream.Close()
-	defer conn.CloseWithError(errCodeNone, "")
+// quicTransport adapts one host QUIC connection. The control stream carries
+// the session in both directions; request streams carry the host's `respond`
+// frames only, and the hub never writes on them.
+type quicTransport struct {
+	conn      *quic.Conn
+	control   *quic.Stream
+	frames    chan []byte
+	errs      chan error
+	stop      chan struct{}
+	closeOnce sync.Once
+}
 
-	readFrame := quicFrameReader(stream)
-	// Match WS hostWriteTimeout: a half-open peer must not block writes
-	// (and thus writeMu / notifyHostsSubscribers goroutines) forever.
-	write := func(payload []byte) error {
-		if err := stream.SetWriteDeadline(time.Now().Add(hostWriteTimeout)); err != nil {
-			return err
-		}
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-		if _, err := stream.Write(lenBuf[:]); err != nil {
-			return err
-		}
-		_, err := stream.Write(payload)
+func newQUICTransport(conn *quic.Conn, control *quic.Stream) *quicTransport {
+	t := &quicTransport{
+		conn:    conn,
+		control: control,
+		frames:  make(chan []byte, 64),
+		errs:    make(chan error, 1),
+		stop:    make(chan struct{}),
+	}
+	go t.readControl()
+	go t.acceptRequests()
+	return t
+}
+
+func (t *quicTransport) fail(err error) {
+	select {
+	case t.errs <- err:
+	default:
+	}
+}
+
+func (t *quicTransport) Send(payload []byte) error {
+	if err := t.control.SetWriteDeadline(time.Now().Add(hostWriteTimeout)); err != nil {
 		return err
 	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if _, err := t.control.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err := t.control.Write(payload)
+	return err
+}
 
-	// Auth: first frame must carry a valid host token.
-	data, err := readFrame()
-	if err != nil {
-		return
+func (t *quicTransport) Recv() ([]byte, error) {
+	select {
+	case b := <-t.frames:
+		return b, nil
+	case err := <-t.errs:
+		return nil, err
+	case <-t.stop:
+		return nil, io.EOF
 	}
-	var auth struct {
-		Type     string `json:"type"`
-		Token    string `json:"token"`
-		Deflate  bool   `json:"deflate"`
-		StateAck bool   `json:"stateAck"`
-	}
-	if json.Unmarshal(data, &auth) != nil || auth.Type != "auth" || auth.Token == "" {
-		_ = write([]byte(`{"v":1,"type":"auth_error","error":"missing auth"}`))
-		return
-	}
-	hostID, ok := h.HostIDForToken(auth.Token)
-	if !ok {
-		_ = write([]byte(`{"v":1,"type":"auth_error","error":"token 无效"}`))
-		return
-	}
-	// Uplink flate is part of the protocol; the hello echoes the flag.
-	upDeflate := auth.Deflate
-	if !auth.StateAck {
-		_ = write([]byte(`{"v":1,"type":"auth_error","error":"protocol version"}`))
-		return
-	}
+}
 
-	var writeMu sync.Mutex
-	wsafe := func(payload []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return write(payload)
-	}
+// SetKeepalive is a no-op: QUIC's keepalive is a per-connection transport
+// option set when the listener dials (see listenQUIC), not a per-stream one.
+func (t *quicTransport) SetKeepalive(time.Duration) {}
 
-	// hello before ConnectStream registration: a relayed request must
-	// never be pushed into a stream the host has not acked yet (see
-	// handleHostWS for the same ordering on the WebSocket transport).
-	helloState, err := writeHostHello(h, hostID, upDeflate, false, wsafe)
-	if err != nil {
-		return
-	}
-	sc, stop, err := h.ConnectStream(hostID, wsafe)
-	if err != nil {
-		return
-	}
-	defer stop()
-	h.CommitHelloState(hostID, *helloState)
-	log.Printf("[capri-hub] host %s connected (quic %s)", hostID, conn.RemoteAddr())
+func (t *quicTransport) Close(r wire.CloseReason) error {
+	t.closeOnce.Do(func() { close(t.stop) })
+	_ = t.control.Close()
+	return t.conn.CloseWithError(quic.ApplicationErrorCode(r.QUICCode()), r.String())
+}
 
-	// Hub→host ping loop. The WebSocket transport has always had one; QUIC
-	// did not, so this connection had no hub-side liveness probe and — more
-	// importantly — no periodic re-assert of the browser subscriber count
-	// (see writeHostPing), leaving a lost `subscribers` frame uncorrected
-	// for the life of the connection.
-	pingDone := make(chan struct{})
-	defer close(pingDone)
-	go func() {
-		t := time.NewTicker(hostPingInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-pingDone:
-				return
-			case <-t.C:
-				if !h.HostWritable(hostID, sc) {
-					continue
-				}
-				if err := writeHostPing(h, hostID, wsafe); err != nil {
-					// Same verdict as the WebSocket path (closePingWrite):
-					// a ping that cannot be written means the session is
-					// already over. Returning from this goroutine alone
-					// used to leave the read loop parked until
-					// hostReadTimeout, and the host's watchdog was the
-					// first to notice. Closing the connection unblocks it.
-					log.Printf("[capri-hub] host %s: ping write failed: %v, dropping", hostID, err)
-					_ = conn.CloseWithError(errCodePingWrite, reasonPingWrite)
-					return
-				}
-			}
-		}
-	}()
-
-	// Idle detection aligned with the WS transport (hostReadTimeout):
-	// the read deadline is reset before every frame, so a host that
-	// stops sending is dropped silently instead of lingering "online"
-	// with every relay stuck.
-	go func() {
-		for {
-			// Request-plane streams (T1): besides the control stream the
-			// host opens further bidirectional streams — one per in-flight
-			// relay request (or a shared request stream on older hosts).
-			// They carry only host→hub `respond` frames plus a no-op
-			// `pong` used to materialize the stream (OpenStream transmits
-			// nothing until first write). The hub→host direction stays on
-			// the control stream, so these are pure uplink: EOF when the
-			// host finishes a request is NORMAL and must not tear down the
-			// session — only the control stream's death does (below, or
-			// via conn.CloseWithError when this session returns).
-			rs, err := conn.AcceptStream(context.Background())
-			if err != nil {
-				return // connection closed with the session
-			}
-			go func(rs *quic.Stream) {
-				defer rs.Close()
-				rf := quicFrameReader(rs)
-				for {
-					// Per-stream idle cap: a stalled request stream is
-					// dropped alone. This is the relay budget, not the
-					// control-plane one: the stream is intentionally
-					// silent while the host works on the request.
-					if err := rs.SetReadDeadline(time.Now().Add(hostRequestStreamTimeout)); err != nil {
-						return
-					}
-					data, err := rf()
-					if err != nil {
-						return // EOF / timeout / reset: end of this stream only
-					}
-					if !h.IsCurrentConn(hostID, sc) {
-						return
-					}
-					// handleHostFrame routes by frame type; `write`
-					// replies (pong to a stray ping) go back over the
-					// CONTROL stream via wsafe, never this stream.
-					// Unreadable-in-a-fatal-way is impossible here:
-					// quicFrameReader already returns the error.
-					_ = handleHostFrame(h, hostID, data, wsafe)
-				}
-			}(rs)
-		}
-	}()
-
+func (t *quicTransport) readControl() {
 	for {
-		if err := stream.SetReadDeadline(time.Now().Add(hostReadTimeout)); err != nil {
-			return
-		}
-		data, err := readFrame()
+		b, err := readQUICFrame(t.control, 0)
 		if err != nil {
-			return // includes the silent read-timeout close
-		}
-		// Superseded connection: drop the stale transport on its next
-		// frame (see the WS transport for the same guard).
-		if !h.IsCurrentConn(hostID, sc) {
-			log.Printf("[capri-hub] host %s: superseded quic connection dropped", hostID)
-			_ = conn.CloseWithError(errCodeSuperseded, reasonSuperseded)
+			t.fail(err)
 			return
 		}
-		if handleHostFrame(h, hostID, data, wsafe) {
-			_ = conn.CloseWithError(errCodeUnreadable, reasonUnreadable)
+		select {
+		case t.frames <- b:
+		case <-t.stop:
 			return
 		}
 	}
 }
 
-// quicFrameReader returns a readFrame closure for one QUIC stream. The
-// wire format is identical on every stream of the session (4-byte big
-// endian length prefix, bit 31 = raw-deflate flag; see PROTOCOL.md §2).
-func quicFrameReader(stream *quic.Stream) func() ([]byte, error) {
-	return func() ([]byte, error) {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-			return nil, err
+// acceptRequests drains request streams. Each stream is silent by design
+// between dispatch and the host's answer, so its read deadline tracks the
+// relay budget; a stream ending is normal and must not end the session.
+func (t *quicTransport) acceptRequests() {
+	for {
+		stream, err := t.conn.AcceptStream(context.Background())
+		if err != nil {
+			t.fail(err)
+			return
 		}
-		n, compressed := parseUplinkLen(binary.BigEndian.Uint32(lenBuf[:]))
-		if n > 32<<20 {
-			return nil, fmt.Errorf("frame too large: %d", n)
-		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(stream, buf); err != nil {
-			return nil, err
-		}
-		if !compressed {
-			return buf, nil
-		}
-		return inflateUplink(buf)
+		go func(stream *quic.Stream) {
+			defer stream.Close()
+			for {
+				b, err := readQUICFrame(stream, hub.RelayTimeout)
+				if err != nil {
+					return // EOF / timeout / reset: end of this stream only
+				}
+				select {
+				case t.frames <- b:
+				case <-t.stop:
+					return
+				}
+			}
+		}(stream)
 	}
+}
+
+// serveQUICConn serves one host QUIC connection: accept the control stream,
+// hand it to the session, and let the transport adapters do the rest.
+func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
+	// A panic in a bare goroutine (no net/http recover) would kill the whole
+	// hub; contain it and drop just this connection.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[capri-hub] quic conn panic recovered: %v", r)
+			_ = conn.CloseWithError(quic.ApplicationErrorCode(wire.CloseNormal.QUICCode()), fmt.Sprint(r))
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stream, err := conn.AcceptStream(ctx)
+	cancel()
+	if err != nil {
+		_ = conn.CloseWithError(0, "no control stream")
+		return
+	}
+	reason := h.ServeHost("", newQUICTransport(conn, stream))
+	log.Printf("[capri-hub] host quic session ended (%s) %s", reason, conn.RemoteAddr())
+}
+
+// readQUICFrame reads one length-prefixed frame (bit 31 = raw deflate).
+// readTimeout > 0 arms a per-read deadline for request streams.
+func readQUICFrame(stream *quic.Stream, readTimeout time.Duration) ([]byte, error) {
+	if readTimeout > 0 {
+		if err := stream.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			return nil, err
+		}
+	}
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	n, compressed := parseUplinkLen(binary.BigEndian.Uint32(lenBuf[:]))
+	if n > hostFrameLimit {
+		return nil, fmt.Errorf("%w: frame too large: %d", wire.ErrUnreadable, n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		return nil, err
+	}
+	if !compressed {
+		return buf, nil
+	}
+	out, err := inflateUplink(buf)
+	if err != nil {
+		return nil, fmt.Errorf("%w: inflate: %v", wire.ErrUnreadable, err)
+	}
+	return out, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────

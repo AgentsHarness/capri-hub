@@ -2,7 +2,8 @@ package hub
 
 import (
 	"testing"
-	"time"
+
+	"github.com/AgentsHarness/capri-wire"
 )
 
 // hostReplayCap mirrors capri-host internal/hub/client.go's replayCap: the
@@ -10,18 +11,6 @@ import (
 // other repository, so the inequality below is the only machine check that
 // the two buffers still fit together — change EITHER side and re-check both.
 const hostReplayCap = 1000
-
-// hostDefaultSessionIdleTimeout mirrors capri-host's
-// defaultSessionIdleTimeout, the DOWNLINK watchdog that applies before the
-// hub has advertised its own numbers. It is a floor, not an exact match:
-// hello.idleTimeout is derived from the hub's sweep (see hostIdleTimeout in
-// cmd/capri-hub) and the host adopts what it receives.
-const hostDefaultSessionIdleTimeout = 20 * time.Second
-
-// hostProbeHeartbeat mirrors capri-host's probeHeartbeatInterval: the
-// host_status cadence against a hub that advertises hello.probe. That beat
-// is the slowest periodic uplink frame a healthy but quiet host sends.
-const hostProbeHeartbeat = 15 * time.Second
 
 // TestEventBufCapCoversHostReplayRing locks the cross-repo invariant argued
 // in eventBufCap's doc comment: the hub's gap-pull buffer must be at least
@@ -39,37 +28,15 @@ func TestEventBufCapCoversHostReplayRing(t *testing.T) {
 	}
 }
 
-// TestLivenessScaleBeatsHostHeartbeat pins the cross-repo inequality that
-// decides whether a quiet host flaps: the sweep must outlast the slowest
-// periodic uplink frame the host sends, with room for one lost beat. When
-// the sweep is shorter than hostProbeHeartbeat, every idle period produces
-// an offline flip that only the next beat undoes — a healthy host that
-// keeps "disconnecting" in the browser.
-func TestLivenessScaleBeatsHostHeartbeat(t *testing.T) {
-	// Two beats: one to arrive, one in case the first was lost.
-	if min := 2 * hostProbeHeartbeat; HostSilenceTimeout < min {
-		t.Fatalf("HostSilenceTimeout = %s must cover two host heartbeats (%s), "+
-			"or an idle host is swept offline between beats",
-			HostSilenceTimeout, min)
+// TestLivenessScaleIsSelfConsistent pins the one liveness invariant the
+// session relies on: a single lost heartbeat must never close a healthy
+// session, so the idle budget is at least two keepalive intervals.
+func TestLivenessScaleIsSelfConsistent(t *testing.T) {
+	if err := wire.ValidateLiveness(SessionLiveness); err != nil {
+		t.Fatalf("advertised liveness %+v is invalid: %v", SessionLiveness, err)
 	}
-}
-
-// TestLivenessScaleMatchesHostDefault pins the other cross-repo inequality:
-// hello.idleTimeout (hub.HostSilenceTimeout + 2 sweep intervals, see
-// hostIdleTimeout in cmd/capri-hub) must outlast the point where the
-// registry flips. If the host gave up first, browsers would see a host that
-// is reconnecting while still listed online.
-func TestLivenessScaleMatchesHostDefault(t *testing.T) {
-	advertised := HostSilenceTimeout + 2*LivenessCheckInterval
-	if advertised <= HostSilenceTimeout+LivenessCheckInterval {
-		t.Fatalf("advertised idleTimeout %s must exceed the sweep's worst case %s",
-			advertised, HostSilenceTimeout+LivenessCheckInterval)
-	}
-	// The host's own fallback must never be shorter than what we advertise,
-	// or a host that ignores hello.idleTimeout would drop the session before
-	// the registry converges.
-	if advertised > hostDefaultSessionIdleTimeout*4 {
-		t.Fatalf("advertised idleTimeout %s has grown far past the host default %s; "+
-			"re-check both sides together", advertised, hostDefaultSessionIdleTimeout)
+	if SessionLiveness.Idle < 2*SessionLiveness.Keepalive {
+		t.Fatalf("idle %ds is below two keepalive intervals (%ds)",
+			SessionLiveness.Idle, SessionLiveness.Keepalive)
 	}
 }

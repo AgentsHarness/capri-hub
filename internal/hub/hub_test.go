@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/AgentsHarness/capri-wire"
 )
 
 // testPair pairs hostID and returns its token.
@@ -101,21 +103,21 @@ func TestPairingCodeAutoRotateOnRead(t *testing.T) {
 func TestEventBufGrace(t *testing.T) {
 	prev := EventBufGrace
 	EventBufGrace = 80 * time.Millisecond
-	defer func() { EventBufGrace = prev }()
+	// Cleanup, not defer: the sessions below read this global while they
+	// unwind, and their own cleanups run before this one.
+	t.Cleanup(func() { EventBufGrace = prev })
 
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
-	_, stop, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(1)}) {
-		t.Fatal("register")
-	}
-	stop()
-	// Immediately after disconnect the buffer is still available.
+	fh := dialFakeHost(t, h, "h1", 1)
+	fh.events(1, 0, chunkEvent(1, "a"))
+	waitFor(t, func() bool { return h.LastSeq("h1") == 1 }, 2*time.Second)
+
+	fh.ft.hangup()
+	waitFor(t, func() bool { return !h.ListHosts()[0].Online }, 2*time.Second)
+	// Immediately after detach the buffer is still available.
 	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Fatalf("evBuf right after disconnect = %d, want 1", n)
+		t.Fatalf("evBuf right after detach = %d, want 1", n)
 	}
 	// After grace, cleared.
 	time.Sleep(120 * time.Millisecond)
@@ -123,24 +125,21 @@ func TestEventBufGrace(t *testing.T) {
 		t.Fatalf("evBuf after grace = %d, want 0", n)
 	}
 
-	// Reconnect cancels clear: disconnect → re-register buffer → reconnect before grace.
-	EventBufGrace = 200 * time.Millisecond
-	_, stop2, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(2)}) {
-		t.Fatal("register 2")
-	}
-	stop2()
-	_, stop3, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stop3()
-	time.Sleep(250 * time.Millisecond)
-	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Fatalf("evBuf after reconnect within grace = %d, want 1 (clear cancelled)", n)
+	// A reconnect within the grace window cancels the clear.
+	EventBufGrace = 250 * time.Millisecond
+	again := dialFakeHost(t, h, "h1", 1)
+	again.events(2, 0, chunkEvent(2, "b"))
+	waitFor(t, func() bool { return h.LastSeq("h1") == 2 }, 2*time.Second)
+	again.ft.hangup()
+	waitFor(t, func() bool { return !h.ListHosts()[0].Online }, 2*time.Second)
+	third := dialFakeHost(t, h, "h1", 1)
+	defer third.ft.hangup()
+	time.Sleep(300 * time.Millisecond)
+	// The pre-grace buffer was already cleared, so only event 2 remains —
+	// and it must have survived the reconnect (the clear was cancelled).
+	evs := h.EventsAfter("h1", 0)
+	if len(evs) != 1 || evSeq(evs[0]) != 2 {
+		t.Fatalf("evBuf after reconnect within grace = %v, want [2] (clear cancelled)", evs)
 	}
 }
 
@@ -223,51 +222,63 @@ func TestConcurrentPairPersist(t *testing.T) {
 	}
 }
 
-// ConnectStream superseding an existing connection must fail in-flight
-// Dispatches immediately (not wait for RelayTimeout).
-func TestConnectStreamSupersedeFailsPending(t *testing.T) {
+// A reconnect in a NEW epoch cannot deliver requests dispatched in the old
+// sequence space, so their pending entries are failed immediately instead of
+// waiting for RelayTimeout. A same-epoch resume keeps them: the frame is still
+// in the down log and is replayed on the new link.
+func TestSessionSupersedeFailsPendingOnEpochChange(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
-
-	got := make(chan []byte, 4)
-	_, stop1, err := h.ConnectStream("h1", func(p []byte) error {
-		got <- append([]byte(nil), p...)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	first := dialFakeHost(t, h, "h1", 1)
 
 	done := make(chan error, 1)
 	go func() {
 		_, err := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
 		done <- err
 	}()
-	select {
-	case <-got:
-	case <-time.After(time.Second):
-		t.Fatal("no request frame on first connection")
-	}
+	first.recvType(wire.TypeRequest, 2*time.Second)
 
-	_, stop2, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stop2()
-	// Stale stop must not mark the new connection offline.
-	stop1()
-
+	second := dialFakeHost(t, h, "h1", 2)
 	select {
 	case err := <-done:
 		var re *RelayError
 		if !errors.As(err, &re) || re.Status != 503 {
 			t.Errorf("dispatch err = %v, want RelayError 503", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("pending request not failed after host reconnect")
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending request not failed on the epoch change")
 	}
 	if !h.ListHosts()[0].Online {
-		t.Error("host should stay online after stale stop")
+		t.Error("host should stay online after the reconnect")
+	}
+	// The new epoch starts from seq 0: the old request frame is gone.
+	second.noFrame(200 * time.Millisecond)
+
+	// Same epoch: the request is replayed on the new link and resolves there.
+	first = dialFakeHost(t, h, "h1", 2)
+	done2 := make(chan error, 1)
+	go func() {
+		_, err := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
+		done2 <- err
+	}()
+	req := first.recvType(wire.TypeRequest, 2*time.Second)
+
+	resumed := dialFakeHost(t, h, "h1", 2)
+	replay := resumed.recvType(wire.TypeRequest, 2*time.Second)
+	if replay.ReqID != req.ReqID {
+		t.Fatalf("replayed request = %q, want %q", replay.ReqID, req.ReqID)
+	}
+	resumed.send(wire.Frame{
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: replay.Seq,
+		ReqID: replay.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
+	})
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("dispatch after same-epoch resume: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replayed request did not resolve")
 	}
 }
 
@@ -276,12 +287,8 @@ func TestUnpair(t *testing.T) {
 	h := NewWithDir(dir)
 	tok := testPair(t, h, "h1", "H1")
 
-	// Online with a pending-ish stream: unpair should clear registry.
-	_, stop, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stop()
+	// Online with an attached session: unpair should clear the registry.
+	dialFakeHost(t, h, "h1", 1)
 
 	if err := h.Unpair("h1"); err != nil {
 		t.Fatalf("Unpair: %v", err)
@@ -405,139 +412,6 @@ func TestEventsAfterBinarySearch(t *testing.T) {
 	}
 }
 
-// TestSubscribersGenMonotonic guards the ordering stamp that keeps a host
-// from acting on a stale subscriber count (see notifyHostsSubscribers): a
-// browser refresh delivers count 0 and count 1 microseconds apart from two
-// separate goroutines, and applying them out of order silently pauses the
-// host's event upload while the page sits there looking connected.
-func TestSubscribersGenMonotonic(t *testing.T) {
-	h := NewWithDir("")
-	testPair(t, h, "h1", "H1")
-
-	var mu sync.Mutex
-	var frames [][]byte
-	_, stop, err := h.ConnectStream("h1", func(p []byte) error {
-		mu.Lock()
-		frames = append(frames, append([]byte(nil), p...))
-		mu.Unlock()
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer stop()
-
-	_, un1 := h.Subscribe()
-	_, un2 := h.Subscribe()
-	un2()
-	un1()
-
-	countSubs := func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		n := 0
-		for _, f := range frames {
-			var m map[string]any
-			if json.Unmarshal(f, &m) == nil && m["type"] == "subscribers" {
-				n++
-			}
-		}
-		return n
-	}
-	// Counts change 1→2→1→0, so four notifications are expected. Wait for
-	// all of them: stopping early would leave the terminal count=0 frame in
-	// flight and make the "highest gen wins" assertion below racy.
-	const wantFrames = 4
-	deadline := time.Now().Add(5 * time.Second)
-	for countSubs() < wantFrames && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	// Frames are written from one goroutine per host, so they genuinely DO
-	// arrive out of order — that is the bug `gen` exists for, so this test
-	// must not assert write ordering. What must hold is that every frame is
-	// stamped, stamps are unique, and the HIGHEST stamp carries the true
-	// final count: a host that keeps the highest gen therefore converges to
-	// the real state no matter how the frames were interleaved.
-	seenGen := map[float64]bool{}
-	var maxGen float64
-	maxGenCount := -1.0
-	for _, f := range frames {
-		var m map[string]any
-		if json.Unmarshal(f, &m) != nil || m["type"] != "subscribers" {
-			continue
-		}
-		gen, ok := m["gen"].(float64)
-		if !ok {
-			t.Fatalf("subscribers frame missing gen: %s", f)
-		}
-		if seenGen[gen] {
-			t.Fatalf("duplicate gen %v — stamps must be unique: %s", gen, f)
-		}
-		seenGen[gen] = true
-		count, ok := m["count"].(float64)
-		if !ok {
-			t.Fatalf("subscribers frame missing count: %s", f)
-		}
-		if gen > maxGen {
-			maxGen, maxGenCount = gen, count
-		}
-	}
-	if len(seenGen) < wantFrames {
-		t.Fatalf("expected %d subscribers frames for the 0→1→2→1→0 churn, got %d", wantFrames, len(seenGen))
-	}
-	if maxGenCount != 0 {
-		t.Fatalf("highest gen (%v) carries count=%v, want 0 — a gen-gating host "+
-			"would converge to the wrong subscriber state", maxGen, maxGenCount)
-	}
-	// SubscribersState (the ping re-assert path) shares the counter, so a
-	// re-assert can never be mistaken for a stale frame.
-	c, g1 := h.SubscribersState()
-	if c != 0 {
-		t.Errorf("count = %d, want 0 after all unsubscribes", c)
-	}
-	_, g2 := h.SubscribersState()
-	if float64(g1) <= maxGen || g2 <= g1 {
-		t.Errorf("SubscribersState gens must continue the sequence: %d, %d after %v", g1, g2, maxGen)
-	}
-}
-
-// TestSubscribersNoRedundantNotify: an unchanged count is not re-broadcast
-// (multi-tab churn would otherwise be a per-host write storm).
-func TestSubscribersNoRedundantNotify(t *testing.T) {
-	h := NewWithDir("")
-	testPair(t, h, "h1", "H1")
-	var mu sync.Mutex
-	subsFrames := 0
-	_, stop, err := h.ConnectStream("h1", func(p []byte) error {
-		var m map[string]any
-		if json.Unmarshal(p, &m) == nil && m["type"] == "subscribers" {
-			mu.Lock()
-			subsFrames++
-			mu.Unlock()
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer stop()
-	// Counts go 1,2,1,0 — four genuine changes, so at most four frames.
-	_, un1 := h.Subscribe()
-	_, un2 := h.Subscribe()
-	un2()
-	un1()
-	time.Sleep(200 * time.Millisecond)
-	mu.Lock()
-	got := subsFrames
-	mu.Unlock()
-	if got > 4 {
-		t.Errorf("got %d subscribers frames for 4 count changes — redundant notifies", got)
-	}
-}
-
 // TestSubscribersChangedBroadcast: the browser-facing total (what the FE top
 // bar shows) is pushed to every page on connect/disconnect, unfiltered — a
 // page watching h1 still needs the hub-wide figure. Unchanged counts are not
@@ -587,15 +461,11 @@ func TestSubscribersChangedBroadcast(t *testing.T) {
 	}
 }
 
-func TestStreamLifecycle(t *testing.T) {
+func TestSessionAttachDetach(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 
-	write := func(payload []byte) error { return nil }
-	conn, stop, err := h.ConnectStream("h1", write)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	fh := dialFakeHost(t, h, "h1", 1)
 	hosts := h.ListHosts()
 	if len(hosts) != 1 || !hosts[0].Online {
 		t.Fatalf("host should be online: %+v", hosts)
@@ -604,61 +474,23 @@ func TestStreamLifecycle(t *testing.T) {
 		t.Errorf("default host = %q, want h1", h.DefaultHostID())
 	}
 
-	stop()
-	if h.ListHosts()[0].Online {
-		t.Error("host should be offline after stop")
-	}
-	// Only known host stays the default (requests would 503 while offline).
+	fh.ft.hangup()
+	waitFor(t, func() bool { return !h.ListHosts()[0].Online }, 2*time.Second)
+	// The known host stays the default (requests would 503 while offline).
 	if h.DefaultHostID() != "h1" {
 		t.Errorf("default host = %q, want h1", h.DefaultHostID())
 	}
 
-	// A stale stop (old conn) must not kill the new connection.
-	conn2, stop2, err := h.ConnectStream("h1", write)
-	if err != nil {
-		t.Fatalf("reconnect: %v", err)
-	}
-	_ = conn
-	stop() // stale
-	if !h.ListHosts()[0].Online {
-		t.Error("stale stop must not mark host offline")
-	}
-	_ = conn2
-	stop2()
-	if h.ListHosts()[0].Online {
-		t.Error("host should be offline after real stop")
-	}
-
-	if _, _, err := h.ConnectStream("nope", write); !errors.Is(err, ErrHostUnknown) {
-		t.Errorf("connect unknown host err = %v", err)
-	}
+	// A reconnect brings it back online.
+	again := dialFakeHost(t, h, "h1", 1)
+	waitFor(t, func() bool { return h.ListHosts()[0].Online }, 2*time.Second)
+	again.ft.hangup()
 }
 
 func TestDispatchAndRespond(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-
-	type frame struct {
-		ReqID  string          `json:"reqId"`
-		HostID string          `json:"hostId"`
-		Method string          `json:"method"`
-		Path   string          `json:"path"`
-		Body   json.RawMessage `json:"body"`
-	}
-	got := make(chan frame, 1)
-	_, stop, err := h.ConnectStream("h1", func(payload []byte) error {
-		var f frame
-		if err := json.Unmarshal(payload, &f); err != nil {
-			t.Errorf("bad relay frame: %v", err)
-			return err
-		}
-		got <- f
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer stop()
+	fh := dialFakeHost(t, h, "h1", 1)
 
 	body := json.RawMessage(`{"blocks":[{"type":"text","text":"hi"}]}`)
 	type result struct {
@@ -671,12 +503,15 @@ func TestDispatchAndRespond(t *testing.T) {
 		done <- result{resp, err}
 	}()
 
-	f := <-got
-	if f.ReqID == "" || f.HostID != "h1" || f.Method != "POST" || f.Path != "/api/prompt" {
+	f := fh.recvType(wire.TypeRequest, 2*time.Second)
+	if f.ReqID == "" || f.Method != "POST" || f.Path != "/api/prompt" {
 		t.Fatalf("relay frame = %+v", f)
 	}
 	if string(f.Body) != string(body) {
 		t.Errorf("body = %s, want %s", f.Body, body)
+	}
+	if f.Seq == 0 {
+		t.Error("request must consume the down seq space")
 	}
 
 	answer := RelayResponse{Status: 200, Body: json.RawMessage(`{"ok":true}`)}
@@ -709,10 +544,7 @@ func TestDispatchOffline(t *testing.T) {
 func TestDispatchFailsOnDisconnect(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-	_, stop, err := h.ConnectStream("h1", func(payload []byte) error { return nil })
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	fh := dialFakeHost(t, h, "h1", 1)
 
 	type result struct {
 		resp RelayResponse
@@ -723,8 +555,8 @@ func TestDispatchFailsOnDisconnect(t *testing.T) {
 		resp, err := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
 		done <- result{resp, err}
 	}()
-	time.Sleep(50 * time.Millisecond) // let the request register
-	stop()                            // host drops mid-request
+	fh.recvType(wire.TypeRequest, 2*time.Second)
+	fh.ft.hangup() // the host drops mid-request
 
 	select {
 	case r := <-done:
@@ -795,10 +627,7 @@ func TestHostsOrderingAndDefault(t *testing.T) {
 	testPair(t, h, "h2", "H2")
 
 	// h2 connects (online) → sorts first, becomes default.
-	_, stop, err := h.ConnectStream("h2", func(payload []byte) error { return nil })
-	if err != nil {
-		t.Fatalf("connect h2: %v", err)
-	}
+	fh2 := dialFakeHost(t, h, "h2", 1)
 	hosts := h.ListHosts()
 	if len(hosts) != 2 || hosts[0].HostID != "h2" {
 		t.Errorf("ordering = %+v, want h2 first", hosts)
@@ -810,7 +639,15 @@ func TestHostsOrderingAndDefault(t *testing.T) {
 	// After h2 disconnects, default falls back to the most recently seen
 	// host — h1, refreshed by a recent event.
 	hubRaw(h, "h1", Event{"type": "chunk", "text": "x", "seq": uint64(1), "sessionId": "s1"})
-	stop()
+	fh2.ft.hangup()
+	waitFor(t, func() bool {
+		for _, hi := range h.ListHosts() {
+			if hi.HostID == "h2" {
+				return !hi.Online
+			}
+		}
+		return false
+	}, 2*time.Second)
 	if h.DefaultHostID() != "h1" {
 		t.Errorf("default after offline = %q, want h1", h.DefaultHostID())
 	}
@@ -822,107 +659,12 @@ func TestHostsChangedBroadcast(t *testing.T) {
 	ch, unsub := h.Subscribe()
 	defer unsub()
 
-	_, stop, err := h.ConnectStream("h1", func(payload []byte) error { return nil })
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	select {
-	case ev := <-ch:
-		if ev["type"] != "hosts_changed" {
-			t.Errorf("event = %v, want hosts_changed", ev["type"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("no hosts_changed on connect")
-	}
-	stop()
-	select {
-	case ev := <-ch:
-		if ev["type"] != "hosts_changed" {
-			t.Errorf("event = %v, want hosts_changed", ev["type"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("no hosts_changed on disconnect")
-	}
+	fh := dialFakeHost(t, h, "h1", 1)
+	waitForEventType(t, ch, "hosts_changed")
+	fh.ft.hangup()
+	waitForEventType(t, ch, "hosts_changed")
 }
 
-func TestNotifyHostsSubscribers(t *testing.T) {
-	h := NewWithDir(t.TempDir())
-	testPair(t, h, "h1", "H1")
-
-	var (
-		mu     sync.Mutex
-		frames []map[string]any
-	)
-	_, stop, err := h.ConnectStream("h1", func(payload []byte) error {
-		var m map[string]any
-		if json.Unmarshal(payload, &m) != nil {
-			return nil
-		}
-		mu.Lock()
-		frames = append(frames, m)
-		mu.Unlock()
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer stop()
-
-	if h.SubscriberCount() != 0 {
-		t.Fatalf("initial subscribers = %d, want 0", h.SubscriberCount())
-	}
-
-	_, unsub := h.Subscribe()
-	// Subscribe notifies hosts with count=1. The two host notifications
-	// (subscribers + viewing) are written by independent goroutines, so scan
-	// every frame rather than assuming which one landed last.
-	deadline := time.After(time.Second)
-	for {
-		mu.Lock()
-		var got1 bool
-		for _, f := range frames {
-			if f["type"] == "subscribers" && f["count"] == float64(1) {
-				got1 = true
-			}
-		}
-		mu.Unlock()
-		if got1 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("no subscribers:1 frame, got %v", frames)
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-
-	unsub()
-	deadline = time.After(time.Second)
-	for {
-		mu.Lock()
-		var got0 bool
-		for _, f := range frames {
-			if f["type"] == "subscribers" && f["count"] == float64(0) {
-				got0 = true
-			}
-		}
-		mu.Unlock()
-		if got0 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("no subscribers:0 frame after unsub, got %v", frames)
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	if h.SubscriberCount() != 0 {
-		t.Errorf("after unsub count = %d, want 0", h.SubscriberCount())
-	}
-}
-
-// TestEventsAfterSeqTypes: a host seq may arrive as uint64 (in-process) or
-// float64 (after the JSON frame is decoded); both must be pullable.
 func TestEventsAfterSeqTypes(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
@@ -948,7 +690,7 @@ func TestEventsAfterSeqTypes(t *testing.T) {
 func TestRegisterRawEventsNilEntry(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-	if !h.RegisterRawEvents("h1", []json.RawMessage{[]byte("null")}) {
+	if !testIngest(h, "h1", []json.RawMessage{[]byte("null")}) {
 		t.Error("known host should be accepted even when every entry is invalid")
 	}
 	if n := len(h.EventsAfter("h1", 0)); n != 0 {
@@ -967,7 +709,7 @@ func TestRegisterRawEventsDoesNotMutateInput(t *testing.T) {
 
 	body := json.RawMessage(`{"type":"chunk","text":"x","seq":1}`)
 	before := string(body)
-	if !h.RegisterRawEvents("h1", []json.RawMessage{body}) {
+	if !testIngest(h, "h1", []json.RawMessage{body}) {
 		t.Fatal("ingest failed")
 	}
 	if string(body) != before {
@@ -1000,81 +742,6 @@ func TestRegisterRawEventsDoesNotMutateInput(t *testing.T) {
 // re-fan-out to FE subscribers, and must not re-append to the gap-pull
 // buffer. LastSeen is still refreshed (return true). A higher seq still
 // advances and fans out as usual.
-func TestRegisterEventSeqRegression(t *testing.T) {
-	h := NewWithDir(t.TempDir())
-	testPair(t, h, "h1", "H1")
-
-	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "fresh", "seq": uint64(100)}) {
-		t.Fatal("register 100")
-	}
-	if got := h.LastSeq("h1"); got != 100 {
-		t.Fatalf("LastSeq = %d, want 100", got)
-	}
-	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Fatalf("evBuf len = %d, want 1 after first event", n)
-	}
-
-	ch, unsub := h.Subscribe()
-	defer unsub()
-	// Fan-out is asynchronous (per-host queue, see hostState.fanout): the
-	// seed event registered before this subscription can still be in flight.
-	// Drain it first, then assert the stale/duplicate seqs stay silent.
-	drainEvents(ch, 100*time.Millisecond)
-
-	// Regressed seq: accepted (LastSeen) but no fan-out / no buffer append.
-	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "stale", "seq": uint64(50)}) {
-		t.Fatal("register 50")
-	}
-	if got := h.LastSeq("h1"); got != 100 {
-		t.Errorf("LastSeq = %d, want 100 (counter must not regress)", got)
-	}
-	select {
-	case ev := <-ch:
-		t.Fatalf("regressed seq must not fan out, got %v", ev)
-	case <-time.After(50 * time.Millisecond):
-		// expected: no broadcast
-	}
-	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Errorf("evBuf len = %d after stale, want 1 (no re-append)", n)
-	}
-
-	// Equal seq (duplicate): same — skip fan-out, counter stays put.
-	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "dup", "seq": uint64(100)}) {
-		t.Fatal("register 100 again")
-	}
-	if got := h.LastSeq("h1"); got != 100 {
-		t.Errorf("LastSeq = %d, want 100 after equal seq", got)
-	}
-	select {
-	case ev := <-ch:
-		t.Fatalf("duplicate seq must not fan out, got %v", ev)
-	case <-time.After(50 * time.Millisecond):
-		// expected
-	}
-	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Errorf("evBuf len = %d after dup, want 1", n)
-	}
-
-	// A higher seq still advances and fans out.
-	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "next", "seq": uint64(101)}) {
-		t.Fatal("register 101")
-	}
-	if got := h.LastSeq("h1"); got != 101 {
-		t.Errorf("LastSeq = %d, want 101", got)
-	}
-	select {
-	case ev := <-ch:
-		if ev["seq"] != float64(101) {
-			t.Errorf("fresh event = %v, want seq 101", ev)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("seq 101 should be broadcast")
-	}
-	if n := len(h.EventsAfter("h1", 0)); n != 2 {
-		t.Errorf("evBuf len = %d after 101, want 2", n)
-	}
-}
-
 // TestHostStatusControlFrame: control-plane host_status updates Ready +
 // fires hosts_changed on flip, without advancing LastSeq or buffering events.
 func TestHostStatusControlFrame(t *testing.T) {
@@ -1284,62 +951,6 @@ func TestPairPortAndPersist(t *testing.T) {
 	}
 }
 
-// TestResetHostSeq: host process restart clears LastSeq + gap-pull buffer
-// so new low seqs fan out instead of being skipped as stale.
-func TestResetHostSeq(t *testing.T) {
-	h := NewWithDir(t.TempDir())
-	testPair(t, h, "h1", "H1")
-
-	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "old", "seq": uint64(100)}) {
-		t.Fatal("register seed")
-	}
-	if got := h.LastSeq("h1"); got != 100 {
-		t.Fatalf("LastSeq = %d, want 100", got)
-	}
-	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Fatalf("evBuf len = %d, want 1", n)
-	}
-
-	ch, unsub := h.Subscribe()
-	defer unsub()
-	// Asynchronous fan-out: drain the pre-subscription seed ("old") before
-	// asserting that the post-reset seq 1 is the one that fans out.
-	drainEvents(ch, 100*time.Millisecond)
-
-	if !h.ResetHostSeq("h1") {
-		t.Fatal("ResetHostSeq failed")
-	}
-	if got := h.LastSeq("h1"); got != 0 {
-		t.Errorf("LastSeq after reset = %d, want 0", got)
-	}
-	if n := len(h.EventsAfter("h1", 0)); n != 0 {
-		t.Errorf("evBuf after reset = %d, want 0", n)
-	}
-
-	// New process seq 1 must fan out (not skipped as s <= 100).
-	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "new", "seq": uint64(1)}) {
-		t.Fatal("register seq 1 after reset")
-	}
-	select {
-	case ev := <-ch:
-		if ev["type"] != "chunk" {
-			t.Errorf("fan-out = %v, want type=chunk", ev)
-		}
-		if s := evSeq(ev); s != 1 {
-			t.Errorf("seq = %d, want 1", s)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("seq 1 after reset was not broadcast")
-	}
-	if got := h.LastSeq("h1"); got != 1 {
-		t.Errorf("LastSeq = %d, want 1", got)
-	}
-
-	if h.ResetHostSeq("nope") {
-		t.Error("ResetHostSeq for unknown host should fail")
-	}
-}
-
 // TestSubscribeNotBlockedBySlowHost: subscriber-count notifications are
 // written per host in the background, so a slow/half-open host (write
 // timeouts of tens of seconds) must not stall subscribe/unsubscribe.
@@ -1347,15 +958,9 @@ func TestSubscribeNotBlockedBySlowHost(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 
+	fh := dialFakeHost(t, h, "h1", 1)
 	release := make(chan struct{})
-	_, stop, err := h.ConnectStream("h1", func([]byte) error {
-		<-release // simulate a host whose write never completes in time
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer stop()
+	fh.ft.setBlock(release) // simulate a host whose write never completes
 	defer close(release)
 
 	done := make(chan struct{})
@@ -1368,7 +973,7 @@ func TestSubscribeNotBlockedBySlowHost(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Subscribe blocked on a slow host notification write")
+		t.Fatal("Subscribe blocked on a slow host write")
 	}
 }
 
@@ -1556,68 +1161,11 @@ func TestPrefsBroadcast(t *testing.T) {
 	}
 }
 
-// TestIsCurrentConn: IsCurrentConn must track the live stream — false for
-// unknown hosts, disconnected conns, and superseded conns; a stale stop
-// must not revive an old conn.
-func TestIsCurrentConn(t *testing.T) {
-	h := NewWithDir("")
-	testPair(t, h, "h1", "H1")
-
-	// Unknown host / no live conn.
-	if h.IsCurrentConn("nope", &streamConn{}) {
-		t.Error("unknown host must not have a current conn")
-	}
-	if h.IsCurrentConn("h1", &streamConn{}) {
-		t.Error("host with no live conn must not have a current conn")
-	}
-	conn1, stop1, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !h.IsCurrentConn("h1", conn1) {
-		t.Error("live conn must be current")
-	}
-	if h.IsCurrentConn("h1", &streamConn{}) {
-		t.Error("unregistered conn must not be current")
-	}
-
-	stop1()
-	if h.IsCurrentConn("h1", conn1) {
-		t.Error("disconnected conn must not be current")
-	}
-
-	conn2, stop2, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stop2()
-	if !h.IsCurrentConn("h1", conn2) {
-		t.Error("new conn must be current after supersede")
-	}
-	if h.IsCurrentConn("h1", conn1) {
-		t.Error("superseded conn must not be current")
-	}
-	// Stale stop must not revive conn1 as current.
-	stop1()
-	if !h.IsCurrentConn("h1", conn2) {
-		t.Error("stale stop must not affect the current conn")
-	}
-}
-
-// TestDispatchAbandonedByBrowser: when the browser's request context is
-// cancelled the relay must stop waiting AND free the pending slot. Before
-// this, an abandoned request (closed tab, mobile network drop) pinned a
-// goroutine, a pending entry and a RelayTimeout-long (45 min) timer, so a
-// client retrying prompts steadily accumulated them.
 func TestDispatchAbandonedByBrowser(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	// A host that accepts the request and never answers.
-	_, stop, err := h.ConnectStream("h1", func([]byte) error { return nil })
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer stop()
+	fh := dialFakeHost(t, h, "h1", 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -1641,6 +1189,7 @@ func TestDispatchAbandonedByBrowser(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
+	fh.recvType(wire.TypeRequest, 2*time.Second)
 	cancel() // browser goes away
 	select {
 	case e := <-done:
@@ -1668,11 +1217,12 @@ func TestDispatchAbandonedByBrowser(t *testing.T) {
 	}
 }
 
-// TestRegisterRawEvents: the raw (pre-encoded) path ingests event bodies
-// without decoding them into maps — host seqs preserved / stale skipped /
-// seq-less rejected, hostId/hostName tags appended, and the broadcast event
-// serializing via MarshalEvent to the spliced original bytes.
-func TestRegisterRawEvents(t *testing.T) {
+// TestIngestRawEvents: the raw (pre-encoded) path ingests event bodies without
+// decoding them into maps — seqs are preserved, hostId/hostName tags are
+// spliced in, and the broadcast event serializes via MarshalEvent to the
+// original bytes. Ordering and duplicates are the receiver's job, not this
+// function's.
+func TestIngestRawEvents(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 	ch, unsub := h.Subscribe()
@@ -1681,30 +1231,27 @@ func TestRegisterRawEvents(t *testing.T) {
 	raws := []json.RawMessage{
 		json.RawMessage(`{"type":"chunk","text":"a","seq":10}`),
 		json.RawMessage(`{"type":"chunk","text":"b","seq":11}`),
-		json.RawMessage(`{"type":"chunk","text":"stale","seq":5}`), // skipped
-		json.RawMessage(`{"type":"chunk","text":"no-seq"}`),        // rejected
 	}
-	if !h.RegisterRawEvents("h1", raws) {
-		t.Fatal("RegisterRawEvents failed for paired host")
+	if !testIngest(h, "h1", raws) {
+		t.Fatal("ingest failed for paired host")
 	}
 	if got := h.LastSeq("h1"); got != 11 {
 		t.Fatalf("LastSeq = %d, want 11", got)
 	}
-	// Two fan-outs (stale and seq-less skipped).
 	var wires []map[string]any
 	for len(wires) < 2 {
 		select {
 		case ev := <-ch:
 			if ev["type"] != "chunk" {
-				continue // hosts_changed noise
+				continue // hosts_changed / subscribed noise
 			}
-			wire, err := MarshalEvent(ev)
+			wireBytes, err := MarshalEvent(ev)
 			if err != nil {
 				t.Fatalf("MarshalEvent: %v", err)
 			}
 			var m map[string]any
-			if json.Unmarshal(wire, &m) != nil {
-				t.Fatalf("spliced wire is not valid JSON: %s", wire)
+			if json.Unmarshal(wireBytes, &m) != nil {
+				t.Fatalf("spliced wire is not valid JSON: %s", wireBytes)
 			}
 			wires = append(wires, m)
 		case <-time.After(time.Second):
@@ -1720,16 +1267,15 @@ func TestRegisterRawEvents(t *testing.T) {
 	if wires[1]["text"] != "b" || wires[1]["seq"].(float64) != 11 {
 		t.Errorf("event 1 = %v", wires[1])
 	}
-	// Stale event not buffered.
 	if evs := h.EventsAfter("h1", 0); len(evs) != 2 {
 		t.Errorf("EventsAfter = %d events, want 2", len(evs))
 	}
-	// Non-object entries are skipped without consuming a seq.
-	h.RegisterRawEvents("h1", []json.RawMessage{json.RawMessage(`null`)})
+	// Non-object entries are skipped.
+	testIngest(h, "h1", []json.RawMessage{json.RawMessage(`null`)})
 	if got := h.LastSeq("h1"); got != 11 {
 		t.Errorf("LastSeq after null entry = %d, want 11", got)
 	}
-	if h.RegisterRawEvents("nope", nil) {
+	if testIngest(h, "nope", nil) {
 		t.Error("unknown host must return false")
 	}
 }
@@ -1740,7 +1286,7 @@ func TestRegisterRawEvents(t *testing.T) {
 func TestRegisterRawEventsHostStatusIsNotAnEvent(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-	h.RegisterRawEvents("h1", []json.RawMessage{json.RawMessage(`{"type":"host_status","ready":true,"seq":1}`)})
+	testIngest(h, "h1", []json.RawMessage{json.RawMessage(`{"type":"host_status","ready":true,"seq":1}`)})
 	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Ready {
 		t.Errorf("ready flipped by an events-frame host_status: %+v", hosts)
 	}
@@ -1913,7 +1459,7 @@ func TestRawTerminalToolUpdateIsCritical(t *testing.T) {
 		json.RawMessage(`{"type":"tool_call_update","toolCallUpdate":{"toolCallId":"c1","status":"completed"},"seq":2}`),
 		json.RawMessage(`{"type":"chunk","text":"x","seq":3}`),
 	}
-	h.RegisterRawEvents("h1", raws)
+	testIngest(h, "h1", raws)
 
 	wantCritical := map[string]bool{"in_progress": false, "completed": false, "chunk": false}
 	seen := 0
@@ -2192,6 +1738,22 @@ func TestFanoutDropsAreCountedNotBlocking(t *testing.T) {
 
 // drainEvents collects whatever arrives within d (used where the hub has no
 // more events to push, so the only wait is for in-flight fan-out).
+// waitForEventType consumes events until one of type typ arrives.
+func waitForEventType(t *testing.T, ch chan Event, typ string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			if ev["type"] == typ {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("no %s event", typ)
+		}
+	}
+}
+
 func drainEvents(ch chan Event, d time.Duration) []Event {
 	var out []Event
 	deadline := time.After(d)
@@ -2319,79 +1881,44 @@ func containsType(types []string, want string) bool {
 	return false
 }
 
-// TestSubscriberCountsNotifyPerHost: the `subscribers` frame decides whether
-// a host uploads bridge events at all. With per-subscriber filtering the
-// frame must carry the PER-HOST audience, otherwise a page watching h1
-// keeps h2 uploading a stream nobody reads — and the switch to h2 finds the
-// hub with a stale buffer.
-func TestSubscriberCountsNotifyPerHost(t *testing.T) {
+// TestAudienceNotifyPerHost: the audience frame decides whether a host uploads
+// bridge events at all. With per-subscriber filtering it must carry the
+// PER-HOST audience, otherwise a page watching h1 keeps h2 uploading a stream
+// nobody reads.
+func TestAudienceNotifyPerHost(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	testPair(t, h, "h2", "H2")
 
-	var mu sync.Mutex
-	last := map[string]float64{}
-	for _, id := range []string{"h1", "h2"} {
-		hostID := id
-		_, stop, err := h.ConnectStream(hostID, func(p []byte) error {
-			var m map[string]any
-			if json.Unmarshal(p, &m) != nil || m["type"] != "subscribers" {
-				return nil
-			}
-			mu.Lock()
-			if c, ok := m["count"].(float64); ok {
-				if prev, seen := last[hostID]; !seen || c >= prev || m["gen"].(float64) > 0 {
-					last[hostID] = c
-				}
-			}
-			mu.Unlock()
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("connect %s: %v", hostID, err)
-		}
-		defer stop()
-	}
-	waitFor := func(want map[string]float64) map[string]float64 {
-		t.Helper()
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			mu.Lock()
-			got := map[string]float64{}
-			for k, v := range last {
-				got[k] = v
-			}
-			mu.Unlock()
-			ok := true
-			for k, v := range want {
-				if got[k] != v {
-					ok = false
-				}
-			}
-			if ok {
-				return got
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		t.Fatalf("subscriber counts never became %v (got %v)", want, last)
-		return nil
-	}
+	fh1 := dialFakeHost(t, h, "h1", 1)
+	fh2 := dialFakeHost(t, h, "h2", 1)
 
 	ch, unsub, ok := h.TrySubscribeHost(0, "h1")
 	if !ok {
 		t.Fatal("TrySubscribeHost refused")
 	}
 	defer unsub()
-	// h1 has a viewer; h2 has none and must pause its uplink.
-	waitFor(map[string]float64{"h1": 1, "h2": 0})
+
+	if a := fh1.recvType(wire.TypeAudience, 2*time.Second).AudienceState(); a.Watchers != 1 {
+		t.Fatalf("h1 audience = %+v, want 1 watcher", a)
+	}
+	// h2 has no viewer: its snapshot never changed, so nothing is sent.
+	fh2.noFrame(200 * time.Millisecond)
 
 	if !h.SetSubscriberHost(ch, "h2") {
 		t.Fatal("SetSubscriberHost rejected a live channel")
 	}
-	waitFor(map[string]float64{"h1": 0, "h2": 1})
+	if a := fh1.recvType(wire.TypeAudience, 2*time.Second).AudienceState(); a.Watchers != 0 {
+		t.Fatalf("h1 audience after retarget = %+v, want 0 watchers", a)
+	}
+	if a := fh2.recvType(wire.TypeAudience, 2*time.Second).AudienceState(); a.Watchers != 1 {
+		t.Fatalf("h2 audience after retarget = %+v, want 1 watcher", a)
+	}
 
 	unsub()
-	waitFor(map[string]float64{"h1": 0, "h2": 0})
+	if a := fh2.recvType(wire.TypeAudience, 2*time.Second).AudienceState(); a.Watchers != 0 {
+		t.Fatalf("h2 audience after unsubscribe = %+v, want 0 watchers", a)
+	}
 }
 
 // TestResyncCarriesHostId: seq counters are per-host, so an untagged resync
@@ -2493,5 +2020,5 @@ func hubRaw(h *Hub, hostID string, ev Event) bool {
 	if err != nil {
 		return false
 	}
-	return h.RegisterRawEvents(hostID, []json.RawMessage{b})
+	return testIngest(h, hostID, []json.RawMessage{b})
 }

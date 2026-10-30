@@ -2,13 +2,15 @@
 // code → token), the host registry, event fan-out to browsers, and the
 // browser ↔ host request relay.
 //
-// Transport model (WebSocket + HTTP API):
+// Transport model (WebSocket + QUIC + HTTP API):
 //
-//	Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──WS /ws/host──▶ capri-host × N ──stdio──▶ grok
+//	Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──WS|QUIC──▶ capri-host × N ──stdio──▶ grok
 //
-// Hosts connect OUTBOUND to the hub (NAT-friendly): one WebSocket carries
-// relayed browser requests down and host events / responds up. Browsers
-// open /ws/fe for the aggregated live event stream; REST APIs stay on HTTP.
+// Hosts connect OUTBOUND to the hub (NAT-friendly) and speak the v2 session
+// protocol (capri-wire/PROTOCOL-V2.md): relayed browser requests and absolute
+// audience state down, events / relays up, all with one seq space per
+// direction. Browsers open /ws/fe for the aggregated live event stream; REST
+// APIs stay on HTTP.
 package hub
 
 import (
@@ -29,6 +31,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AgentsHarness/capri-wire"
 )
 
 const (
@@ -37,13 +41,11 @@ const (
 	// pairingCodeCheckInterval is how often the maintainer looks for an
 	// expired pairing code to rotate.
 	pairingCodeCheckInterval = 30 * time.Second
-	// RelayTimeout caps how long the hub waits for a host to answer a
-	// relayed request when no tighter budget applies. It is the relay
-	// layer's ceiling for "the host never answered and there is no ack to
-	// fall back on": long-running endpoints (history, file reads,
-	// agent-style RPCs) legitimately need this order of magnitude, while
-	// fast endpoints fail on RelayAckTimeout's per-request budget instead
-	// (see dispatchAckTimeout).
+	// RelayTimeout caps how long the hub waits for a host's answer once its
+	// request frame was delivered. It is the relay layer's ceiling: long
+	// running endpoints (history, file reads, agent-style RPCs) legitimately
+	// need this order of magnitude. Delivery itself has its own, much
+	// shorter deadline (RequestAckTimeout in session.go).
 	RelayTimeout = 45 * time.Minute
 	// eventBufCap bounds per-host buffered events for gap-pull. It MUST
 	// stay ≥ the host's replay ring (capri-host internal/hub replayCap =
@@ -82,16 +84,6 @@ var evBufByteCap = 64 << 20
 // (parallel session-history pages, prompts, settings) working while bounding
 // the worst case. A var so tests can shrink it.
 var maxPendingRelayPerHost = 16
-
-// RelayAckTimeout is how long one relayed request may stay unanswered
-// while that host sends no uplink frame at all. A JSON pong answering
-// the hub's ping counts — it proves the uplink is alive — but it does
-// not refresh LastSeen (see NoteUplink). The failure is this request
-// only; the sweep owns the registry. Var so tests can shrink it.
-var RelayAckTimeout = 6 * time.Second
-
-// AckCheckInterval paces the per-request ack check.
-var AckCheckInterval = 1 * time.Second
 
 // EventBufGrace is how long after a host disconnect we keep its gap-pull
 // buffer so a short blip can still be filled via GET /api/events. Zero
@@ -171,64 +163,16 @@ type HostInfo struct {
 	Local    bool      `json:"local,omitempty"`
 }
 
-// RelayRequest is pushed to a host over its WebSocket.
-type RelayRequest struct {
-	V      int             `json:"v"`
-	Type   string          `json:"type"` // always "request"
-	ReqID  string          `json:"reqId"`
-	HostID string          `json:"hostId"` // 目标 host，host 端据此校验请求归属
-	Method string          `json:"method"`
-	Path   string          `json:"path"`
-	Body   json.RawMessage `json:"body,omitempty"`
-}
-
 // RelayResponse is the host's answer (WS type:"respond").
 type RelayResponse struct {
 	Status int             `json:"status"`
 	Body   json.RawMessage `json:"body,omitempty"`
 }
 
-// streamConn is one host's live WebSocket (hub ↔ host). The hub
-// writes relayed request / subscribers frames to it.
-type streamConn struct {
-	id    int64
-	write func(payload []byte) error
-	// suspended is set by the liveness sweep when the host has gone silent
-	// but its transport is still attached. Every downlink write path skips
-	// a suspended conn, while the transport stays identifiable so the next
-	// uplink frame can clear the flag and restore Online without a
-	// reconnect. Guarded by Hub.mu.
-	suspended bool
-}
-
-// unackedState is one edge-triggered absolute-state frame the host has not
-// confirmed yet. payload is resent verbatim with the same gen, so the host's
-// generation gate keeps discarding anything it already applied.
-type unackedState struct {
-	gen     uint64
-	payload []byte
-	// deadline is when the next retransmit is due.
-	deadline time.Time
-	// attempts counts retransmits, not the original write.
-	attempts int
-	// inflight is true while a retransmit is on the wire, so a peer that
-	// stalls writes cannot pile up one goroutine per tick. Guarded by Hub.mu.
-	inflight bool
-}
-
+// pendingReq is one relayed request waiting for the host's answer.
 type pendingReq struct {
 	resp chan RelayResponse
 	done chan struct{}
-	// dispatchedAt is when the request frame was handed to the host's
-	// transport. The silence watchdog compares it against the host's last
-	// uplink frame: a request still unanswered after RelayAckTimeout while
-	// the host has sent nothing since is not "a slow endpoint", it is a
-	// dead uplink.
-	dispatchedAt time.Time
-	// ackTimeout is this request's budget for the silence check (0 =
-	// exempt). Long-running endpoints opt out: they legitimately take
-	// minutes, so an absent response proves nothing on its own.
-	ackTimeout time.Duration
 
 	// Chunked relay response assembly (see Hub.RespondChunk). A body over
 	// the host's relay chunk size arrives as several `respond` frames of
@@ -240,60 +184,53 @@ type pendingReq struct {
 	chunkStatusSet bool
 }
 
+// hostState is one paired host. Lock order is always h.mu → hs.mu; nothing
+// takes them the other way.
 type hostState struct {
 	info  HostInfo
 	token string
-	conn  *streamConn
 
-	// mu guards seq/evBuf ONLY (the per-host data plane). The global h.mu
-	// protects the registry (hosts/tokens maps, conn, info, pending) —
-	// event ingestion no longer serializes every host behind it. Lock
-	// order is always h.mu → hs.mu; nothing takes them the other way.
+	// Attachment, guarded by h.mu. online is derived: a host is online while
+	// a session is attached. proto is the (hostId, epoch) protocol state; it
+	// outlives the transport so a same-epoch reconnect resumes at the same
+	// watermarks, and a new epoch replaces it.
+	session *session
+	proto   *sessionProto
+	// epoch mirrors proto.epoch for the event ingest fast path, which checks
+	// it under hs.mu so a superseded epoch's frames cannot land in the new
+	// epoch's buffers.
+	epoch atomic.Uint64
+	// upAcked mirrors the proto's up watermark for LastSeq / SeqByHost, which
+	// must answer while the host is offline too.
+	upAcked atomic.Uint64
+
+	// audienceGen stamps every absolute audience snapshot for this host and
+	// is never reset by an epoch change; audienceKey dedupes an unchanged
+	// snapshot. Guarded by h.mu.
+	audienceGen uint64
+	audienceKey string
+
+	// mu guards evBuf only (the per-host data plane). The global h.mu
+	// protects the registry; event ingestion does not serialize every host
+	// behind it.
 	mu sync.Mutex
 
-	// seq is every event sequence number seen from this host (the HIGHEST,
-	// even with holes behind it); evBuf is a bounded ring of recent events
-	// (with seq injected) so browsers can pull gaps:
-	// GET /api/events?host=X&after=SEQ.
-	//
-	// acked is the number this host may treat as DELIVERED: 1..acked all
-	// arrived. It is what hello/ping/pong advertise, because the host
-	// deletes its replay copies and anchors its repairs there — reporting
-	// the highest number would let one lost frame erase the events it
-	// never received. It advances only while the next seq is already in
-	// hand; the numbers past the hole wait in `gapped` (see
-	// gateSeqLocked).
-	seq    uint64
-	acked  uint64
-	gapped map[uint64]struct{}
-	evBuf  []Event
+	// evBuf is a bounded ring of recent events (with seq injected) so browsers
+	// can pull gaps: GET /api/events?host=X&after=SEQ.
+	evBuf []Event
 	// evBufBytes is the byte weight of evBuf (raw wire bytes on the raw
 	// path). Count alone is not a memory bound — one giant tool result can
 	// be 8MB — so the gap-pull ring is also capped by evBufByteCap.
-	// Guarded by hs.mu, alongside evBuf.
 	evBufBytes int
 	// evBufFuseLogged keeps the over-cap trim from logging on every event.
-	// Guarded by hs.mu.
 	evBufFuseLogged bool
-	// lastUplink is the last JSON frame from this host, of any type,
-	// including a pong. The per-request silence check reads it. It is
-	// not LastSeen: a pong proves the socket is carrying the host's
-	// read loop, not that the registry snapshot is fresh. Guarded by
-	// h.mu, same as info.LastSeen.
-	lastUplink time.Time
-	// evBufEpoch is bumped on disconnect (schedule clear) and reconnect
-	// (cancel clear). A delayed clear only runs if the epoch still matches.
+	// evBufEpoch is bumped on detach (schedule clear) and attach (cancel
+	// clear). A delayed clear only runs if the epoch still matches.
 	evBufEpoch uint64
 
-	// fanout decouples uplink ingestion from browser fan-out. The host read
+	// fanout decouples uplink ingestion from browser fan-out. The session
 	// loop only appends here (bounded, never blocks); a per-host goroutine
-	// drains it into h.broadcast. Without this the reader would run the
-	// per-subscriber fan-out itself — and a stalled reader stops draining the
-	// host socket, back-pressuring the host's entire uplink (events, responds,
-	// host_status) for every browser, not just the slow one.
-	//
-	// fanout is created (and its goroutine started) by fanoutOnce on the
-	// first enqueue, so hosts that never receive an event cost nothing.
+	// drains it into h.broadcast.
 	fanout     chan Event
 	fanoutOnce sync.Once
 	// fanoutDropped counts events dropped because the fan-out queue was
@@ -301,12 +238,6 @@ type hostState struct {
 	// recovers it — this is not a loss, just deferred delivery. Read by the
 	// diagnostics snapshot (Hub.Stats); never reset.
 	fanoutDropped atomic.Uint64
-	// watermarkJumps counts maxGappedSeq overflows: the hub declared a
-	// missing range lost and stepped the watermark over it. Unlike
-	// fanoutDropped this IS data loss for the gap-pull buffer (the host
-	// deleted the replay copies below the new watermark), so each jump gets
-	// an unconditional log line and this counter. Never reset.
-	watermarkJumps atomic.Uint64
 }
 
 // fanoutDropCount is the read side of fanoutDropped for diagnostics.
@@ -314,20 +245,8 @@ func (hs *hostState) fanoutDropCount() uint64 {
 	return hs.fanoutDropped.Load()
 }
 
-// lastSeq is the diagnostics read side of hs.seq (guarded by hs.mu).
-func (hs *hostState) lastSeq() uint64 {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	return hs.seq
-}
-
-// ackedSeq is the diagnostics/ping read side of hs.acked (guarded by hs.mu):
-// the highest seq for which 1..N all arrived.
-func (hs *hostState) ackedSeq() uint64 {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	return hs.acked
-}
+// lastSeq is the highest applied up seq, i.e. the delivery watermark.
+func (hs *hostState) lastSeq() uint64 { return hs.upAcked.Load() }
 
 // eventBufferLen is the current gap-pull buffer depth (safe for the
 // diagnostics path; the registry itself stays private).
@@ -342,14 +261,6 @@ func (hs *hostState) eventBufferBytes() int {
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
 	return hs.evBufBytes
-}
-
-// gappedCount is the number of parked out-of-order seqs, i.e. holes the
-// cumulative watermark is still waiting on (diagnostics only).
-func (hs *hostState) gappedCount() int {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	return len(hs.gapped)
 }
 
 // fanoutDepth is the current fan-out backlog depth (diagnostics only).
@@ -405,35 +316,13 @@ type Hub struct {
 	subs    atomic.Pointer[[]*feSubscriber]
 	pending map[string]map[string]*pendingReq
 
-	nextReq    atomic.Int64
-	nextConnID atomic.Int64
+	nextReq atomic.Int64
 	// nextSubID stamps each browser subscriber with a stable id so the
 	// admin's subscriber panel can point at one row (hello carries it).
 	nextSubID atomic.Int64
-	// subsGen stamps every subscriber-count frame so hosts can discard an
-	// out-of-order delivery (see notifyHostsSubscribers). It is used for
-	// subscriber counts only; viewing sets have their own stamp below.
-	subsGen atomic.Uint64
-	// viewGen stamps every viewing-set frame (see notifyHostsViewing).
-	// Keeping it separate from subsGen means the two absolute-state
-	// families never interleave: a viewing ping cannot advance the
-	// subscriber high-water a host compares against.
-	viewGen atomic.Uint64
 	// lastViewWidenLog rate-limits the "widened to all" warning (guarded
 	// by h.mu).
 	lastViewWidenLog time.Time
-	// lastNotifiedSubs is the count each host was last told (hostID →
-	// count), used to skip no-op resends. Missing key = never notified.
-	lastNotifiedSubs map[string]int
-	// lastViewing is the viewing set each host was last told (hostID →
-	// canonical frame payload), used to skip no-op resends the same way.
-	// See notifyHostsViewing.
-	lastViewing map[string]string
-	// unacked maps hostID → kind → the newest edge-triggered state frame
-	// that host has not confirmed with `state_ack`. Only connections that
-	// negotiated state_ack have entries; the periodic ping stays the repair
-	// path for everyone else. See trackUnackedLocked.
-	unacked map[string]map[string]*unackedState
 	// lastFESubs is the browser subscriber total last pushed to FE pages
 	// (see notifySubscribersCount); subsSeen marks whether any push
 	// happened yet. The top bar renders this number, so a reconnect storm
@@ -893,108 +782,6 @@ func (h *Hub) StartPairingCodeMaintainer(ctx context.Context) {
 	}()
 }
 
-// HostSilenceTimeout is how long a host may go without an application
-// uplink before the registry marks it offline.
-//
-// Application uplinks are host_status, events, respond, state_ack and
-// seq_reset. A pong does not count: the WebSocket control pong only
-// proves the socket library is reading, and the JSON pong only proves
-// the read loop answered a ping. The socket probe (WS) and the read
-// deadline (QUIC) own that question. The sweep owns "is the registry
-// snapshot still being refreshed".
-//
-// On a hub that advertises probe, host_status is every 15s, so 30s is
-// two beats: one lost beat does not flap a quiet host. QUIC keeps the
-// 5s beat; the same threshold is simply looser there. hello.idleTimeout
-// is this value plus two sweep intervals, so the registry flips before
-// the host tears the session down.
-//
-// Var (not const) so tests can shrink it.
-var HostSilenceTimeout = 30 * time.Second
-
-// LivenessCheckInterval paces the sweep. 3s keeps the worst case from "last
-// uplink frame" to "marked offline" at HostSilenceTimeout + one tick = 33s,
-// inside the host's advertised 36s downlink watchdog: the registry must
-// always flip BEFORE the host gives up, or browsers keep seeing a host that
-// is already reconnecting. Var (not const) so tests can shrink it, the same
-// reason HostSilenceTimeout is one.
-var LivenessCheckInterval = 3 * time.Second
-
-// StartLivenessWatchdog marks silent hosts offline and fails their pending
-// relayed requests, so a browser learns the host is unreachable instead of
-// waiting out RelayTimeout. It exists because the transport-level read
-// timeout only fires once the socket read actually errors: a half-open link
-// whose writes still land in a kernel buffer (the exact shape of a
-// blackholed uplink) can keep the hub believing the host is there.
-//
-// Safe to call once per Hub. It stops when ctx is cancelled; a caller that
-// rewrites the package knobs (tests do) must wait for that stop, so this
-// records completion in the returned func.
-func (h *Hub) StartLivenessWatchdog(ctx context.Context) (wait func()) {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(LivenessCheckInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				h.sweepStaleHosts()
-			}
-		}
-	}()
-	return func() { <-done }
-}
-
-// sweepStaleHosts is one pass of StartLivenessWatchdog: every host still
-// marked online whose LastSeen is older than HostSilenceTimeout is treated
-// as disconnected. The registry flips and hosts_changed broadcasts; the
-// transport is left alone (its own read timeout owns closing it), but the
-// conn is suspended so no downlink write can reach a wedged peer.
-//
-// We deliberately keep hs.conn instead of nilling it: markHostAliveLocked
-// requires a conn to restore Online, and the transport cannot re-attach
-// itself — nilling would strand a host that is merely silent until it
-// reconnects. Suspending gives the same write isolation while the next
-// uplink frame (heartbeat or event) clears the flag and restores the host.
-func (h *Hub) sweepStaleHosts() {
-	cutoff := time.Now().Add(-HostSilenceTimeout)
-	type staleHost struct {
-		id    string
-		epoch uint64
-	}
-	var stale []staleHost
-	h.mu.Lock()
-	for id, hs := range h.hosts {
-		if !hs.info.Online {
-			continue
-		}
-		if hs.info.LastSeen.After(cutoff) {
-			continue
-		}
-		hs.info.Online = false
-		if hs.conn != nil {
-			hs.conn.suspended = true
-		}
-		// Same registry transition as disconnectStream: fail pending work,
-		// bump the epoch, and let the grace timer clear the replay buffer.
-		hs.evBufEpoch++
-		// Caller must hold h.mu (see failPendingLocked).
-		h.failPendingLocked(id)
-		stale = append(stale, staleHost{id: id, epoch: hs.evBufEpoch})
-	}
-	if len(stale) > 0 {
-		h.broadcast(hostsChanged())
-	}
-	h.mu.Unlock()
-	for _, s := range stale {
-		h.scheduleEvBufClear(s.id, s.epoch)
-		log.Printf("[capri-hub] host %s: no uplink for %s, marked offline", s.id, HostSilenceTimeout)
-	}
-}
-
 // Pair exchanges a pairing code for a host token. Re-pairing an existing
 // hostId revokes every previous token for that host (not only hs.token),
 // so a restart that left multiple map entries cannot keep old credentials
@@ -1081,11 +868,13 @@ func (h *Hub) Unpair(hostID string) error {
 	}
 	h.revokeTokensForHostLocked(hostID)
 	h.failPendingLocked(hostID)
-	hs.conn = nil
+	if hs.session != nil {
+		// The transport is left to unwind on its own; its detach finds the
+		// host gone and does nothing.
+		hs.session.requestStop(wire.CloseAuth)
+		hs.session = nil
+	}
 	delete(h.hosts, hostID)
-	delete(h.lastNotifiedSubs, hostID)
-	delete(h.lastViewing, hostID)
-	delete(h.unacked, hostID)
 	hs.mu.Lock()
 	hs.evBuf = nil
 	hs.evBufBytes = 0
@@ -1150,89 +939,107 @@ func (h *Hub) HostIDForToken(token string) (string, bool) {
 	return hid, ok
 }
 
-// ── host connections ──────────────────────────────────────────────────
+// ── host sessions ─────────────────────────────────────────────────────
 
-// ConnectStream registers the host's outbound stream; the returned stop
-// func must be called when the connection ends (it fails all pending
-// relayed requests for that host when this conn is still current).
+// attach installs a hello's session in the registry and returns the hello_ack
+// it must answer with. old is the session this one supersedes (same host, any
+// epoch); its loop is stopped by the caller.
 //
-// If the host already has a live stream, the new connection supersedes
-// it: in-flight pending requests are failed immediately so they do not
-// hang until RelayTimeout (the old stop is a no-op once superseded).
-//
-// Confirmed state delivery (`state_ack`) is part of the protocol, so every
-// connection tracks unconfirmed absolute-state frames from the start.
-func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*streamConn, func(), error) {
+// A same-epoch reconnect resumes the existing protocol state, so the peer's
+// unacked log is replayed against the same watermarks. A new epoch resets both
+// sequence spaces and the gap-pull buffer, sends /ws/fe subscribers
+// subscribed{seq:0} before any new-epoch event, and leaves the per-host
+// audience generation increasing.
+func (h *Hub) attach(hostID string, epoch uint64, deflate bool) (s *session, old *session, ack wire.HelloAck, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
 	if hs == nil {
-		return nil, nil, ErrHostUnknown
+		return nil, nil, wire.HelloAck{}, ErrHostUnknown
 	}
-	// Supersede: fail requests that were written to the previous stream
-	// (or still waiting) — the old connection's stop will not clear them.
-	if hs.conn != nil {
-		h.failPendingLocked(hostID)
+	old = hs.session
+	if hs.proto == nil || hs.proto.epoch != epoch {
+		// Requests dispatched in the old sequence space can never be
+		// answered there; the new epoch's sender starts from zero, so fail
+		// them instead of leaving the browser waiting for RelayTimeout.
+		if hs.proto != nil {
+			h.failPendingLocked(hostID)
+		}
+		hs.proto = newSessionProto(epoch)
+		hs.epoch.Store(epoch)
+		hs.upAcked.Store(0)
+		hs.mu.Lock()
+		hs.evBuf = nil
+		hs.evBufBytes = 0
+		hs.mu.Unlock()
+		// The FE watermark is per host, so it must be told about the restart
+		// before it sees an event numbered in the new space.
+		h.broadcastSeqReset(hostID)
 	}
-	// Cancel any pending grace-period buffer clear from a prior disconnect.
-	hs.evBufEpoch++
-	conn := &streamConn{id: h.nextConnID.Add(1), write: write}
-	// A new transport starts from the hello, which already carries the
-	// current absolute state. Entries left from the previous session are
-	// stale by definition (their gen is older than that hello's) and must
-	// not be retransmitted over the new connection.
-	delete(h.unacked, hostID)
-	hs.conn = conn
+	s = &session{
+		h:      h,
+		hostID: hostID,
+		epoch:  epoch,
+		proto:  hs.proto,
+		wake:   make(chan struct{}, 1),
+		stop:   make(chan struct{}),
+	}
+	hs.session = s
 	hs.info.Online = true
-	now := time.Now()
-	hs.info.LastSeen = now
-	hs.lastUplink = now
+	hs.info.LastSeen = time.Now()
+	// A pending grace-period clear of the gap-pull buffer must not run while
+	// this session is attached.
+	hs.evBufEpoch++
+
+	aud, _ := h.audienceLocked(hostID)
+	liveness := SessionLiveness
+	limits := wire.DefaultLimits
+	caps := wire.Caps{Deflate: deflate}
+	ack = wire.HelloAck{
+		Epoch:    epoch,
+		AckUp:    hs.proto.upAcked(),
+		AckDown:  hs.proto.downAcked(),
+		Audience: &aud,
+		Liveness: &liveness,
+		Limits:   &limits,
+		Caps:     &caps,
+	}
 	h.broadcast(hostsChanged())
-	return conn, func() { h.disconnectStream(hostID, conn) }, nil
+	return s, old, ack, nil
 }
 
-func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
+// detach clears the attachment. A superseded session (a newer one already
+// holds the host) must not touch the registry or the pending table; the
+// replacement owns both from the moment it attached.
+func (h *Hub) detach(s *session) {
 	h.mu.Lock()
-	hs := h.hosts[hostID]
-	if hs == nil || hs.conn != conn {
+	hs := h.hosts[s.hostID]
+	if hs == nil || hs.session != s {
 		h.mu.Unlock()
-		return // superseded by a newer connection
+		return
 	}
-	hs.conn = nil
-	wasOnline := hs.info.Online
+	hs.session = nil
 	hs.info.Online = false
-	// Keep evBuf for EventBufGrace so short disconnects can still be
-	// gap-pulled; schedule a clear that no-ops if the host reconnects.
+	hs.info.LastSeen = time.Now()
 	hs.evBufEpoch++
 	epoch := hs.evBufEpoch
-	h.failPendingLocked(hostID)
-	if wasOnline {
-		// A sweep may have reported this host offline already; a second
-		// hosts_changed for the same state is pure churn.
-		h.broadcast(hostsChanged())
-	}
+	h.failPendingLocked(s.hostID)
+	h.broadcast(hostsChanged())
 	h.mu.Unlock()
 
-	h.scheduleEvBufClear(hostID, epoch)
+	// Keep the gap-pull buffer for EventBufGrace: a browser can still fill a
+	// hole left by a short disconnect.
+	h.scheduleEvBufClear(s.hostID, epoch)
 }
 
-// connDetachedLocked reports whether hs has no writable transport: either
-// it never reconnected or the sweep suspended a silent one. Caller holds
-// h.mu.
-func (h *Hub) connDetachedLocked(hs *hostState) bool {
-	return hs.conn == nil || hs.conn.suspended
-}
-
-// scheduleEvBufClear clears hostID's replay buffer after EventBufGrace
-// unless the host has reattached (or the epoch moved on) in the meantime.
-// The buffer survives a short disconnect so a reconnecting host can still
-// be gap-pulled; a suspended sweep uses the same path.
+// scheduleEvBufClear clears hostID's replay buffer after EventBufGrace unless
+// the host has reattached (or the epoch moved on) in the meantime.
 func (h *Hub) scheduleEvBufClear(hostID string, epoch uint64) {
 	clear := func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		hs := h.hosts[hostID]
-		if hs == nil || !h.connDetachedLocked(hs) || hs.evBufEpoch != epoch {
+		if hs == nil || hs.session != nil || hs.evBufEpoch != epoch {
 			return
 		}
 		hs.mu.Lock()
@@ -1248,127 +1055,35 @@ func (h *Hub) scheduleEvBufClear(hostID string, epoch uint64) {
 	time.AfterFunc(grace, clear)
 }
 
-// IsCurrentConn reports whether connID is the host's live stream.
-// Transport loops check it before processing each uplink frame: after a
-// reconnect — or a duplicate host process pairing under the same hostId
-// — the superseded connection must not keep feeding the hub, or its
-// events would interleave with the new connection's seq space (both
-// count from 1) and the stale-seq gate would drop events from whichever
-// arrives later. The stale transport drops itself on its next frame.
-func (h *Hub) IsCurrentConn(hostID string, conn *streamConn) bool {
+// noteUpAck mirrors the receiver's watermark for readers that outlive the
+// session (LastSeq, SeqByHost, the FE hello).
+func (h *Hub) noteUpAck(s *session, ack uint64) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	hs := h.hosts[hostID]
-	return hs != nil && hs.conn == conn
-}
-
-// HostWritable reports whether the hub may still write downlink frames to
-// conn. A transport the liveness sweep suspended is current (it can recover
-// on the next uplink frame) but must not receive app-level writes, because
-// its peer is presumed wedged. Transport loops use this before pinging.
-func (h *Hub) HostWritable(hostID string, conn *streamConn) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	hs := h.hosts[hostID]
-	return hs != nil && hs.conn == conn && !conn.suspended
-}
-
-// dispatchAckTimeout returns the silence-check budget for a relayed path,
-// or 0 to exempt it.
-//
-// The rule: only endpoints the HOST answers by itself — from memory, or
-// after an accepted/asynchronous hand-off — qualify. A prompt is accepted
-// in milliseconds (the turn runs in the background), and approvals /
-// forwarded questions resolve against the host's in-memory request
-// registry, so silence there proves the uplink is dead. Long jobs
-// legitimately take minutes and must keep their full RelayTimeout —
-// applying the budget to them would fail healthy work on an
-// idle-but-connected host the moment the 6s mark passed.
-//
-// Anything that blocks on an agent RPC is excluded even when its 200 looks
-// synchronous to the UI: set-model / set-mode / cancel / toggle-plan-mode
-// wait on a 30s agent round-trip (or boot the agent first), so a model
-// switch queued behind a running turn can exceed the budget while the host
-// is perfectly alive.
-//
-// The queue endpoints are included because the host answers them without
-// waiting on the agent (XaiNotify: notify and return). A queued-message
-// delete or a mid-turn interjection that never acknowledges is the same
-// failure as an unacknowledged prompt, and leaving it on RelayTimeout would
-// keep the UI showing a queue action that never happened.
-//
-// Maintenance note: this path list is hand-maintained against the host's
-// endpoint set. When a host endpoint changes how it answers (accepted vs.
-// blocking) the list must be re-checked; anything not listed falls back to
-// RelayTimeout.
-func dispatchAckTimeout(path string) time.Duration {
-	switch path {
-	case "/api/prompt",
-		"/api/queue/interject",
-		"/api/queue/remove",
-		"/api/queue/clear",
-		"/api/queue/reorder",
-		"/api/queue/edit",
-		"/api/queue/hold-edit",
-		"/api/queue/release-edit",
-		// Approvals and forwarded x.ai questions: the host resolves these
-		// against its in-memory clientReqs registry and returns immediately
-		// (RespondPermissionWithMeta / RespondClientRequest), so an absent
-		// ack is a dead link — not a slow agent. This is the worst place to
-		// guess wrong: the agent sits waiting on the answer, and a lost
-		// response looks to the user like a click that did nothing.
-		"/api/permission-response",
-		"/api/client-response":
-		return RelayAckTimeout
+	if hs := h.hosts[s.hostID]; hs != nil && hs.session == s {
+		if ack > hs.upAcked.Load() {
+			hs.upAcked.Store(ack)
+		}
 	}
-	return 0
-}
-
-// failIfUplinkSilent is the per-request fast-fail check: it fails reqID
-// (closing pr.done) when the request has waited past its ack budget and the
-// host has sent no uplink frame since the request was dispatched. Returns
-// whether it failed the request.
-//
-// "No frame since dispatch" is the whole point, and the frame may be a
-// pong. LastSeen is the registry clock and deliberately ignores pongs,
-// so a quiet host that is still answering pings must not 503 a request
-// it is about to answer. Only this request is failed.
-func (h *Hub) failIfUplinkSilent(hostID, reqID string, pr *pendingReq) bool {
-	if pr.ackTimeout <= 0 {
-		return false
-	}
-	now := time.Now()
-	if now.Sub(pr.dispatchedAt) < pr.ackTimeout {
-		return false
-	}
-	h.mu.Lock()
-	hs := h.hosts[hostID]
-	if hs == nil || !hs.info.Online || hs.lastUplink.After(pr.dispatchedAt) {
-		h.mu.Unlock()
-		return false
-	}
-	// The host has not spoken since we handed it the request: stop
-	// waiting — for THIS request only. A request that happens to meet the
-	// silence condition does not prove anything about the others: a slow
-	// endpoint on a live host would otherwise 503 unrelated in-flight
-	// work. Online stays untouched as well; the liveness sweep owns that
-	// verdict.
-	m := h.pending[hostID]
-	if m == nil || m[reqID] != pr {
-		// Already answered/dropped by a concurrent path; closing pr.done
-		// twice would panic.
-		h.mu.Unlock()
-		return false
-	}
-	delete(m, reqID)
-	if len(m) == 0 {
-		delete(h.pending, hostID)
-	}
-	close(pr.done)
 	h.mu.Unlock()
-	log.Printf("[capri-hub] host %s: no uplink since req %s dispatched (%s), failing that request",
-		hostID, reqID, pr.ackTimeout)
-	return true
+}
+
+// heartbeatStatus snapshots the registry view a heartbeat carries. The shared
+// envelope gives hb a status field in both directions; on the way down it is
+// informational — the host's own last report, never a command.
+func (h *Hub) heartbeatStatus(hostID string) wire.HeartbeatStatus {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		return wire.HeartbeatStatus{}
+	}
+	return wire.HeartbeatStatus{
+		Ready:        hs.info.Ready,
+		Busy:         hs.info.Busy,
+		Booting:      hs.info.Booting,
+		PendingCount: hs.info.PendingCount,
+		Port:         hs.info.Port,
+	}
 }
 
 // failPendingLocked closes and drops every pending request for hostID.
@@ -1381,44 +1096,19 @@ func (h *Hub) failPendingLocked(hostID string) {
 	delete(h.pending, hostID)
 }
 
-// markHostAliveLocked refreshes LastSeen for an uplink frame and restores
-// Online when the host still has a transport attached. The sweep (and a
-// momentary silence) can mark a healthy host offline; if only a reconnect
-// could clear the flag, a host whose link is fine would stay offline
-// forever, since it never reconnects. Returns true when Online flipped, so
-// the caller can broadcast hostsChanged. Caller must hold h.mu.
-func (h *Hub) markHostAliveLocked(hs *hostState) bool {
-	now := time.Now()
-	hs.info.LastSeen = now
-	hs.lastUplink = now
-	if hs.conn == nil {
-		return false
-	}
-	if hs.conn.suspended {
-		// Any uplink frame proves the transport is still delivering: undo
-		// the sweep's suspension and cancel its pending buffer clear.
-		hs.conn.suspended = false
-		hs.evBufEpoch++
-	}
-	if hs.info.Online {
-		return false
-	}
-	hs.info.Online = true
-	return true
-}
-
-// NoteUplink records that a JSON frame arrived from the host. Pongs and
-// pings count: the per-request silence check uses this, and a blackholed
-// uplink is exactly "nothing came back". It does not move LastSeen and
-// does not restore Online. A control-frame pong never gets here; the
-// socket probe handles that without touching the registry.
-func (h *Hub) NoteUplink(hostID string) {
+// failRequest fails one pending relayed request with an HTTP status. It is the
+// session's per-request deadline path (a dispatch the host never acked), so
+// other requests and the session itself are untouched.
+func (h *Hub) failRequest(hostID, reqID string, status int, message string) {
 	h.mu.Lock()
-	hs := h.hosts[hostID]
-	if hs != nil {
-		hs.lastUplink = time.Now()
-	}
+	pr := h.takePendingLocked(hostID, reqID)
 	h.mu.Unlock()
+	if pr == nil {
+		return
+	}
+	pr.chunks = nil
+	body, _ := json.Marshal(map[string]any{"ok": false, "error": message})
+	pr.resp <- RelayResponse{Status: status, Body: body}
 }
 
 // evSeq normalizes an event's seq across Go-native (uint64) and
@@ -1451,12 +1141,11 @@ type HostStatusPatch struct {
 	Port         *int
 }
 
-// UpdateHostStatus applies a control-plane host_status frame (no seq).
-// Always refreshes LastSeen; on any visible-field flip it updates the
-// registry entry and broadcasts hosts_changed. Returns false for unknown
-// hosts. Does not advance the per-host event seq or touch the transcript
-// buffer. Port flips are also persisted (FE may need the port after a
-// hub restart before the next heartbeat).
+// UpdateHostStatus applies the status snapshot carried by a host heartbeat.
+// On any visible-field flip it updates the registry entry and broadcasts
+// hosts_changed. Returns false for unknown hosts. Does not touch the
+// transcript buffer. Port flips are also persisted (the FE may need the port
+// after a hub restart before the next heartbeat).
 func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 	h.mu.Lock()
 	hs := h.hosts[hostID]
@@ -1464,7 +1153,7 @@ func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 		h.mu.Unlock()
 		return false
 	}
-	changed := h.markHostAliveLocked(hs)
+	changed := false
 	portChanged := false
 	if p.Ready != nil && *p.Ready != hs.info.Ready {
 		hs.info.Ready = *p.Ready
@@ -1501,167 +1190,6 @@ func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 	return true
 }
 
-// ResetHostSeq clears the per-host event counters, the out-of-order set (and
-// its seal) and the gap-pull buffer. Used when a host process restarts: bridge
-// seq restarts at 1 while the hub still holds the previous process's numbers —
-// without a reset, the hub would skip fan-out for every new event with s <= the
-// old watermark.
-// Does not change Ready; like every uplink frame it refreshes liveness and
-// restores Online (broadcasting hosts_changed if that flipped).
-func (h *Hub) ResetHostSeq(hostID string) bool {
-	h.mu.Lock()
-	hs := h.hosts[hostID]
-	if hs == nil {
-		h.mu.Unlock()
-		return false
-	}
-	flipped := h.markHostAliveLocked(hs)
-	h.mu.Unlock()
-	if flipped {
-		h.broadcast(hostsChanged())
-	}
-	hs.mu.Lock()
-	prev := hs.seq
-	prevAck := hs.acked
-	hs.seq = 0
-	hs.acked = 0
-	hs.gapped = nil
-	hs.evBuf = nil
-	hs.evBufBytes = 0
-	hs.mu.Unlock()
-	if prev > 0 {
-		log.Printf("[capri-hub] host %s seq reset (was %d, contiguous %d) — host process restart", hostID, prev, prevAck)
-	}
-	return true
-}
-
-// appendEvent is the per-host data-plane section of event ingest: seq gating
-// (host-provided preserved, stale/duplicate skipped), hostId/hostName
-// tagging, gap-pull buffering and amortized compaction. Returns the tagged
-// event to fan out, or nil when the event was stale/duplicate (accepted,
-// LastSeen already refreshed). Runs under hs.mu only.
-func (hs *hostState) appendEvent(cp Event, hostID, hostName string) Event {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	incoming := evSeq(cp)
-	assigned, ok := hs.gateSeqLocked(hostID, incoming)
-	if !ok {
-		return nil
-	}
-	cp["seq"] = assigned
-	cp["hostId"] = hostID
-	cp["hostName"] = hostName
-	hs.bufferEventLocked(hostID, cp)
-	return cp
-}
-
-// maxGappedSeq bounds the out-of-order set the cumulative watermark has to
-// remember. The host keeps its unacked replay tail and ends the session when
-// it outgrows replayHardCap, so anything near this bound is already a broken
-// host; the cap only keeps a hostile or wedged peer from growing hub memory.
-const maxGappedSeq = 8192
-
-// gateSeqLocked applies the per-host seq gate: the host's seq is preserved
-// (stale/duplicate rejected). Every uplink event carries one — the host's
-// event bus assigns it before framing — so a missing seq is a protocol
-// violation, not something the hub invents a number for.
-//
-// Besides the stale check it maintains the CUMULATIVE watermark hs.acked:
-// everywhere the wire says `seq = N` (hello, ping, the subscribed ack) it
-// means "1..N all arrived". A number above acked + 1 is a hole, so it parks in
-// hs.gapped until the numbers below it show up — the watermark then walks over
-// the whole run at once. A number between the watermark and the highest one is
-// a hole FILL and must be accepted: rejecting it as "not newer than the last
-// seen" is how a hole could never close.
-//
-// Returns the seq to stamp on the event — always the seq the host sent, so
-// the map and the wire bytes agree even for a hole fill — and ok=false when
-// the event was stale/duplicate (skip fan-out). hs.seq is the highest number
-// seen and only feeds diagnostics (HighestSeq); it must never be stamped on
-// an event, or a hole fill would be indexed under the wrong number and a
-// gap-pull by (hostId,seq) would drop it as a duplicate of the current high
-// water. The caller must hold hs.mu.
-func (hs *hostState) gateSeqLocked(hostID string, incoming uint64) (assigned uint64, ok bool) {
-	if incoming == 0 {
-		Verbosef("[capri-hub] host %s event without seq dropped", hostID)
-		return 0, false
-	}
-	if incoming <= hs.acked {
-		if incoming < hs.acked {
-			Verbosef("[capri-hub] host %s event seq regressed: got %d, delivered through %d (skip fan-out)", hostID, incoming, hs.acked)
-		}
-		return 0, false
-	}
-	if _, dup := hs.gapped[incoming]; dup {
-		return 0, false
-	}
-	// A number at or below the highest seen is a hole fill, not staleness:
-	// it is between the delivery watermark and the highest number, and its
-	// arrival is exactly what lets the watermark advance.
-	if incoming > hs.seq {
-		hs.seq = incoming
-	}
-	if hs.acked == 0 {
-		// First event of this epoch (fresh hub, or just past seq_reset):
-		// there is no history to compare against, and the host can only
-		// replay what its ring still holds. Its first number therefore
-		// defines the baseline — parking everything above 1 in `gapped`
-		// would freeze the watermark (and with it the host's compaction)
-		// for the life of the session.
-		hs.acked = incoming - 1
-	}
-	if incoming == hs.acked+1 {
-		hs.acked = incoming
-		hs.drainGappedLocked()
-		return incoming, true
-	}
-	if hs.gapped == nil {
-		hs.gapped = make(map[uint64]struct{})
-	}
-	hs.gapped[incoming] = struct{}{}
-	if len(hs.gapped) > maxGappedSeq {
-		// The out-of-order set is beyond anything a healthy host produces
-		// (its own replayHardCap ends the session far earlier). Freezing the
-		// watermark here would be worse than losing the hole: the host would
-		// stop compacting, outgrow its ring, reconnect, replay from the
-		// frozen number — and the hub would still be frozen, forever. Give up
-		// on the missing range instead, exactly like the FE's PENDING_SEQ_CAP:
-		// declare everything below the lowest parked number lost, then drain
-		// what is parked. The FE sees the same hole it would have seen anyway
-		// and rebuilds from history.
-		lowest := incoming
-		for s := range hs.gapped {
-			if s < lowest {
-				lowest = s
-			}
-		}
-		prev := hs.acked
-		hs.acked = lowest
-		delete(hs.gapped, lowest)
-		hs.drainGappedLocked()
-		hs.watermarkJumps.Add(1)
-		// Data loss, not a diagnostic detail: the host has already deleted
-		// the replay copies below the new watermark, so this range is gone
-		// from the gap-pull buffer for good.
-		log.Printf("[capri-hub] host %s: out-of-order set over %d, treating seq %d..%d as lost and moving the watermark %d → %d",
-			hostID, maxGappedSeq, prev+1, lowest-1, prev, hs.acked)
-	}
-	return incoming, true
-}
-
-// drainGappedLocked walks the watermark over every parked number that is now
-// contiguous. Caller holds hs.mu, and hs.acked was just advanced.
-func (hs *hostState) drainGappedLocked() {
-	for {
-		next := hs.acked + 1
-		if _, ok := hs.gapped[next]; !ok {
-			return
-		}
-		delete(hs.gapped, next)
-		hs.acked = next
-	}
-}
-
 // eventBytes is one buffered event's byte weight: the canonical wire bytes
 // on the raw path (the only one production uses), else the marshaled map.
 func eventBytes(ev Event) int {
@@ -1684,18 +1212,17 @@ func eventsBytes(evs []Event) int {
 }
 
 // bufferEventLocked appends ev to the gap-pull ring, keeping the ring in
-// ascending seq order, and compacts at the high-water mark. Most events are
-// appends (the common path); a hole fill lands behind the tail and is spliced
-// in, because EventsAfter binary-searches for the first seq > after and a
-// misordered ring would hide events from a gap-pull. The copy (not a reslice)
+// ascending seq order, and compacts at the high-water mark. The receiver
+// delivers events in contiguous runs, so appends are the common path; the
+// splice keeps the ring ordered for EventsAfter's binary search even if a
+// caller ever hands over a non-monotonic batch. The copy (not a reslice)
 // keeps dropped Event maps from staying reachable via the old backing array.
 //
 // The ring is bounded by evBufByteCap as well as by eventBufCap: one giant
 // tool result must not pin hundreds of MB per host. Over the byte cap the
-// OLDEST events are dropped. That touches only the gap-pull copy — hs.acked,
-// hs.seq and the parked out-of-order set stay as they are, so the delivery
-// watermark keeps advancing and a FE that missed the dropped range rebuilds
-// it from host history. The caller must hold hs.mu.
+// OLDEST events are dropped. That touches only the gap-pull copy — the
+// delivery watermark keeps advancing and a FE that missed the dropped range
+// rebuilds it from host history. The caller must hold hs.mu.
 func (hs *hostState) bufferEventLocked(hostID string, ev Event) {
 	hs.evBufBytes += eventBytes(ev)
 	if n := len(hs.evBuf); n == 0 || evSeq(hs.evBuf[n-1]) < evSeq(ev) {
@@ -1979,61 +1506,48 @@ func spliceRawEvent(raw, idJSON, nameJSON []byte) json.RawMessage {
 	return json.RawMessage(out)
 }
 
-// RegisterRawEvents ingests host events still in their original wire form
-// (host events frames): each body stays json.RawMessage, only the few fields
-// the hub itself needs are shallow-parsed, and the FE-bound bytes are spliced
-// once instead of decode-map + re-encode per subscriber. Every event carries
-// the host's own seq; non-object entries (e.g. null) are skipped. Returns
-// false only for unknown hosts.
-func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
-	// Same locking shape as appendEvent: global lock for lookup +
-	// liveness only; seq/buffer under the per-host lock; fan-out
-	// lock-free (see hostState.mu).
+// ingestRawEvents applies one contiguous run of host events in their original
+// wire form: each body stays json.RawMessage, only the fields the hub needs are
+// shallow-parsed, and the FE-bound bytes are spliced once instead of
+// decode-map + re-encode per subscriber.
+//
+// The receiver has already validated that the run is gapless and in order
+// (wire.ValidateEvents), so seqs are used verbatim and nothing here may skip
+// one. Returns false when s is no longer the host's session: its epoch was
+// superseded while the frame was parked, and the events must not be applied to
+// the new epoch's buffer.
+func (h *Hub) ingestRawEvents(s *session, raws []json.RawMessage) bool {
 	h.mu.Lock()
-	hs := h.hosts[hostID]
-	if hs == nil {
+	hs := h.hosts[s.hostID]
+	if hs == nil || hs.session != s {
 		h.mu.Unlock()
 		return false
 	}
-	flipped := h.markHostAliveLocked(hs)
 	hostName := hs.info.HostName
 	h.mu.Unlock()
-	if flipped {
-		h.broadcast(hostsChanged())
-	}
 
-	idJSON, _ := json.Marshal(hostID)
+	idJSON, _ := json.Marshal(s.hostID)
 	nameJSON, _ := json.Marshal(hostName)
 	for _, raw := range raws {
-		// Validate shape BEFORE consuming a seq from the counter.
 		r := bytes.TrimRight(raw, " \t\r\n")
 		if len(r) < 2 || r[0] != '{' || r[len(r)-1] != '}' {
-			Verbosef("[capri-hub] host %s non-object event skipped", hostID)
+			Verbosef("[capri-hub] host %s non-object event skipped", s.hostID)
 			continue
 		}
 		var meta rawEventMeta
 		if err := json.Unmarshal(r, &meta); err != nil {
 			continue
 		}
-		hs.mu.Lock()
-		// Same seq gating as appendEvent (shared via gateSeqLocked): preserve
-		// the host's seq, skip stale/duplicate and missing ones.
-		assigned, ok := hs.gateSeqLocked(hostID, meta.Seq)
-		if !ok {
-			hs.mu.Unlock()
-			continue
-		}
-		wire := spliceRawEvent(r, idJSON, nameJSON)
-		if wire == nil {
-			hs.mu.Unlock()
-			Verbosef("[capri-hub] host %s non-object event skipped", hostID)
+		wireBytes := spliceRawEvent(r, idJSON, nameJSON)
+		if wireBytes == nil {
+			Verbosef("[capri-hub] host %s non-object event skipped", s.hostID)
 			continue
 		}
 		ev := Event{
-			rawWireKey: wire,
+			rawWireKey: wireBytes,
 			"type":     meta.Type,
-			"seq":      float64(assigned),
-			"hostId":   hostID,
+			"seq":      meta.Seq,
+			"hostId":   s.hostID,
 			"hostName": hostName,
 		}
 		if meta.SessionID != "" {
@@ -2043,14 +1557,19 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 		case "completed", "failed":
 			ev[terminalToolUpdateKey] = true
 		}
-		hs.bufferEventLocked(hostID, ev)
+		hs.mu.Lock()
+		if hs.epoch.Load() != s.epoch {
+			hs.mu.Unlock()
+			return false
+		}
+		hs.bufferEventLocked(s.hostID, ev)
 		hs.mu.Unlock()
 		// 子代理派发：记下子会话归属，访客才能顺着白名单父会话读到这条
 		// 时间线（见 noteGuestChild）。同一事件既带顶层 sessionId（父）也带
 		// update 里的 child_session_id（子）。放在入环/扇出之前：该事件本身
 		// 是父会话的（白名单直接放行），但紧跟着到达的子会话事件要能命中。
 		if meta.Type == "subagent_spawned" {
-			h.noteSpawnFromRaw(hostID, r)
+			h.noteSpawnFromRaw(s.hostID, r)
 		}
 		hs.enqueueFanout(h, ev)
 	}
@@ -2058,10 +1577,9 @@ func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
 }
 
 // LastSeq returns the delivery watermark for hostID: the highest N for which
-// 1..N all arrived (0 when unknown / nothing seen yet). This is the number
-// every wire field may present as an ack — the host deletes replay copies and
-// anchors repairs at it, so reporting the highest number SEEN instead would
-// turn one lost frame into permanent loss (see gateSeqLocked).
+// 1..N all arrived (0 when unknown / nothing seen yet). It is the only number
+// a wire field may present as an ack; a higher one would erase the replay
+// copies of events the hub never received.
 func (h *Hub) LastSeq(hostID string) uint64 {
 	h.mu.Lock()
 	hs := h.hosts[hostID]
@@ -2069,35 +1587,17 @@ func (h *Hub) LastSeq(hostID string) uint64 {
 	if hs == nil {
 		return 0
 	}
-	return hs.ackedSeq()
-}
-
-// HighestSeq returns the highest event sequence number seen from hostID,
-// holes included. Diagnostics only: it is not an acknowledgment.
-func (h *Hub) HighestSeq(hostID string) uint64 {
-	h.mu.Lock()
-	hs := h.hosts[hostID]
-	h.mu.Unlock()
-	if hs == nil {
-		return 0
-	}
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	return hs.seq
+	return hs.lastSeq()
 }
 
 // SeqByHost returns the per-host delivery watermark (see LastSeq) for the FE
-// hello frame. A browser aligns its watermark to this number, so it must be
-// the contiguous one: a higher number would make the FE skip the hole it is
-// about to need.
+// hello frame, so a browser works on the same gapless coordinate as the hub.
 func (h *Hub) SeqByHost() map[string]uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := make(map[string]uint64, len(h.hosts))
 	for id, hs := range h.hosts {
-		hs.mu.Lock()
-		out[id] = hs.acked
-		hs.mu.Unlock()
+		out[id] = hs.upAcked.Load()
 	}
 	return out
 }
@@ -2152,8 +1652,8 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 		h.mu.Unlock()
 		return RelayResponse{}, &RelayError{Status: 404, Message: ErrHostUnknown.Error()}
 	}
-	conn := hs.conn
-	if conn == nil || conn.suspended {
+	sess := hs.session
+	if sess == nil {
 		h.mu.Unlock()
 		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 当前离线", hostID)}
 	}
@@ -2166,10 +1666,8 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 		return RelayResponse{}, &RelayError{Status: 429, Message: "host 在途中继请求过多"}
 	}
 	pr := &pendingReq{
-		resp:         make(chan RelayResponse, 1),
-		done:         make(chan struct{}),
-		dispatchedAt: time.Now(),
-		ackTimeout:   dispatchAckTimeout(path),
+		resp: make(chan RelayResponse, 1),
+		done: make(chan struct{}),
 	}
 	if h.pending[hostID] == nil {
 		h.pending[hostID] = make(map[string]*pendingReq)
@@ -2177,31 +1675,19 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 	h.pending[hostID][reqID] = pr
 	h.mu.Unlock()
 
-	payload, err := json.Marshal(RelayRequest{V: 1, Type: "request", ReqID: reqID, HostID: hostID, Method: method, Path: path, Body: body})
-	if err != nil {
-		h.dropPending(hostID, reqID)
-		return RelayResponse{}, &RelayError{Status: 500, Message: err.Error()}
-	}
-	if err := conn.write(payload); err != nil {
+	// Delivery is the session's problem: the frame is logged and retransmitted
+	// until the host's cumulative ack covers it. A frame that stays unacked
+	// past RequestAckTimeout fails this request alone (see session.run).
+	if err := sess.dispatch(reqID, method, path, body); err != nil {
 		h.dropPending(hostID, reqID)
 		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
 	}
 
 	timer := time.NewTimer(RelayTimeout)
 	defer timer.Stop()
-	// Fast-fail ticker: see failIfUplinkSilent. Cheap (one wakeup per
-	// AckCheckInterval while a request is outstanding) and only fires on
-	// requests that opted into the ack budget.
-	var ackTick <-chan time.Time
-	var ackTicker *time.Ticker
-	if pr.ackTimeout > 0 {
-		ackTicker = time.NewTicker(AckCheckInterval)
-		defer ackTicker.Stop()
-		ackTick = ackTicker.C
-	}
-	// A response that already arrived must win over a concurrently
-	// firing timeout: select would otherwise pick the timer branch at
-	// random and drop an answer that is already here.
+	// A response that already arrived must win over a concurrently firing
+	// timeout: select would otherwise pick the timer branch at random and drop
+	// an answer that is already here.
 	select {
 	case resp := <-pr.resp:
 		return resp, nil
@@ -2213,12 +1699,6 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 			return resp, nil
 		case <-pr.done:
 			return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
-		case <-ackTick:
-			// Unanswered past its ack budget AND the host has not sent a
-			// single uplink frame since the frame was dispatched: the link
-			// is dead, not slow. failIfUplinkSilent closes pr.done, so the
-			// next iteration returns the 503.
-			h.failIfUplinkSilent(hostID, reqID, pr)
 		case <-ctx.Done():
 			// Browser gone: stop waiting and release the pending slot. The host
 			// keeps executing; its late respond simply finds no pending entry.
@@ -2250,7 +1730,6 @@ func (h *Hub) Respond(hostID, reqID string, resp RelayResponse) bool {
 	if pr == nil {
 		return false
 	}
-	h.markRelayAnswerLocked(hostID)
 	pr.resp <- resp
 	return true
 }
@@ -2271,16 +1750,6 @@ func (h *Hub) takePendingLocked(hostID, reqID string) *pendingReq {
 		delete(h.pending, hostID)
 	}
 	return pr
-}
-
-// markRelayAnswerLocked refreshes the host's registry clock after an answer.
-// Callers hold h.mu.
-func (h *Hub) markRelayAnswerLocked(hostID string) {
-	if hs := h.hosts[hostID]; hs != nil {
-		if h.markHostAliveLocked(hs) {
-			h.broadcast(hostsChanged())
-		}
-	}
 }
 
 // failRelayRequestLocked drops one pending request and answers it with a 502
@@ -2364,7 +1833,6 @@ func (h *Hub) RespondChunk(hostID, reqID string, status int, encoding, chunk str
 		return true // raced with a dropPending; the browser is gone
 	}
 	pr.chunks = body
-	h.markRelayAnswerLocked(hostID)
 	pr.resp <- RelayResponse{Status: pr.chunkStatus, Body: body}
 	return true
 }
@@ -2946,8 +2414,7 @@ func (h *Hub) trySubscribe(max int, hostID string, guest *GuestToken, info Subsc
 	}
 	h.subscribeLocked(s)
 	h.mu.Unlock()
-	h.notifyHostsSubscribers()
-	h.notifyHostsViewing()
+	h.notifyAudience()
 	// The newcomer learns the total from its hello; only the pages already
 	// open need the push.
 	h.notifySubscribersCount(s)
@@ -2964,8 +2431,7 @@ func (h *Hub) trySubscribe(max int, hostID string, guest *GuestToken, info Subsc
 			}
 		}
 	drained:
-		h.notifyHostsSubscribers()
-		h.notifyHostsViewing()
+		h.notifyAudience()
 		h.notifySubscribersCount(nil)
 	}, s, true
 }
@@ -2996,38 +2462,30 @@ func (h *Hub) SetSubscriberHost(ch chan Event, hostID string) bool {
 	if !found {
 		return false
 	}
-	h.notifyHostsSubscribers()
-	h.notifyHostsViewing()
+	h.notifyAudience()
 	return true
 }
 
 // HostStat is one host's data-plane snapshot for GET /api/stats. It is a
 // read-only diagnostic: nothing here feeds a delivery decision.
 type HostStat struct {
-	HostID        string `json:"hostId"`
-	LastSeq       uint64 `json:"lastSeq"`
-	HighestSeq    uint64 `json:"highestSeq"`
-	Online        bool   `json:"online"`
+	HostID  string `json:"hostId"`
+	LastSeq uint64 `json:"lastSeq"`
+	Online  bool   `json:"online"`
+	// Epoch identifies the host's current sequence space; an epoch change is
+	// a host process restart, and the per-host FE watermark resets with it.
+	Epoch         uint64 `json:"epoch,omitempty"`
 	FanoutDropped uint64 `json:"fanoutDropped"`
-	// WatermarkJumps counts maxGappedSeq overflows: each one declared a
-	// missing range lost and moved the watermark over it.
-	WatermarkJumps uint64 `json:"watermarkJumps,omitempty"`
-	// Gapped is how many out-of-order seqs are parked behind a hole; a
-	// number that stays high while LastSeq stalls is a host losing frames.
-	Gapped int `json:"gapped,omitempty"`
 	// FanoutLen is the current pre-fan-out backlog depth.
 	FanoutLen   int `json:"fanoutLen,omitempty"`
 	Subscribers int `json:"subscribers"`
 	EvBufLen    int `json:"evBufLen"`
 	// EvBufBytes is the gap-pull buffer's byte weight; evBufByteCap bounds
 	// it, and over the cap the oldest events are dropped.
-	EvBufBytes   int  `json:"evBufBytes,omitempty"`
-	UnackedState bool `json:"unackedState"`
-	// UnackedSubscribers / UnackedViewing name which absolute-state frame
-	// the host has not confirmed yet. A host that keeps one of these set is
-	// receiving frames but its state_ack is not landing.
-	UnackedSubscribers bool `json:"unackedSubscribers,omitempty"`
-	UnackedViewing     bool `json:"unackedViewing,omitempty"`
+	EvBufBytes int `json:"evBufBytes,omitempty"`
+	// DownUnacked is how many down frames the host has not acked yet; a
+	// number that stays high means its uplink ack is not landing.
+	DownUnacked int `json:"downUnacked,omitempty"`
 }
 
 // Stats is the process-wide diagnostic snapshot behind GET /api/stats.
@@ -3067,22 +2525,18 @@ func (h *Hub) Stats() Stats {
 	}
 	for id, hs := range h.hosts {
 		st := HostStat{
-			HostID:         id,
-			LastSeq:        hs.ackedSeq(),
-			HighestSeq:     hs.lastSeq(),
-			Online:         hs.info.Online,
-			FanoutDropped:  hs.fanoutDropCount(),
-			WatermarkJumps: hs.watermarkJumps.Load(),
-			Gapped:         hs.gappedCount(),
-			FanoutLen:      hs.fanoutDepth(),
-			Subscribers:    h.subscriberCountForLocked(id),
-			EvBufLen:       hs.eventBufferLen(),
-			EvBufBytes:     hs.eventBufferBytes(),
-			UnackedState:   len(h.unacked[id]) > 0,
-			UnackedSubscribers: h.unacked[id] != nil &&
-				h.unacked[id][kindSubscribers] != nil,
-			UnackedViewing: h.unacked[id] != nil &&
-				h.unacked[id][kindViewing] != nil,
+			HostID:        id,
+			LastSeq:       hs.upAcked.Load(),
+			Online:        hs.info.Online,
+			Epoch:         hs.epoch.Load(),
+			FanoutDropped: hs.fanoutDropCount(),
+			FanoutLen:     hs.fanoutDepth(),
+			Subscribers:   h.subscriberCountForLocked(id),
+			EvBufLen:      hs.eventBufferLen(),
+			EvBufBytes:    hs.eventBufferBytes(),
+		}
+		if s := hs.session; s != nil {
+			st.DownUnacked = s.proto.downLen()
 		}
 		out.Hosts = append(out.Hosts, st)
 	}
@@ -3123,108 +2577,6 @@ func (h *Hub) subscriberCountForLocked(hostID string) int {
 		}
 	}
 	return n
-}
-
-// notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N, gen:G}
-// to every online host WebSocket. Hosts use count==0 to stop uploading
-// bridge events (they still send host_status heartbeats). Writes run
-// outside h.mu so a slow host cannot stall the hub lock.
-//
-// N is PER HOST — the number of subscribers that actually receive that
-// host's events (see SubscriberCountFor), not the raw browser count. With
-// the /ws/fe host filter in place this is what lets an unwatched host stop
-// uploading at all.
-//
-// `gen` is a hub-monotonic generation stamp and it is load-bearing: the
-// frames are ABSOLUTE state, they are written from one fire-and-forget
-// goroutine per host, and a slow write can therefore deliver them OUT OF
-// ORDER. Without the stamp a browser refresh (unsubscribe → count 0,
-// resubscribe → count 1, microseconds apart) can land as 1 then 0, leaving
-// the host convinced nobody is watching: it stops uploading bridge events
-// while host_status heartbeats keep it "online", so the freshly reloaded
-// page shows a live-looking but permanently frozen session. Hosts keep the
-// highest gen seen and ignore anything older.
-//
-// A count that has not changed since the last notification for THAT host
-// is not resent (browser churn on a multi-tab hub is otherwise a per-host
-// write storm). A lost frame is repaired by retransmitting the same payload
-// until the host confirms it (see retransmitStateAcks).
-func (h *Hub) notifyHostsSubscribers() {
-	h.mu.Lock()
-	type pending struct {
-		write func([]byte) error
-		host  string
-		count int
-	}
-	var todo []pending
-	for id, hs := range h.hosts {
-		if hs.conn == nil || hs.conn.suspended {
-			continue
-		}
-		count := h.subscriberCountForLocked(id)
-		if prev, seen := h.lastNotifiedSubs[id]; seen && prev == count {
-			continue
-		}
-		if h.lastNotifiedSubs == nil {
-			h.lastNotifiedSubs = make(map[string]int)
-		}
-		h.lastNotifiedSubs[id] = count
-		todo = append(todo, pending{write: hs.conn.write, host: id, count: count})
-	}
-	if len(todo) == 0 {
-		h.mu.Unlock()
-		return
-	}
-	gen := h.subsGen.Add(1)
-	writes := make([]func([]byte) error, 0, len(todo))
-	frames := make([][]byte, 0, len(todo))
-	for _, p := range todo {
-		b, err := json.Marshal(map[string]any{
-			"v": 1, "type": "subscribers", "count": p.count, "gen": gen,
-		})
-		if err != nil {
-			continue
-		}
-		h.trackUnackedLocked(p.host, kindSubscribers, gen, b)
-		frames = append(frames, b)
-		writes = append(writes, p.write)
-	}
-	h.mu.Unlock()
-	if len(frames) == 0 {
-		return
-	}
-	// Fire-and-forget per host: writes carry a multi-second timeout each,
-	// so one half-open host must not stall the caller (subscribe /
-	// unsubscribe). Ordering across goroutines is handled by `gen`.
-	for i, write := range writes {
-		go func(w func([]byte) error, payload []byte) {
-			_ = w(payload)
-		}(write, frames[i])
-	}
-}
-
-// SubscribersState returns the total live browser subscriber count together
-// with a fresh monotonic generation stamp — the watch-all audience, i.e.
-// what every host used to be told before per-host filtering.
-func (h *Hub) SubscribersState() (count int, gen uint64) {
-	return h.subscribersStateFor("")
-}
-
-// SubscribersStateFor is SubscribersState scoped to the subscribers that
-// receive hostID's events, for transports that re-assert the count on their
-// periodic host ping. Re-asserting makes the subscriber count self-healing:
-// a `subscribers` frame lost to a write error or a superseded connection is
-// corrected within one ping interval instead of leaving the host paused
-// until the next browser connect/disconnect.
-func (h *Hub) SubscribersStateFor(hostID string) (count int, gen uint64) {
-	return h.subscribersStateFor(hostID)
-}
-
-func (h *Hub) subscribersStateFor(hostID string) (count int, gen uint64) {
-	h.mu.Lock()
-	count = h.subscriberCountForLocked(hostID)
-	h.mu.Unlock()
-	return count, h.subsGen.Add(1)
 }
 
 // viewingSet is the resolved "who is looking at what" for one host.
@@ -3340,403 +2692,110 @@ func (h *Hub) logViewingWidenLocked(hostID, reason string) {
 	log.Printf("[capri-hub] host %s: viewing set widened to all (%s)", hostID, reason)
 }
 
-// notifyHostsViewing pushes {v:1, type:"viewing", all:bool, sessions:[…]}
-// to every online host, telling it which sessions its pages are actually
-// displaying. Hosts replace their whole set (absolute state) and may then
-// stop uploading the transcript of sessions nobody watches.
+// ── audience (absolute viewer state, one frame) ───────────────────────
+
+// Audience is the absolute viewer state for one host: how many browsers
+// receive its events and which sessions they display. One frame carries both,
+// with one generation, one ack path and one retransmit entry — the host pauses
+// its upload on watchers==0 and filters nothing when all is set.
 //
-// Same shape of guarantee as notifyHostsSubscribers: per-host dedupe on
-// the payload, and — because a lost frame would leave a host filtering
-// against a stale set — the frame is retransmitted until the host
-// confirms it (state_ack).
-func (h *Hub) notifyHostsViewing() {
-	h.mu.Lock()
-	type pending struct {
-		write   func([]byte) error
-		payload string
+// The snapshot is built under h.mu from the live subscriber list, so it is
+// always the newest state and wins over anything still in flight by gen.
+
+// audienceKey renders the parts of a snapshot that decide whether it changed.
+// gen is excluded: an identical payload must keep its old generation so the
+// host can discard the duplicate.
+func audienceKey(a wire.Audience) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d|%t|", a.Watchers, a.All)
+	for _, s := range a.Sessions {
+		b.WriteString(s)
+		b.WriteByte(0)
 	}
-	var todo []pending
-	if h.lastViewing == nil {
-		h.lastViewing = map[string]string{}
-	}
-	for id, hs := range h.hosts {
-		if hs.conn == nil || hs.conn.suspended {
-			continue
-		}
-		view, ok := h.viewingViewLocked(id)
-		if !ok {
-			// No audience for this host at all: it is paused on
-			// subscribers==0 and needs no set.
-			continue
-		}
-		payload := encodeViewingView(view)
-		if prev, seen := h.lastViewing[id]; seen && prev == payload {
-			continue
-		}
-		h.lastViewing[id] = payload
-		// Stamp every frame with a hub-monotonic generation, for the same
-		// reason the subscriber count carries one: these are ABSOLUTE
-		// states written from one goroutine per host, so a slow write can
-		// deliver them out of order. Without the stamp a session switch
-		// (old set → new set, microseconds apart) could land as the new
-		// set followed by the old one, leaving the host trimming exactly
-		// the session the user just opened. viewGen is its own counter so
-		// subscriber-count frames never interleave with viewing frames.
-		gen := h.viewGen.Add(1)
-		framed := encodeViewingViewGen(view, gen)
-		h.trackUnackedLocked(id, kindViewing, gen, []byte(framed))
-		todo = append(todo, pending{write: hs.conn.write, payload: framed})
-	}
-	h.mu.Unlock()
-	for _, p := range todo {
-		go func(w func([]byte) error, payload string) { _ = w([]byte(payload)) }(p.write, p.payload)
-	}
+	return b.String()
 }
 
-// encodeViewingView renders the stable wire form of a viewing set. The
-// string doubles as the per-host dedupe key, so it must be canonical —
-// Sessions arrives sorted for exactly that reason. gen is stamped on the
-// wire by encodeViewingViewGen, leaving the key gen-free.
-//
-// The frame carries its own "type" (the host dispatches on the type and
-// reads all/sessions at the top level for the standalone form); the hello
-// carrier nests the same value under a "viewing" key.
-func encodeViewingView(v ViewingView) string {
-	b, err := json.Marshal(struct {
-		V    int    `json:"v"`
-		Type string `json:"type"`
-		ViewingView
-	}{V: 1, Type: "viewing", ViewingView: v})
-	if err != nil {
-		return ""
-	}
-	return string(b)
-}
-
-// encodeViewingViewGen is encodeViewingView plus the ordering stamp.
-func encodeViewingViewGen(v ViewingView, gen uint64) string {
-	b, err := json.Marshal(struct {
-		V    int    `json:"v"`
-		Type string `json:"type"`
-		ViewingView
-		Gen uint64 `json:"gen"`
-	}{V: 1, Type: "viewing", ViewingView: v, Gen: gen})
-	if err != nil {
-		return encodeViewingView(v)
-	}
-	return string(b)
-}
-
-// HelloViewing is the hello's nested carrier for the viewing set: the same
-// value and generation the standalone frame carries, so the host applies it
-// through one path and confirms it the same way.
-type HelloViewing struct {
-	ViewingView
-	Gen uint64 `json:"gen"`
-}
-
-// HelloState is the absolute state a hello carries, with the generations and
-// wire bytes needed to retransmit it. It is prepared BEFORE the hello is
-// written (the host has to see the stamps) and committed after the transport
-// is registered — ConnectStream drops the previous session's unconfirmed
-// entries, and the hello's own must not be caught by that sweep.
-type HelloState struct {
-	Subscribers int
-	SubsGen     uint64
-	Viewing     *HelloViewing
-
-	subPayload  []byte
-	viewPayload []byte
-}
-
-// PrepareHelloState binds the current absolute state to fresh generation
-// stamps. The hello is otherwise the one absolute-state carrier with no
-// repair path: `subscribers` was applied at gen 0 (so it could neither be
-// deduped nor acked) and the viewing set consumed a generation that the hub
-// never registered. A hello lost after the handshake then left the host
-// paused while a page waited, until the next browser connect/disconnect.
-func (h *Hub) PrepareHelloState(hostID string) HelloState {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	st := HelloState{Subscribers: h.subscriberCountForLocked(hostID)}
-	st.SubsGen = h.subsGen.Add(1)
-	st.subPayload, _ = json.Marshal(map[string]any{
-		"v": 1, "type": "subscribers", "count": st.Subscribers, "gen": st.SubsGen,
-	})
-	if view, ok := h.viewingViewLocked(hostID); ok {
-		gen := h.viewGen.Add(1)
-		st.Viewing = &HelloViewing{ViewingView: view, Gen: gen}
-		st.viewPayload = []byte(encodeViewingViewGen(view, gen))
-	}
-	return st
-}
-
-// CommitHelloState registers the hello's absolute state as awaiting
-// confirmation, so a lost hello is repaired by the retry timer with the
-// identical generation (the host's gate drops it if the original landed).
-// Call it once the transport is registered: ConnectStream deliberately
-// discards the previous session's entries.
-func (h *Hub) CommitHelloState(hostID string, st HelloState) {
-	h.mu.Lock()
-	hs := h.hosts[hostID]
-	if hs == nil || hs.conn == nil {
-		h.mu.Unlock()
-		return
-	}
-	if st.subPayload != nil {
-		h.trackUnackedLocked(hostID, kindSubscribers, st.SubsGen, st.subPayload)
-	}
-	if st.viewPayload != nil && st.Viewing != nil {
-		h.trackUnackedLocked(hostID, kindViewing, st.Viewing.Gen, st.viewPayload)
-	}
-	h.mu.Unlock()
-}
-
-// viewingViewLocked is viewingSetLocked rendered for the wire. ok=false
-// when nobody receives hostID's events.
-func (h *Hub) viewingViewLocked(hostID string) (ViewingView, bool) {
-	set := h.viewingSetLocked(hostID)
-	if set == nil {
-		return ViewingView{}, false
-	}
-	if set.all {
-		return ViewingView{All: true}, true
-	}
-	out := ViewingView{Sessions: make([]string, 0, len(set.sessions))}
-	for sid := range set.sessions {
-		out.Sessions = append(out.Sessions, sid)
-	}
-	sort.Strings(out.Sessions)
-	return out, true
-}
-
-// ViewingFrameFor returns the current viewing set stamped with a FRESH
-// viewGen value: the answer is read from the live subscriber list, so it is
-// always the newest state and must win over any edge-triggered frame still in
-// flight. The hello uses PrepareHelloState instead, which keeps the stamp it
-// registered for retransmission.
-//
-// ok=false when the host is unknown or nobody receives its events — the
-// caller then sends no field, because an empty set must never be mistaken
-// for "nobody is watching, drop everything".
-func (h *Hub) ViewingFrameFor(hostID string) (view ViewingView, gen uint64, ok bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	v, ok := h.viewingViewLocked(hostID)
-	if !ok {
-		return ViewingView{}, 0, false
-	}
-	return v, h.viewGen.Add(1), true
-}
-
-// ViewingView is the wire/JSON shape of one host's viewing set: the
-// sessions its browser pages currently display, or All when at least one
-// of those pages has not declared a session (so the host must not filter).
-type ViewingView struct {
-	All      bool     `json:"all"`
-	Sessions []string `json:"sessions,omitempty"`
-}
-
-// ── confirmed state delivery (state_ack) ─────────────────────────────
-//
-// Edge-triggered absolute-state frames (`subscribers`, `viewing`) used to be
-// repaired only by re-asserting the whole state on every host ping, because
-// a lost frame leaves the host acting on a stale answer indefinitely: paused
-// while a browser waits, or uploading transcripts nobody displays.
-//
-// The host confirms each state frame it applied. The hub retransmits an
-// unconfirmed frame verbatim (same gen, so the host's generation gate drops
-// duplicates) on a short timer, which is why the periodic ping carries no
-// absolute state.
-
-const (
-	kindSubscribers = "subscribers"
-	kindViewing     = "viewing"
-)
-
-// StateAckRetryInterval is how often retransmitStateAcks looks for
-// unconfirmed state frames, and the delay before the first retransmit of
-// one. Later attempts back off (see stateAckDelay) so a host that has
-// applied the state but cannot get an ack onto a full uplink does not
-// take a downlink write every second forever. A var so tests can shrink it.
-var StateAckRetryInterval = time.Second
-
-// stateAckBackoffMax caps the retransmit gap. The session's own timeouts
-// end a host that never confirms; this only spaces the retries.
-const stateAckBackoffMax = 30 * time.Second
-
-// stateAckDelay is the gap after the attempt-th retransmit (1-based).
-// attempt 1 waits one interval, then 2, 4, … up to stateAckBackoffMax.
-func stateAckDelay(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	d := StateAckRetryInterval
-	for i := 1; i < attempt; i++ {
-		if d >= stateAckBackoffMax/2 {
-			return stateAckBackoffMax
-		}
-		d *= 2
-	}
-	if d > stateAckBackoffMax {
-		return stateAckBackoffMax
-	}
-	return d
-}
-
-// trackUnackedLocked records the frame just queued for hostID as awaiting
-// confirmation. A newer gen for the same kind replaces the entry: the
-// frames are absolute state, so confirming the newest makes the older one
-// moot, and retransmitting both would be redundant traffic. Caller holds
-// h.mu.
-func (h *Hub) trackUnackedLocked(hostID, kind string, gen uint64, payload []byte) {
-	if h.unacked == nil {
-		h.unacked = make(map[string]map[string]*unackedState)
-	}
-	perHost := h.unacked[hostID]
-	if perHost == nil {
-		perHost = make(map[string]*unackedState)
-		h.unacked[hostID] = perHost
-	}
-	perHost[kind] = &unackedState{
-		gen:      gen,
-		payload:  append([]byte(nil), payload...),
-		deadline: time.Now().Add(StateAckRetryInterval),
-	}
-}
-
-// AckState records a host's confirmation that it applied the state frame of
-// `kind` with generation gen. Entries older than or equal to gen are
-// cleared; a NEWER entry is kept — acks from one host can arrive out of
-// order (edge frame and retransmit racing on the wire), and a stale ack must
-// never drop the unconfirmed newer state.
-//
-// The frame is also liveness evidence: it is a real uplink frame from the
-// host, so LastSeen refreshes exactly as a host_status heartbeat would.
-//
-// Returns whether the ack matched an outstanding entry, for tests and logs.
-func (h *Hub) AckState(hostID, kind string, gen uint64) bool {
-	h.mu.Lock()
+// audienceLocked snapshots hostID's audience and assigns it the current
+// per-host generation, minting the first one (gen 1) for a host that never had
+// one. Callers hold h.mu.
+func (h *Hub) audienceLocked(hostID string) (wire.Audience, bool) {
 	hs := h.hosts[hostID]
 	if hs == nil {
-		h.mu.Unlock()
-		return false
+		return wire.Audience{}, false
 	}
-	flipped := h.markHostAliveLocked(hs)
-	perHost := h.unacked[hostID]
-	st := perHost[kind]
-	matched := st != nil && st.gen <= gen
-	if matched {
-		delete(perHost, kind)
-		if len(perHost) == 0 {
-			delete(h.unacked, hostID)
+	a := wire.Audience{Watchers: h.subscriberCountForLocked(hostID)}
+	if set := h.viewingSetLocked(hostID); set != nil {
+		if set.all {
+			a.All = true
+		} else {
+			a.Sessions = make([]string, 0, len(set.sessions))
+			for sid := range set.sessions {
+				a.Sessions = append(a.Sessions, sid)
+			}
+			sort.Strings(a.Sessions)
 		}
 	}
-	h.mu.Unlock()
-	if flipped {
-		h.broadcast(hostsChanged())
+	key := audienceKey(a)
+	changed := false
+	switch {
+	case hs.audienceGen == 0:
+		hs.audienceGen = 1
+		hs.audienceKey = key
+	case key != hs.audienceKey:
+		hs.audienceGen++
+		hs.audienceKey = key
+		changed = true
 	}
-	return matched
+	a.Gen = hs.audienceGen
+	return a, changed
 }
 
-// UnackedState reports whether hostID currently has an unconfirmed entry of
-// `kind`. Minimal surface for the admin/diagnostics path and tests.
-func (h *Hub) UnackedState(hostID, kind string) (gen uint64, ok bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	st := h.unacked[hostID][kind]
-	if st == nil {
-		return 0, false
-	}
-	return st.gen, true
-}
-
-// retransmitStateAcks is one pass of the state-ack retry timer: every
-// unconfirmed frame whose deadline passed is written again, payload
-// unchanged. There is no give-up path — the protocol has no other carrier
-// for absolute state, so a host that stops confirming is a broken host, and
-// its own transport timeouts are what end the session.
-func (h *Hub) retransmitStateAcks() {
+// notifyAudience pushes the current audience to every attached host whose
+// snapshot changed. Called on subscriber connect/disconnect, host retarget and
+// viewing changes; dedupe happens here, so a no-op reload storm costs nothing.
+func (h *Hub) notifyAudience() {
 	type send struct {
-		write   func([]byte) error
-		payload []byte
-		host    string
-		kind    string
-		gen     uint64
+		s *session
+		a wire.Audience
 	}
-	var out []send
-	now := time.Now()
+	var todo []send
 	h.mu.Lock()
-	for hostID, perHost := range h.unacked {
-		hs := h.hosts[hostID]
-		if hs == nil || hs.conn == nil {
-			// Superseded: nothing to retransmit to. A merely SUSPENDED conn
-			// is kept — the sweep restores it on the next uplink frame, and
-			// the unconfirmed state still needs delivery.
-			delete(h.unacked, hostID)
+	for id, hs := range h.hosts {
+		if hs.session == nil {
 			continue
 		}
-		if hs.conn.suspended {
+		a, changed := h.audienceLocked(id)
+		if !changed {
 			continue
 		}
-		for kind, st := range perHost {
-			if st.inflight || now.Before(st.deadline) {
-				continue
-			}
-			st.attempts++
-			st.inflight = true
-			st.deadline = now.Add(stateAckDelay(st.attempts))
-			out = append(out, send{
-				write: hs.conn.write, payload: st.payload,
-				host: hostID, kind: kind, gen: st.gen,
-			})
-		}
-		if len(perHost) == 0 {
-			delete(h.unacked, hostID)
-		}
+		todo = append(todo, send{s: hs.session, a: a})
 	}
 	h.mu.Unlock()
-
-	for _, s := range out {
-		go func(s send) {
-			// A failed write does not drop the entry. The next deadline
-			// retries it; the transport's own timeout ends a dead session.
-			// inflight keeps this to one write at a time per generation.
-			_ = s.write(s.payload)
-			h.mu.Lock()
-			st := h.unacked[s.host][s.kind]
-			// A newer state (or an ack) replaced the entry meanwhile; its
-			// own in-flight flag must not be touched.
-			if st != nil && st.gen == s.gen {
-				st.inflight = false
-			}
-			h.mu.Unlock()
-		}(s)
+	for _, t := range todo {
+		if err := t.s.pushAudience(t.a); err != nil {
+			Verbosef("[capri-hub] host %s: audience push: %v", t.s.hostID, err)
+		}
 	}
 }
 
-// StartStateAckRetry runs the retransmit timer until ctx is done. Safe to
-// call once per Hub.
-func (h *Hub) StartStateAckRetry(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(StateAckRetryInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				h.retransmitStateAcks()
+// broadcastSeqReset tells /ws/fe subscribers of hostID that its sequence space
+// restarted, so their per-host watermark resets before any new-epoch event.
+func (h *Hub) broadcastSeqReset(hostID string) {
+	ev := Event{"v": 1, "type": "subscribed", "host": hostID, "seq": uint64(0)}
+	if cur := h.subs.Load(); cur != nil {
+		for _, s := range *cur {
+			if s.watches(hostID) {
+				s.deliver(ev)
 			}
 		}
-	}()
+	}
 }
 
 // notifySubscribersCount pushes {v:1, type:"subscribers_changed", count:N}
 // to the browser subscribers when the total live /ws/fe client count
 // changes. The FE top bar renders it next to the host block, so it is the
 // raw browser total (every host's audience) — unlike the per-host
-// `subscribers` frames above, which drive the host upload gate.
+// `audience` frames, which drive the host upload gate.
 //
 // except is the page whose hello is about to carry the same figure (its own
 // subscribe): skipping it keeps a freshly opened socket's channel empty
@@ -3862,7 +2921,7 @@ func (h *Hub) setSubscriberSession(ch chan Event, sessionID string, declared boo
 	if !found {
 		return false
 	}
-	h.notifyHostsViewing()
+	h.notifyAudience()
 	return true
 }
 

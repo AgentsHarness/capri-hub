@@ -15,26 +15,6 @@ import (
 	"github.com/coder/websocket"
 )
 
-// A chunk frame whose reqId is unknown must be routed to the assembly path,
-// ignored and counted — not logged as a legacy unknown respond, and never a
-// panic.
-func TestHandleHostFrameChunkedRespondUnknownReq(t *testing.T) {
-	h := hub.NewWithDir("")
-	code, _ := h.PairingCode()
-	if _, err := h.Pair(code, "h1", "H1"); err != nil {
-		t.Fatal(err)
-	}
-	frame, _ := json.Marshal(map[string]any{
-		"v": 1, "type": "respond", "reqId": "missing", "status": 200,
-		"chunk": base64.StdEncoding.EncodeToString([]byte("x")), "encoding": "base64", "more": false,
-	})
-	handleHostFrame(h, "h1", frame, func([]byte) error { return nil })
-
-	if got := h.Stats().LateRelayChunks; got != 1 {
-		t.Fatalf("LateRelayChunks = %d, want 1 (the frame must reach RespondChunk)", got)
-	}
-}
-
 // End to end over the real WS host handler: a host answers in two chunk
 // frames, and the browser's relayed HTTP request receives the reassembled
 // body with nothing about the split visible.
@@ -52,21 +32,8 @@ func TestChunkedRespondRelayedToBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pair: %v", err)
 	}
-	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Authorization":   []string{"Bearer " + token},
-			"X-Hub-Deflate":   []string{"1"},
-			"X-Hub-State-Ack": []string{"1"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("host ws dial: %v", err)
-	}
+	conn := dialHostWithToken(t, ctx, srv, "h1", token, 77)
 	defer conn.Close(websocket.StatusNormalClosure, "")
-	conn.SetReadLimit(1 << 20)
-	if _, _, err := conn.Read(ctx); err != nil { // hello
-		t.Fatalf("hello: %v", err)
-	}
 
 	// 2.25MB of valid JSON, split into two frames the way respondChunked
 	// splits at relayChunkSize.
@@ -82,13 +49,14 @@ func TestChunkedRespondRelayedToBrowser(t *testing.T) {
 			var f struct {
 				Type  string `json:"type"`
 				ReqID string `json:"reqId"`
+				Seq   uint64 `json:"seq"`
 			}
 			if json.Unmarshal(data, &f) != nil || f.Type != "request" {
 				continue
 			}
 			for i, part := range []string{body[:split], body[split:]} {
 				frame, _ := json.Marshal(map[string]any{
-					"v": 1, "type": "respond", "reqId": f.ReqID, "status": 200,
+					"v": 2, "type": "respond", "reqId": f.ReqID, "status": 200, "ack": f.Seq,
 					"chunk":    base64.StdEncoding.EncodeToString([]byte(part)),
 					"encoding": "base64",
 					"more":     i == 0,

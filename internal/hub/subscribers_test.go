@@ -148,7 +148,7 @@ func TestViewingAllWhenPageSilent(t *testing.T) {
 	}
 	defer unsub()
 
-	v, _, ok := h.ViewingFrameFor("h1")
+	v, _, ok := testViewing(h, "h1")
 	if !ok || !v.All {
 		t.Fatalf("viewing = %+v ok=%v, want all (page has not declared a session)", v, ok)
 	}
@@ -157,14 +157,14 @@ func TestViewingAllWhenPageSilent(t *testing.T) {
 	if !h.SetSubscriberSession(ch, "s1") {
 		t.Fatal("SetSubscriberSession refused a live channel")
 	}
-	if v, _, ok := h.ViewingFrameFor("h1"); !ok || !v.All {
+	if v, _, ok := testViewing(h, "h1"); !ok || !v.All {
 		t.Fatalf("viewing after subscribe-only = %+v ok=%v, want all", v, ok)
 	}
 	// The explicit viewing frame is what narrows it.
 	if !h.SetSubscriberViewing(ch, "s1") {
 		t.Fatal("SetSubscriberViewing refused a live channel")
 	}
-	v, _, ok = h.ViewingFrameFor("h1")
+	v, _, ok = testViewing(h, "h1")
 	if !ok || v.All || len(v.Sessions) != 1 || v.Sessions[0] != "s1" {
 		t.Fatalf("viewing after declare = %+v ok=%v, want [s1]", v, ok)
 	}
@@ -187,13 +187,13 @@ func TestViewingUnionAcrossPages(t *testing.T) {
 	h.SetSubscriberViewing(ch1, "s1")
 	h.SetSubscriberViewing(ch2, "s2")
 
-	v, _, _ := h.ViewingFrameFor("h1")
+	v, _, _ := testViewing(h, "h1")
 	if len(v.Sessions) != 2 || v.Sessions[0] != "s1" || v.Sessions[1] != "s2" {
 		t.Fatalf("viewing = %+v, want sorted [s1 s2]", v)
 	}
 
 	h.SetSubscriberViewing(ch2, "s3")
-	v, _, _ = h.ViewingFrameFor("h1")
+	v, _, _ = testViewing(h, "h1")
 	if len(v.Sessions) != 2 || v.Sessions[0] != "s1" || v.Sessions[1] != "s3" {
 		t.Fatalf("viewing after switch = %+v, want [s1 s3]", v)
 	}
@@ -219,7 +219,7 @@ func TestViewingIgnoresOtherHostWatchers(t *testing.T) {
 	// 这个页面在 h2 上没声明会话——不得把 h1 的集合拉成 all。
 	_ = other
 
-	v, _, ok := h.ViewingFrameFor("h1")
+	v, _, ok := testViewing(h, "h1")
 	if !ok || v.All || len(v.Sessions) != 1 || v.Sessions[0] != "s1" {
 		t.Fatalf("viewing for h1 = %+v ok=%v, want [s1]", v, ok)
 	}
@@ -237,7 +237,7 @@ func TestViewingExpandsSubagentChild(t *testing.T) {
 	h.SetSubscriberViewing(ch, "parent")
 	h.noteGuestChild("h1", "parent", "child", "sub-1")
 
-	v, _, _ := h.ViewingFrameFor("h1")
+	v, _, _ := testViewing(h, "h1")
 	got := map[string]bool{}
 	for _, sid := range v.Sessions {
 		got[sid] = true
@@ -251,7 +251,7 @@ func TestViewingExpandsSubagentChild(t *testing.T) {
 func TestViewingAbsentWithoutWatchers(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
-	if v, _, ok := h.ViewingFrameFor("h1"); ok {
+	if v, _, ok := testViewing(h, "h1"); ok {
 		t.Fatalf("viewing = %+v, want no frame without watchers", v)
 	}
 }
@@ -268,14 +268,14 @@ func TestViewingEmptyDeclarationIsNotAll(t *testing.T) {
 	}
 	defer unsub()
 	// 未声明任何内容：全量放行。
-	if v, _, ok := h.ViewingFrameFor("h1"); !ok || !v.All {
+	if v, _, ok := testViewing(h, "h1"); !ok || !v.All {
 		t.Fatalf("viewing before any declaration = %+v ok=%v, want all", v, ok)
 	}
 	// 显式声明空：不再是 all（host 可以放心裁剪），只是集合为空。
 	if !h.SetSubscriberViewing(ch, "") {
 		t.Fatal("SetSubscriberViewing refused")
 	}
-	v, _, ok := h.ViewingFrameFor("h1")
+	v, _, ok := testViewing(h, "h1")
 	if !ok || v.All {
 		t.Fatalf("viewing after empty declaration = %+v ok=%v, want a narrowable empty set", v, ok)
 	}
@@ -299,7 +299,7 @@ func TestViewingRejectsOversizedSessionID(t *testing.T) {
 	if !h.SetSubscriberViewing(ch, strings.Repeat("x", maxViewingSessionIDLen+1)) {
 		t.Fatal("SetSubscriberViewing refused")
 	}
-	v, _, ok := h.ViewingFrameFor("h1")
+	v, _, ok := testViewing(h, "h1")
 	if !ok || !v.All {
 		t.Fatalf("viewing with an oversized id = %+v ok=%v, want all", v, ok)
 	}
@@ -323,7 +323,7 @@ func TestViewingWidensToAllAtSessionCap(t *testing.T) {
 			t.Fatalf("SetSubscriberViewing refused at %d", i)
 		}
 	}
-	v, _, ok := h.ViewingFrameFor("h1")
+	v, _, ok := testViewing(h, "h1")
 	if !ok || !v.All {
 		t.Fatalf("viewing past the cap = %+v ok=%v, want all", v, ok)
 	}

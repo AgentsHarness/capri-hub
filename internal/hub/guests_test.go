@@ -370,7 +370,7 @@ func TestGuestChildScope(t *testing.T) {
 	g, _ := h.CreateGuestToken("t", 0, []GuestSession{{HostID: "h1", SessionID: "parent"}})
 
 	// Host announces the child on the parent's event stream.
-	h.RegisterRawEvents("h1", []json.RawMessage{
+	testIngest(h, "h1", []json.RawMessage{
 		json.RawMessage(`{"type":"subagent_spawned","seq":1,"sessionId":"parent","update":{"child_session_id":"child-1","subagent_id":"child-1"}}`),
 	})
 
@@ -424,7 +424,7 @@ func TestGuestChildScopeNeedsWhitelistedParent(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	g, _ := h.CreateGuestToken("t", 0, []GuestSession{{HostID: "h1", SessionID: "shared"}})
-	h.RegisterRawEvents("h1", []json.RawMessage{
+	testIngest(h, "h1", []json.RawMessage{
 		json.RawMessage(`{"type":"subagent_spawned","sessionId":"private","update":{"child_session_id":"child-2","subagent_id":"child-2"}}`),
 	})
 	ch, unsub, _, ok := h.TrySubscribeGuest(0, "h1", g)

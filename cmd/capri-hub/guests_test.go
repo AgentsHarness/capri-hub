@@ -42,20 +42,7 @@ func dialFakeHost(t *testing.T, ctx context.Context, srv *httptest.Server, h *hu
 	if err != nil {
 		t.Fatalf("pair %s: %v", hostID, err)
 	}
-	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Authorization":   []string{"Bearer " + token},
-			"X-Hub-Deflate":   []string{"1"},
-			"X-Hub-State-Ack": []string{"1"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("host ws dial %s: %v", hostID, err)
-	}
-	conn.SetReadLimit(1 << 20)
-	if _, _, err := conn.Read(ctx); err != nil { // hello
-		t.Fatalf("host hello %s: %v", hostID, err)
-	}
+	conn := dialHostWithToken(t, ctx, srv, hostID, token, 500+hostEpochSeq.Add(1))
 	f := &fakeHost{conn: conn, canned: map[string]any{}}
 	go f.serve(ctx)
 	return f
@@ -86,6 +73,7 @@ func (f *fakeHost) serve(ctx context.Context) {
 		var frame struct {
 			Type   string          `json:"type"`
 			ReqID  string          `json:"reqId"`
+			Seq    uint64          `json:"seq"`
 			Path   string          `json:"path"`
 			Body   json.RawMessage `json:"body"`
 			Method string          `json:"method"`
@@ -118,7 +106,8 @@ func (f *fakeHost) serve(ctx context.Context) {
 			out = map[string]any{"ok": true, "echo": map[string]any{"path": frame.Path, "body": body}}
 		}
 		resp, _ := json.Marshal(map[string]any{
-			"v": 1, "type": "respond", "reqId": frame.ReqID, "status": 200, "body": out,
+			"v": 2, "type": "respond", "reqId": frame.ReqID, "seq": 0,
+			"ack": frame.Seq, "status": 200, "body": out,
 		})
 		_ = f.conn.Write(ctx, websocket.MessageText, resp)
 	}
@@ -467,9 +456,22 @@ func TestGuestRelayEnforcement(t *testing.T) {
 func TestGuestRelayChildSession(t *testing.T) {
 	f := newGuestFixture(t)
 	// The host announces the child on the parent's stream.
-	f.h.RegisterRawEvents("h1", []json.RawMessage{
-		json.RawMessage(`{"type":"subagent_spawned","seq":1,"sessionId":"s1","update":{"child_session_id":"child-1","subagent_id":"child-1"}}`),
+	spawn, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "events", "seq": 1, "ack": 0,
+		"events": []any{map[string]any{
+			"type": "subagent_spawned", "seq": 1, "sessionId": "s1",
+			"update": map[string]any{"child_session_id": "child-1", "subagent_id": "child-1"},
+		}},
 	})
+	if err := f.host1.conn.Write(context.Background(), websocket.MessageText, spawn); err != nil {
+		t.Fatalf("spawn event: %v", err)
+	}
+	// Wait until the hub has learned the relation (it is applied synchronously
+	// on the host read path, but the relay below may race the session loop).
+	deadline := time.Now().Add(2 * time.Second)
+	for f.h.GuestParentOf("h1", "child-1") == "" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	res, body := f.do(t, f.guest.Token, http.MethodPost, "/api/session-updates?host=h1",
 		map[string]any{"sessionId": "child-1", "cwd": "/tmp/child", "offset": -10})
