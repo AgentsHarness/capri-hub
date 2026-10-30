@@ -123,16 +123,23 @@ func (p *sessionProto) accept(seq uint64, payload []byte) ([][]byte, uint64, err
 	return p.up.Accept(seq, payload)
 }
 
-// ackDown applies the peer's watermark and forgets the requests it covers.
-func (p *sessionProto) ackDown(n uint64) {
+// ackDown applies the peer's watermark and forgets the requests it covers. It
+// returns the watermark actually in force: Sender.Ack clamps an ack above the
+// last assigned seq, because a peer cannot confirm a frame that was never
+// sent. Reporting the clamped value keeps the session's own mirror honest —
+// recording the raw number would make every later, genuine ack look stale and
+// stall the down log for the life of the session.
+func (p *sessionProto) ackDown(n uint64) uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.down.Ack(n)
+	applied := p.down.Acked()
 	for seq := range p.reqAcks {
-		if seq <= n {
+		if seq <= applied {
 			delete(p.reqAcks, seq)
 		}
 	}
+	return applied
 }
 
 // appendReliable assigns the next down seq, stamps the current up watermark,
@@ -530,8 +537,7 @@ func (s *session) handleFrame(data []byte) wire.CloseReason {
 	// log; it is applied before the payload so a respond can never be
 	// processed as "not delivered".
 	if f.Ack > s.lastDownAck {
-		s.proto.ackDown(f.Ack)
-		s.lastDownAck = f.Ack
+		s.lastDownAck = s.proto.ackDown(f.Ack)
 	}
 	switch f.Type {
 	case wire.TypeEvents:

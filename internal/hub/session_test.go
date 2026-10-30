@@ -281,6 +281,33 @@ func (fh *fakeHost) waitReason(timeout time.Duration) wire.CloseReason {
 	}
 }
 
+// TestSessionAckBeyondNextDoesNotPoisonTheMirror: an ack for a seq the hub
+// never sent is clamped to the watermark it actually has, and a later genuine
+// ack still advances it. Recording the raw value would make every real ack
+// look stale and stall the down log for the rest of the session.
+func TestSessionAckBeyondNextDoesNotPoisonTheMirror(t *testing.T) {
+	p := newSessionProto(1, 0, 8)
+
+	if got := p.ackDown(999); got != 0 {
+		t.Fatalf("ack of an unsent seq advanced the watermark to %d", got)
+	}
+	seq, err := p.appendReliable(func(seq, ack uint64) wire.Frame {
+		return wire.NewAudience(seq, ack, wire.Audience{Gen: 1, Watchers: 1})
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if !p.hasUnacked() {
+		t.Fatal("appended frame is not in the unacked log")
+	}
+	if got := p.ackDown(seq); got != seq {
+		t.Fatalf("genuine ack of %d was clamped to %d", seq, got)
+	}
+	if p.hasUnacked() || p.downAcked() != seq {
+		t.Fatalf("down log not drained: unacked=%v acked=%d", p.hasUnacked(), p.downAcked())
+	}
+}
+
 // TestSessionResumeDownAdopted: a same-epoch resume adopts hello.resume.down
 // as the down watermark, so frames the host already applied are not replayed
 // and hello_ack reports the adopted value.
