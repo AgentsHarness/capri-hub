@@ -55,15 +55,6 @@ func (f *fakeHost) respond(path string, body any) {
 	f.mu.Unlock()
 }
 
-func (f *fakeHost) lastRequest() (relayedRequest, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.seen) == 0 {
-		return relayedRequest{}, false
-	}
-	return f.seen[len(f.seen)-1], true
-}
-
 func (f *fakeHost) serve(ctx context.Context) {
 	for {
 		_, data, err := f.conn.Read(ctx)

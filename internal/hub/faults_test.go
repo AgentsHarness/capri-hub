@@ -8,7 +8,7 @@ import (
 )
 
 // This file is the Stage-4 fault matrix at the hub end of the session: the
-// failure modes that created the v1 patch layer, driven through the real
+// failure modes v2 must answer, driven through the real
 // ServeHost path with an in-process fake host transport.
 
 // collectHostSeqs drains ch until n events of hostID arrived and returns

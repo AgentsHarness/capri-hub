@@ -101,14 +101,6 @@ func prunePrefsTombstones(entries PrefsEntries, now time.Time) {
 	}
 }
 
-func prefsLive(entries PrefsEntries, key string) (PrefsEntry, bool) {
-	e, ok := entries[key]
-	if !ok || e.Del {
-		return PrefsEntry{}, false
-	}
-	return e, true
-}
-
 // projectPrefsEntries fills the document's snapshot fields from entries. The
 // snapshot is what FEs render; entries stay the authority, so this is always
 // recomputed rather than trusted from outside.

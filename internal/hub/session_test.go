@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"sort"
@@ -118,6 +119,13 @@ func dialFakeHost(t *testing.T, h *Hub, hostID string, epoch uint64) *fakeHost {
 // resumeUp+1.
 func dialFakeHostResume(t *testing.T, h *Hub, hostID string, epoch, resumeUp uint64) *fakeHost {
 	t.Helper()
+	return dialFakeHostFull(t, h, hostID, epoch, resumeUp, 0)
+}
+
+// dialFakeHostFull is dialFakeHostResume with an explicit resume.down: the
+// highest down seq the host claims to have applied.
+func dialFakeHostFull(t *testing.T, h *Hub, hostID string, epoch, resumeUp, resumeDown uint64) *fakeHost {
+	t.Helper()
 	h.mu.Lock()
 	hs := h.hosts[hostID]
 	var token string
@@ -152,19 +160,13 @@ func dialFakeHostResume(t *testing.T, h *Hub, hostID string, epoch, resumeUp uin
 	fh.send(wire.NewHello(wire.Hello{
 		Epoch:  epoch,
 		Token:  token,
-		Resume: &wire.Resume{Up: resumeUp},
+		Resume: &wire.Resume{Up: resumeUp, Down: resumeDown},
 	}))
 	fh.ack = fh.recvType(wire.TypeHelloAck, 5*time.Second)
 	if got := fh.ack.Epoch; got != epoch {
 		t.Fatalf("hello_ack epoch = %d, want %d", got, epoch)
 	}
 	return fh
-}
-
-func (fh *fakeHost) token() string {
-	fh.h.mu.Lock()
-	defer fh.h.mu.Unlock()
-	return fh.h.hosts[fh.host].token
 }
 
 func (fh *fakeHost) send(f wire.Frame) {
@@ -276,6 +278,106 @@ func (fh *fakeHost) waitReason(timeout time.Duration) wire.CloseReason {
 	case <-time.After(timeout):
 		fh.t.Fatalf("session did not end within %s", timeout)
 		return 0
+	}
+}
+
+// TestSessionResumeDownAdopted: a same-epoch resume adopts hello.resume.down
+// as the down watermark, so frames the host already applied are not replayed
+// and hello_ack reports the adopted value.
+func TestSessionResumeDownAdopted(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+
+	first := dialFakeHost(t, h, "h1", 5)
+	for i := 1; i <= 5; i++ {
+		go func() {
+			_, _ = h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
+		}()
+		if f := first.recvType(wire.TypeRequest, 2*time.Second); f.Seq != uint64(i) {
+			t.Fatalf("down frame %d has seq %d", i, f.Seq)
+		}
+	}
+	first.ft.hangup()
+	first.waitReason(2 * time.Second)
+
+	// The host applied 1..5; the hub must not replay them.
+	second := dialFakeHostFull(t, h, "h1", 5, 0, 5)
+	if got := second.ack.AckDown; got != 5 {
+		t.Fatalf("hello_ack.ackDown = %d, want the adopted 5", got)
+	}
+	second.noFrame(300 * time.Millisecond)
+
+	// The next frame continues the same down space.
+	go func() {
+		_, _ = h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
+	}()
+	if f := second.recvType(wire.TypeRequest, 2*time.Second); f.Seq != 6 {
+		t.Fatalf("first frame after resume has seq %d, want 6", f.Seq)
+	}
+}
+
+// TestSessionUpWindowFromAdvertisedLimits: the up receiver's overflow bound is
+// the limits.resumeWindow the hub advertises, not a package constant.
+func TestSessionUpWindowFromAdvertisedLimits(t *testing.T) {
+	prev := SessionLimits
+	SessionLimits = wire.DefaultLimits
+	SessionLimits.ResumeWindow = 3
+	t.Cleanup(func() { SessionLimits = prev })
+
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+	if fh.ack.Limits == nil || fh.ack.Limits.ResumeWindow != 3 {
+		t.Fatalf("advertised limits = %+v, want resumeWindow 3", fh.ack.Limits)
+	}
+
+	// Seq 1 is missing; 2..5 park four frames, one past the advertised bound.
+	fh.events(2, 0, chunkEvent(2, "b"), chunkEvent(3, "c"), chunkEvent(4, "d"), chunkEvent(5, "e"))
+	if got := fh.waitReason(2 * time.Second); got != wire.CloseOverflow {
+		t.Fatalf("close = %s, want overflow at the advertised window", got)
+	}
+}
+
+// TestEpochResetQueuedBehindRetiredEvents: the subscribed{seq:baseline} reset
+// travels through the per-host fan-out queue, so events of the retired epoch
+// reach the browser first and the reset precedes every new-epoch event.
+func TestEpochResetQueuedBehindRetiredEvents(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	h.mu.Lock()
+	hs := h.hosts["h1"]
+	h.mu.Unlock()
+
+	// Install the queue without its drain goroutine so the test sees exactly
+	// the order the queue holds.
+	hs.fanoutOnce.Do(func() {})
+	hs.mu.Lock()
+	hs.fanout = make(chan fanoutItem, 8)
+	hs.mu.Unlock()
+
+	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(3)})
+	h.mu.Lock()
+	h.announceEpochReset(hs, 9)
+	h.mu.Unlock()
+	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(10)})
+
+	var got []Event
+	for len(got) < 3 {
+		select {
+		case item := <-hs.fanout:
+			got = append(got, item.ev)
+		case <-time.After(time.Second):
+			t.Fatalf("queue held only %d events", len(got))
+		}
+	}
+	if got[0]["type"] != "chunk" || evSeq(got[0]) != 3 {
+		t.Fatalf("first queued event = %v, want the retired epoch's chunk 3", got[0])
+	}
+	if got[1]["type"] != "subscribed" || got[1]["host"] != "h1" || evSeq(got[1]) != 9 {
+		t.Fatalf("second queued event = %v, want subscribed{host:h1,seq:9}", got[1])
+	}
+	if got[2]["type"] != "chunk" || evSeq(got[2]) != 10 {
+		t.Fatalf("third queued event = %v, want the new epoch's chunk 10", got[2])
 	}
 }
 
@@ -863,7 +965,7 @@ func testSession(h *Hub, hostID string) *session {
 		return hs.session
 	}
 	if hs.proto == nil {
-		hs.proto = newSessionProto(1, 0)
+		hs.proto = newSessionProto(1, 0, SessionLimits.ResumeWindow)
 		hs.epoch.Store(1)
 		hs.upAcked.Store(0)
 	}

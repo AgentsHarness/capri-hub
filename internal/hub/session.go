@@ -39,6 +39,11 @@ var (
 	// idle / retransmit paths without waiting.
 	SessionLiveness = wire.DefaultLiveness
 
+	// SessionLimits is what hello_ack advertises and what the hub itself
+	// applies: the up receiver parks at most limits.resumeWindow frames, so
+	// the bound the host is told is the bound in force. Shrunk by tests.
+	SessionLimits = wire.DefaultLimits
+
 	// RequestAckTimeout is how long a relayed request's down frame may stay
 	// unacked before that request is failed. Delivery is proven by the host's
 	// cumulative ack, so this is an RPC deadline inside the session, not a
@@ -88,10 +93,11 @@ type sessionProto struct {
 // high-water baseline declared in hello.resume.up: the host's event bus may be
 // past events the hub never saw (the FE rebuilds those from history), so the
 // first live event is baseline+1 and everything at or below is a duplicate.
-func newSessionProto(epoch, upAcked uint64) *sessionProto {
+// window is the advertised limits.resumeWindow for the up receiver.
+func newSessionProto(epoch, upAcked uint64, window int) *sessionProto {
 	return &sessionProto{
 		epoch:   epoch,
-		up:      wire.NewReceiver(upAcked),
+		up:      wire.NewReceiverWindow(upAcked, window),
 		down:    wire.NewSender(0),
 		reqAcks: make(map[uint64]reqAck),
 	}
@@ -358,7 +364,7 @@ func (h *Hub) serveHost(expected string, t Transport) wire.CloseReason {
 	keepalive := time.Duration(SessionLiveness.Keepalive) * time.Second
 	t.SetKeepalive(keepalive)
 
-	s, old, ack, err := h.attach(hostID, hello.Epoch, hello.Resume.Up, deflate)
+	s, old, ack, err := h.attach(hostID, hello.Epoch, hello.Resume.Up, hello.Resume.Down, deflate)
 	if err != nil {
 		log.Printf("[capri-hub] host %s: attach: %v", hostID, err)
 		if errors.Is(err, ErrHostUnknown) {

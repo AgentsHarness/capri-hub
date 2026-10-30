@@ -569,21 +569,6 @@ func (s *feTicketStore) consume(ticket string) (guestID string, ok bool) {
 	return rec.guestID, true
 }
 
-// valid reports whether ticket is still usable WITHOUT burning it (used by
-// the WS handshake, which must not consume twice when logging).
-func (s *feTicketStore) valid(ticket string) (guestID string, ok bool) {
-	if ticket == "" {
-		return "", false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, found := s.tickets[ticket]
-	if !found || !rec.expires.After(time.Now()) {
-		return "", false
-	}
-	return rec.guestID, true
-}
-
 func handleWSTicket(h *hub.Hub, tickets *feTicketStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// requireAny already resolved (and burned any ?ticket=) — reusing

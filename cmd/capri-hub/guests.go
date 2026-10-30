@@ -165,7 +165,6 @@ func handleGuestTokenRefresh(h *hub.Hub) http.HandlerFunc {
 		type hostScan struct {
 			titles map[string]string
 			cwds   map[string]string
-			names  map[string]string
 			ok     bool
 		}
 		scans := make(map[string]hostScan, len(hosts))

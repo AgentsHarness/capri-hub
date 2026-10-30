@@ -141,10 +141,11 @@ func (e *RelayError) Error() string { return e.Message }
 type Event map[string]any
 
 // HostInfo is the public registry entry (GET /api/hosts). busy/booting/
-// pendingCount are the host's live snapshot (host_status heartbeat) —
-// transient, never persisted; absent on older hosts/FEs that predate
-// them (omitempty). Port is the host's local HTTP listen port (so the
-// browser can probe 127.0.0.1:<port>); it is persisted.
+// pendingCount are the host's live snapshot (the hb.status field) —
+// transient, never persisted. Port is the host's local HTTP listen port (so
+// the browser can try 127.0.0.1:<port>); it is persisted. LastSeen is the
+// last attach/detach activity and only orders the host list: online is
+// derived from the attachment, never from this timestamp.
 type HostInfo struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
@@ -230,8 +231,8 @@ type hostState struct {
 
 	// fanout decouples uplink ingestion from browser fan-out. The session
 	// loop only appends here (bounded, never blocks); a per-host goroutine
-	// drains it into h.broadcast.
-	fanout     chan Event
+	// drains it into the subscriber broadcast.
+	fanout     chan fanoutItem
 	fanoutOnce sync.Once
 	// fanoutDropped counts events dropped because the fan-out queue was
 	// full. The event is already in evBuf, so a FE's (hostId,seq) gap-pull
@@ -279,23 +280,53 @@ func (hs *hostState) fanoutDepth() int {
 // event back out of evBuf.
 const hostFanoutCap = 2048
 
+// fanoutReady reports whether this host already has a fan-out queue, i.e.
+// whether an event can be sitting in front of the one about to be enqueued.
+func (hs *hostState) fanoutReady() bool {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.fanout != nil
+}
+
+// fanoutItem is one queued event plus the host it was buffered for. The host
+// is explicit so a control frame that carries no hostId of its own (the
+// epoch-reset `subscribed`) is still delivered to exactly that host's
+// subscribers, without being dressed up as a host event.
+type fanoutItem struct {
+	hostID string
+	ev     Event
+}
+
 // enqueueFanout hands one already-gated, already-buffered event to this
 // host's fan-out goroutine. Never blocks: a slow browser must not stall the
 // host read loop (see hostState.fanout).
-func (hs *hostState) enqueueFanout(h *Hub, ev Event) {
-	hs.fanoutOnce.Do(func() {
-		hs.fanout = make(chan Event, hostFanoutCap)
-		go func() {
-			for e := range hs.fanout {
-				h.broadcast(e)
-			}
-		}()
-	})
+func (hs *hostState) enqueueFanout(h *Hub, hostID string, ev Event) {
+	ch := hs.fanoutQueue(h)
 	select {
-	case hs.fanout <- ev:
+	case ch <- fanoutItem{hostID: hostID, ev: ev}:
 	default:
 		hs.fanoutDropped.Add(1)
 	}
+}
+
+// fanoutQueue returns the host's fan-out channel, starting its goroutine on
+// first use. The channel is published under hs.mu so the diagnostics readers
+// (fanoutDepth, fanoutReady) never observe a half-installed queue.
+func (hs *hostState) fanoutQueue(h *Hub) chan fanoutItem {
+	hs.fanoutOnce.Do(func() {
+		ch := make(chan fanoutItem, hostFanoutCap)
+		hs.mu.Lock()
+		hs.fanout = ch
+		hs.mu.Unlock()
+		go func() {
+			for item := range ch {
+				h.broadcastHost(item.hostID, item.ev)
+			}
+		}()
+	})
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.fanout
 }
 
 // Hub is the relay core. All methods are safe for concurrent use.
@@ -363,6 +394,11 @@ type Hub struct {
 	lateRelayChunks atomic.Uint64
 	// startedAt stamps process start for the uptime in GET /api/stats.
 	startedAt time.Time
+	// hubBoot identifies this hub process. The relay request-id counter
+	// restarts at 0 on every process start, so a reqId only names one request
+	// inside one hubBoot; hello_ack carries it and the host scopes its relay
+	// memo by it. Minted once in NewWithDir.
+	hubBoot uint64
 	// guestChildren maps a subagent child session (and its subagent id) to the
 	// parent session that spawned it, per host. Learned from the
 	// subagent_spawned typed event, so a guest token may follow the transcript
@@ -391,12 +427,21 @@ func New() *Hub {
 // persistence (used by tests).
 func NewWithDir(dir string) *Hub {
 	emptySubs := []*feSubscriber{}
+	boot, err := wire.NewEpoch()
+	if err != nil {
+		// A non-zero timestamp still satisfies the protocol's "per-process,
+		// non-zero" requirement; a hub with a zero boot id could not write a
+		// valid hello_ack at all.
+		boot = uint64(time.Now().UnixNano()) | 1
+		log.Printf("[capri-hub] 无法生成随机 hubBoot（%v），使用时间戳 %d", err, boot)
+	}
 	h := &Hub{
 		tokens:    make(map[string]string),
 		hosts:     make(map[string]*hostState),
 		pending:   make(map[string]map[string]*pendingReq),
 		prefs:     BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
 		startedAt: time.Now(),
+		hubBoot:   boot,
 	}
 	h.subs.Store(&emptySubs)
 	if dir != "" {
@@ -947,12 +992,14 @@ func (h *Hub) HostIDForToken(token string) (string, bool) {
 //
 // A same-epoch reconnect resumes the existing protocol state, so the peer's
 // unacked log is replayed against the same watermarks and resume.up is
-// ignored: the hub's ackUp is authoritative there. A new epoch starts from
-// the host's declared baseline (resume.up — the retired high-water mark of its
-// event bus), resets the gap-pull buffer, tells /ws/fe subscribers the same
-// baseline via subscribed{seq:baseline} before any new-epoch event, and leaves
-// the per-host audience generation increasing.
-func (h *Hub) attach(hostID string, epoch, resumeUp uint64, deflate bool) (s *session, old *session, ack wire.HelloAck, err error) {
+// ignored: the hub's ackUp is authoritative there. resume.down is adopted as
+// the down watermark, so the hub does not replay frames the host already
+// applied. A new epoch starts from the host's declared baseline (resume.up —
+// the retired high-water mark of its event bus), resets the gap-pull buffer,
+// starts the down sender at zero, tells /ws/fe subscribers the same baseline
+// via subscribed{seq:baseline} before any new-epoch event, and leaves the
+// per-host audience generation increasing.
+func (h *Hub) attach(hostID string, epoch, resumeUp, resumeDown uint64, deflate bool) (s *session, old *session, ack wire.HelloAck, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
@@ -967,7 +1014,7 @@ func (h *Hub) attach(hostID string, epoch, resumeUp uint64, deflate bool) (s *se
 		if hs.proto != nil {
 			h.failPendingLocked(hostID)
 		}
-		hs.proto = newSessionProto(epoch, resumeUp)
+		hs.proto = newSessionProto(epoch, resumeUp, SessionLimits.ResumeWindow)
 		hs.epoch.Store(epoch)
 		hs.upAcked.Store(resumeUp)
 		hs.mu.Lock()
@@ -976,8 +1023,16 @@ func (h *Hub) attach(hostID string, epoch, resumeUp uint64, deflate bool) (s *se
 		hs.mu.Unlock()
 		// The FE watermark is per host, so it must be told about the restart
 		// before it sees an event numbered in the new space. The baseline is
-		// the new coordinate's origin, not necessarily 0.
-		h.broadcastSeqReset(hostID, resumeUp)
+		// the new coordinate's origin, not necessarily 0. The reset rides the
+		// fan-out queue: events of the retired epoch may still be waiting
+		// there and must reach the browser first.
+		h.announceEpochReset(hs, resumeUp)
+	} else if resumeDown > 0 {
+		// The host already applied everything up to resume.down; advancing the
+		// down sender's ack drops those entries instead of replaying them, and
+		// releases the requests they proved delivered. A stale or smaller
+		// value never moves the watermark backwards.
+		hs.proto.ackDown(resumeDown)
 	}
 	s = &session{
 		h:      h,
@@ -996,10 +1051,11 @@ func (h *Hub) attach(hostID string, epoch, resumeUp uint64, deflate bool) (s *se
 
 	aud, _ := h.audienceLocked(hostID)
 	liveness := SessionLiveness
-	limits := wire.DefaultLimits
+	limits := SessionLimits
 	caps := wire.Caps{Deflate: deflate}
 	ack = wire.HelloAck{
 		Epoch:    epoch,
+		HubBoot:  h.hubBoot,
 		AckUp:    hs.proto.upAcked(),
 		AckDown:  hs.proto.downAcked(),
 		Audience: &aud,
@@ -1132,10 +1188,9 @@ func evSeq(ev Event) uint64 {
 	return 0
 }
 
-// HostStatusPatch carries the registry fields a host_status frame may
-// update. Fields absent from the frame arrive as nil and leave the current
-// value untouched. LastSeen refreshes on every frame; hosts_changed fires
-// when any field flips.
+// HostStatusPatch carries the registry fields an hb status snapshot may
+// update. Fields absent from the snapshot arrive as nil and leave the current
+// value untouched; hosts_changed fires when any field flips.
 type HostStatusPatch struct {
 	Ready        *bool
 	Busy         *bool
@@ -1574,7 +1629,7 @@ func (h *Hub) ingestRawEvents(s *session, raws []json.RawMessage) bool {
 		if meta.Type == "subagent_spawned" {
 			h.noteSpawnFromRaw(s.hostID, r)
 		}
-		hs.enqueueFanout(h, ev)
+		hs.enqueueFanout(h, s.hostID, ev)
 	}
 	return true
 }
@@ -1891,8 +1946,8 @@ func (h *Hub) DefaultHostID() string {
 // returned func to unsubscribe.
 //
 // Subscribe/unsubscribe notify connected hosts of the browser subscriber
-// count so they can pause event upload when nobody is listening (heartbeat
-// host_status still runs on the host side).
+// count so they can pause event upload when nobody is listening (the
+// heartbeat and the registry it feeds keep running on the host side).
 func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
 	ch, unsub, _ := h.TrySubscribe(0) // 0 = unlimited
 	return ch, unsub
@@ -2221,15 +2276,6 @@ func (s *feSubscriber) watchesEvent(ev Event) bool {
 // kick ends a guest subscriber's socket (token revoked or deleted).
 func (s *feSubscriber) kick() {
 	s.kickOnce.Do(func() { close(s.kicked) })
-}
-
-// kickedChan is nil for admin subscribers so a select on it stays blocked
-// forever (nil channel semantics).
-func (s *feSubscriber) kickedChan() <-chan struct{} {
-	if !s.guest {
-		return nil
-	}
-	return s.kicked
 }
 
 // Drop-tier policy for a full subscriber queue. Terminal / control events
@@ -2781,10 +2827,21 @@ func (h *Hub) notifyAudience() {
 	}
 }
 
-// broadcastSeqReset tells /ws/fe subscribers of hostID that its sequence space
-// restarted, so their per-host watermark resets before any new-epoch event.
-func (h *Hub) broadcastSeqReset(hostID string, baseline uint64) {
+// announceEpochReset tells the /ws/fe subscribers of hs that its sequence
+// space restarted, so their per-host watermark resets before any new-epoch
+// event. It is enqueued on the per-host fan-out queue, not delivered directly:
+// events of the retired epoch may still be sitting in that queue, and the
+// reset must follow them and precede everything from the new epoch.
+//
+// Caller holds h.mu (attach). A host with no queue and no goroutine yet cannot
+// have a pending event, so direct delivery is equivalent there.
+func (h *Hub) announceEpochReset(hs *hostState, baseline uint64) {
+	hostID := hs.info.HostID
 	ev := Event{"v": 1, "type": "subscribed", "host": hostID, "seq": baseline}
+	if hs.fanoutReady() {
+		hs.enqueueFanout(h, hostID, ev)
+		return
+	}
 	if cur := h.subs.Load(); cur != nil {
 		for _, s := range *cur {
 			if s.watches(hostID) {
@@ -2853,6 +2910,28 @@ func (h *Hub) broadcast(ev Event) {
 	// sessionId against their whitelist (see watchesEvent).
 	for _, s := range *cur {
 		if !s.watchesEvent(ev) {
+			continue
+		}
+		s.deliver(ev)
+	}
+}
+
+// broadcastHost fans one queued event out to the subscribers of hostID. An
+// event that carries its own hostId (every uplinked transcript event) uses the
+// full guest filter; a control frame without one — the epoch-reset
+// `subscribed` — goes to every subscriber watching that host, guests included,
+// because it carries no session to whitelist.
+func (h *Hub) broadcastHost(hostID string, ev Event) {
+	cur := h.subs.Load()
+	if cur == nil {
+		return
+	}
+	_, tagged := ev["hostId"].(string)
+	for _, s := range *cur {
+		if !s.watches(hostID) {
+			continue
+		}
+		if tagged && !s.watchesEvent(ev) {
 			continue
 		}
 		s.deliver(ev)

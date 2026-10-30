@@ -597,9 +597,8 @@ func TestEventTaggingAndFanout(t *testing.T) {
 	}
 }
 
-// A host_status frame is a control frame: it updates Ready without becoming
-// an event. A host_status nested inside an events frame is no longer a
-// supported shape.
+// UpdateHostStatus is control-plane state: it updates Ready without becoming
+// an event or moving the data-plane watermark.
 func TestHostStatusIsControlFrame(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
@@ -742,7 +741,7 @@ func TestRegisterRawEventsDoesNotMutateInput(t *testing.T) {
 // re-fan-out to FE subscribers, and must not re-append to the gap-pull
 // buffer. LastSeen is still refreshed (return true). A higher seq still
 // advances and fans out as usual.
-// TestHostStatusControlFrame: control-plane host_status updates Ready +
+// TestHostStatusControlFrame: a control-plane status update sets Ready and
 // fires hosts_changed on flip, without advancing LastSeq or buffering events.
 func TestHostStatusControlFrame(t *testing.T) {
 	h := NewWithDir(t.TempDir())
@@ -767,16 +766,16 @@ func TestHostStatusControlFrame(t *testing.T) {
 		return h.UpdateHostStatus("h1", HostStatusPatch{Ready: &ready})
 	}
 	if !setReady(true) {
-		t.Fatal("host_status ready=true failed")
+		t.Fatal("status ready=true failed")
 	}
 	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
 		t.Errorf("ready not set: %+v", hosts)
 	}
 	if got := h.LastSeq("h1"); got != 7 {
-		t.Errorf("LastSeq = %d after host_status, want 7 (must not advance)", got)
+		t.Errorf("LastSeq = %d after a status update, want 7 (must not advance)", got)
 	}
 	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Errorf("evBuf len = %d after host_status, want 1", n)
+		t.Errorf("evBuf len = %d after a status update, want 1", n)
 	}
 	select {
 	case ev := <-ch:
@@ -789,7 +788,7 @@ func TestHostStatusControlFrame(t *testing.T) {
 
 	// Same ready value: no second hosts_changed.
 	if !setReady(true) {
-		t.Fatal("host_status ready=true (noop) failed")
+		t.Fatal("status ready=true (noop) failed")
 	}
 	select {
 	case ev := <-ch:
@@ -800,7 +799,7 @@ func TestHostStatusControlFrame(t *testing.T) {
 
 	// Flip false → hosts_changed again.
 	if !setReady(false) {
-		t.Fatal("host_status ready=false failed")
+		t.Fatal("status ready=false failed")
 	}
 	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Ready {
 		t.Errorf("ready should be false: %+v", hosts)
@@ -816,14 +815,14 @@ func TestHostStatusControlFrame(t *testing.T) {
 
 	ready := true
 	if h.UpdateHostStatus("nope", HostStatusPatch{Ready: &ready}) {
-		t.Error("host_status for unknown host should fail")
+		t.Error("status update for unknown host should fail")
 	}
 }
 
-// TestUpdateHostStatus: control-plane host_status carries the live
-// registry fields (ready/busy/booting/pendingCount); hosts_changed fires
-// on ANY flip, nil fields leave the current value untouched (older hosts
-// send only ready), and identical frames stay silent.
+// TestUpdateHostStatus: the hb status snapshot carries the live registry
+// fields (ready/busy/booting/pendingCount); hosts_changed fires on ANY flip,
+// nil fields leave the current value untouched, and identical snapshots stay
+// silent.
 func TestUpdateHostStatus(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
@@ -1277,18 +1276,6 @@ func TestIngestRawEvents(t *testing.T) {
 	}
 	if testIngest(h, "nope", nil) {
 		t.Error("unknown host must return false")
-	}
-}
-
-// TestRegisterRawEventsHostStatusIsNotAnEvent: host_status inside an events
-// frame is no longer a supported shape. It is just an event body, so it must
-// not flip the registry's Ready flag (the control frame does that).
-func TestRegisterRawEventsHostStatusIsNotAnEvent(t *testing.T) {
-	h := NewWithDir(t.TempDir())
-	testPair(t, h, "h1", "H1")
-	testIngest(h, "h1", []json.RawMessage{json.RawMessage(`{"type":"host_status","ready":true,"seq":1}`)})
-	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Ready {
-		t.Errorf("ready flipped by an events-frame host_status: %+v", hosts)
 	}
 }
 
@@ -1953,7 +1940,7 @@ func TestResyncCarriesHostId(t *testing.T) {
 }
 
 // TestUnwatchedHostStatusStillVisible: the host list's live status (online /
-// ready / busy / pendingCount) comes from the host_status CONTROL plane and
+// ready / busy / pendingCount) comes from the heartbeat's status snapshot and
 // the hub-level hosts_changed frame, never from the data-plane event stream.
 // A host nobody watches pauses its event upload, and it must still be
 // correct in every browser's list — otherwise 分流 would silently freeze the
@@ -1979,7 +1966,7 @@ func TestUnwatchedHostStatusStillVisible(t *testing.T) {
 	}
 	ready := true
 	if !h.UpdateHostStatus("h2", HostStatusPatch{Ready: &ready}) {
-		t.Fatal("host_status ready h2")
+		t.Fatal("status ready h2")
 	}
 
 	evs := drainEvents(ch, 200*time.Millisecond)
