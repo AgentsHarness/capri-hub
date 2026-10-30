@@ -2070,3 +2070,90 @@ func TestSubscribeFrameKeepsViewingAll(t *testing.T) {
 	// (TestViewingAllWhenPageSilent): a subscribe-only page must keep the set
 	// at all:true. Here it is enough that the frame was accepted and acked.
 }
+
+// TestFEReceivesEpochResetAsSubscribedFrame pins the shape of the epoch reset
+// on /ws/fe. The FE's only seq-reconciliation entry point for a host restart
+// is the top-level {"type":"subscribed","host":..,"seq":baseline} frame (see
+// acp-fe live.ts, the `subscribed` branch next to the subscribe ack). An
+// `events` batch is walked as transcript, so a reset delivered inside one is
+// emitted as an ordinary event: the page keeps its old per-host watermark and
+// silently drops every event of the new epoch, whose seq restarted lower.
+func TestFEReceivesEpochResetAsSubscribedFrame(t *testing.T) {
+	h := hub.NewWithDir("")
+	const secret = "epoch-reset-secret"
+	srv := httptest.NewServer(buildHandler(h, secret, newFETicketStore(), newPairLimiter(), nil))
+	defer srv.Close()
+
+	code, _ := h.PairingCode()
+	token, err := h.Pair(code, "h1", "H1")
+	if err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	host := dialHostWithToken(t, ctx, srv, "h1", token, 111)
+	defer host.Close(websocket.StatusNormalClosure, "")
+	pushHostEvent(t, ctx, host, 1, map[string]any{"type": "chunk", "text": "before"})
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/ws-ticket", nil)
+	req.Header.Set("Authorization", "Bearer "+secret)
+	tr, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ticketRes struct {
+		Ticket string `json:"ticket"`
+	}
+	_ = json.NewDecoder(tr.Body).Decode(&ticketRes)
+	tr.Body.Close()
+
+	fe, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/fe?ticket="+ticketRes.Ticket, nil)
+	if err != nil {
+		t.Fatalf("fe dial: %v", err)
+	}
+	defer fe.Close(websocket.StatusNormalClosure, "")
+	fe.SetReadLimit(1 << 20)
+	if _, _, err := fe.Read(ctx); err != nil {
+		t.Fatalf("fe hello: %v", err)
+	}
+	frames := feFrames(ctx, fe)
+
+	// A second host connection is a new epoch (a restarted host process): the
+	// hub must announce the retired high-water mark to the page.
+	restarted := dialHostWithToken(t, ctx, srv, "h1", token, 112)
+	defer restarted.Close(websocket.StatusNormalClosure, "")
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("FE never received a top-level subscribed frame for the epoch reset")
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatal("FE connection closed before the epoch reset")
+			}
+			typ, _ := f["type"].(string)
+			if typ == "events" {
+				if evs, _ := f["events"].([]any); len(evs) > 0 {
+					for _, e := range evs {
+						if m, _ := e.(map[string]any); m != nil && m["type"] == "subscribed" {
+							t.Fatalf("epoch reset was batched as a transcript event: %v", m)
+						}
+					}
+				}
+				continue
+			}
+			if typ != "subscribed" {
+				continue
+			}
+			if f["host"] != "h1" {
+				t.Fatalf("subscribed frame names host %v, want h1", f["host"])
+			}
+			if seq, _ := f["seq"].(float64); seq != 0 {
+				t.Fatalf("subscribed baseline = %v, want the declared resume.up 0", f["seq"])
+			}
+			return
+		}
+	}
+}

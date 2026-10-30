@@ -1009,6 +1009,34 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 			flateBufPool.Put(buf)
 			return err
 		}
+		// writeBatch keeps wire order across the two shapes a subscriber
+		// receives. `subscribed` is the only control frame the FE reads as a
+		// TOP-LEVEL frame (live.ts's `subscribed` branch, the same shape the
+		// subscribe ack above writes); batched inside `events` it is walked as
+		// transcript and silently does nothing — and the epoch reset it
+		// carries is what keeps a restarted host's events from being dropped
+		// as stale. Everything else keeps travelling inside the batch.
+		writeBatch := func(evs []hub.Event) error {
+			start := 0
+			for i, ev := range evs {
+				if t, _ := ev["type"].(string); t != "subscribed" {
+					continue
+				}
+				if i > start {
+					if err := writeEventsFrame(evs[start:i]); err != nil {
+						return err
+					}
+				}
+				if err := writeJSONFrame(ev); err != nil {
+					return err
+				}
+				start = i + 1
+			}
+			if start < len(evs) {
+				return writeEventsFrame(evs[start:])
+			}
+			return nil
+		}
 
 		hello := map[string]any{
 			"v":             1,
@@ -1059,7 +1087,7 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 				flushTimer = nil
 				flushCh = nil
 			}
-			return writeEventsFrame(evs)
+			return writeBatch(evs)
 		}
 		defer func() {
 			if flushTimer != nil {
