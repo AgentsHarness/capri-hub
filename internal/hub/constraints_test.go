@@ -3,7 +3,7 @@ package hub
 import (
 	"testing"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // hostReplayCap mirrors capri-host internal/hub/client.go's replayCap: the

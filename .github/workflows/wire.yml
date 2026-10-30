@@ -1,0 +1,44 @@
+name: wire
+
+on:
+  push:
+    branches: [main, refactor/session-v2]
+    paths:
+      - 'wire/**'
+      - '.github/workflows/wire.yml'
+  pull_request:
+    paths:
+      - 'wire/**'
+      - '.github/workflows/wire.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build, vet, test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wire
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: wire/go.mod
+          cache: true
+
+      # A compile error should not wait for the race build.
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race
+        run: go test -race ./...

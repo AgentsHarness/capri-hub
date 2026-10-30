@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // This file is the Stage-4 fault matrix at the hub end of the session: the

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // One host may have at most maxPendingRelayPerHost relayed requests in

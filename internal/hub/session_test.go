@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // fakeTransport is the host end of one session link. Recv is unblocked by

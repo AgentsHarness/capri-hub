@@ -42,7 +42,7 @@ import (
 	"time"
 
 	"github.com/AgentsHarness/capri-hub/internal/hub"
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 )

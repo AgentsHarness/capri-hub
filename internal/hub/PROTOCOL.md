@@ -1,8 +1,8 @@
 # PROTOCOL — hub-side transport notes
 
 The host ↔ hub session protocol is specified once in
-`capri-wire/PROTOCOL-V2.md` and implemented by
-`github.com/AgentsHarness/capri-wire` (frame model, sender/receiver, close
+`wire/PROTOCOL-V2.md` and implemented by
+`github.com/AgentsHarness/capri-hub/wire` (frame model, sender/receiver, close
 reasons). That document is the single source of truth; this file only records
 what the hub's transports do with a frame and in what order.
 

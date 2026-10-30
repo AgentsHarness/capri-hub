@@ -14,7 +14,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // The uplink decoders accept two framings per transport — bare JSON and a raw

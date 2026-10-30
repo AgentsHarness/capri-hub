@@ -7,7 +7,7 @@
 //	Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──WS|QUIC──▶ capri-host × N ──stdio──▶ grok
 //
 // Hosts connect OUTBOUND to the hub (NAT-friendly) and speak the v2 session
-// protocol (capri-wire/PROTOCOL-V2.md): relayed browser requests and absolute
+// protocol (wire/PROTOCOL-V2.md): relayed browser requests and absolute
 // audience state down, events / relays up, all with one seq space per
 // direction. Browsers open /ws/fe for the aggregated live event stream; REST
 // APIs stay on HTTP.
@@ -32,7 +32,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 const (
