@@ -45,7 +45,7 @@ const (
 	// request frame was delivered. It is the relay layer's ceiling: long
 	// running endpoints (history, file reads, agent-style RPCs) legitimately
 	// need this order of magnitude. Delivery itself has its own, much
-	// shorter deadline (RequestAckTimeout in session.go).
+	// shorter deadline (requestAckDeadline in session.go, three heartbeats).
 	RelayTimeout = 45 * time.Minute
 	// eventBufCap bounds per-host buffered events for gap-pull. It MUST
 	// stay ≥ the host's replay ring (capri-host internal/hub replayCap =
@@ -199,7 +199,8 @@ type hostState struct {
 	proto   *sessionProto
 	// epoch mirrors proto.epoch for the event ingest fast path, which checks
 	// it under hs.mu so a superseded epoch's frames cannot land in the new
-	// epoch's buffers.
+	// epoch's buffers. It also validates queued fan-out items, which are
+	// enqueued after that check has been released (fanoutItem.epoch).
 	epoch atomic.Uint64
 	// upAcked mirrors the proto's up watermark for LastSeq / SeqByHost, which
 	// must answer while the host is offline too.
@@ -292,18 +293,34 @@ func (hs *hostState) fanoutReady() bool {
 // is explicit so a control frame that carries no hostId of its own (the
 // epoch-reset `subscribed`) is still delivered to exactly that host's
 // subscribers, without being dressed up as a host event.
+//
+// epoch is the sequence space the event was gated on when it was buffered.
+// Ingest gates an event on hs.epoch under hs.mu, then enqueues it outside the
+// lock; an attach that installs a new epoch in between leaves that item
+// tagged with the retired epoch. The drain side drops it, so a stale
+// high-seq frame can never be delivered behind the reset that moved the FE's
+// watermark (see fanoutItemCurrent).
 type fanoutItem struct {
 	hostID string
 	ev     Event
+	epoch  uint64
+}
+
+// fanoutItemCurrent reports whether item still belongs to the host's live
+// sequence space. The epoch-reset item is tagged with the new epoch, so it is
+// delivered; anything staged for a retired epoch is not.
+func (hs *hostState) fanoutItemCurrent(item fanoutItem) bool {
+	return item.epoch == hs.epoch.Load()
 }
 
 // enqueueFanout hands one already-gated, already-buffered event to this
 // host's fan-out goroutine. Never blocks: a slow browser must not stall the
-// host read loop (see hostState.fanout).
-func (hs *hostState) enqueueFanout(h *Hub, hostID string, ev Event) {
+// host read loop (see hostState.fanout). epoch is the value the caller gated
+// the event on.
+func (hs *hostState) enqueueFanout(h *Hub, hostID string, ev Event, epoch uint64) {
 	ch := hs.fanoutQueue(h)
 	select {
-	case ch <- fanoutItem{hostID: hostID, ev: ev}:
+	case ch <- fanoutItem{hostID: hostID, ev: ev, epoch: epoch}:
 	default:
 		hs.fanoutDropped.Add(1)
 	}
@@ -320,6 +337,9 @@ func (hs *hostState) fanoutQueue(h *Hub) chan fanoutItem {
 		hs.mu.Unlock()
 		go func() {
 			for item := range ch {
+				if !hs.fanoutItemCurrent(item) {
+					continue
+				}
 				h.broadcastHost(item.hostID, item.ev)
 			}
 		}()
@@ -1024,8 +1044,9 @@ func (h *Hub) attach(hostID string, epoch, resumeUp, resumeDown uint64, deflate 
 		// The FE watermark is per host, so it must be told about the restart
 		// before it sees an event numbered in the new space. The baseline is
 		// the new coordinate's origin, not necessarily 0. The reset rides the
-		// fan-out queue: events of the retired epoch may still be waiting
-		// there and must reach the browser first.
+		// fan-out queue: it must not jump ahead of queued work, and items of
+		// the retired epoch that are still queued are dropped when the drain
+		// reaches them (see fanoutItemCurrent).
 		h.announceEpochReset(hs, resumeUp)
 	} else if resumeDown > 0 {
 		// The host already applied everything up to resume.down; advancing the
@@ -1629,7 +1650,12 @@ func (h *Hub) ingestRawEvents(s *session, raws []json.RawMessage) bool {
 		if meta.Type == "subagent_spawned" {
 			h.noteSpawnFromRaw(s.hostID, r)
 		}
-		hs.enqueueFanout(h, s.hostID, ev)
+		// The epoch gate above is released before the enqueue, so an attach
+		// may install a new epoch right here. Tagging the item with the epoch
+		// it was gated on lets the drain drop it instead of delivering a
+		// retired-epoch seq behind the new epoch's reset. Dropping it is safe:
+		// the FE rebuilds from host history.
+		hs.enqueueFanout(h, s.hostID, ev, s.epoch)
 	}
 	return true
 }
@@ -1735,7 +1761,7 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 
 	// Delivery is the session's problem: the frame is logged and retransmitted
 	// until the host's cumulative ack covers it. A frame that stays unacked
-	// past RequestAckTimeout fails this request alone (see session.run).
+	// past the request ack deadline fails this request alone (see session.run).
 	if err := sess.dispatch(reqID, method, path, body); err != nil {
 		h.dropPending(hostID, reqID)
 		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
@@ -2830,8 +2856,11 @@ func (h *Hub) notifyAudience() {
 // announceEpochReset tells the /ws/fe subscribers of hs that its sequence
 // space restarted, so their per-host watermark resets before any new-epoch
 // event. It is enqueued on the per-host fan-out queue, not delivered directly:
-// events of the retired epoch may still be sitting in that queue, and the
-// reset must follow them and precede everything from the new epoch.
+// the reset must not jump ahead of work already queued for this host. Items
+// still tagged with the retired epoch are dropped by the drain instead of
+// being delivered behind the reset; that is safe because the FE rebuilds the
+// transcript from host history, and a stale seq behind the reset would
+// otherwise be accepted and shadow every new-epoch event below it.
 //
 // Caller holds h.mu (attach). A host with no queue and no goroutine yet cannot
 // have a pending event, so direct delivery is equivalent there.
@@ -2839,7 +2868,10 @@ func (h *Hub) announceEpochReset(hs *hostState, baseline uint64) {
 	hostID := hs.info.HostID
 	ev := Event{"v": 1, "type": "subscribed", "host": hostID, "seq": baseline}
 	if hs.fanoutReady() {
-		hs.enqueueFanout(h, hostID, ev)
+		// Tagged with the new epoch: queued items of the retired epoch are
+		// dropped at drain time (fanoutItemCurrent), while this reset is
+		// delivered.
+		hs.enqueueFanout(h, hostID, ev, hs.epoch.Load())
 		return
 	}
 	if cur := h.subs.Load(); cur != nil {

@@ -365,46 +365,102 @@ func TestSessionUpWindowFromAdvertisedLimits(t *testing.T) {
 	}
 }
 
+// stageFanout installs a host's fan-out queue without its drain goroutine, so
+// a test sees exactly what the queue holds.
+func stageFanout(t *testing.T, h *Hub, hostID string, n int) *hostState {
+	t.Helper()
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	h.mu.Unlock()
+	if hs == nil {
+		t.Fatalf("host %s is not paired", hostID)
+	}
+	hs.fanoutOnce.Do(func() {})
+	hs.mu.Lock()
+	hs.fanout = make(chan fanoutItem, n)
+	hs.mu.Unlock()
+	return hs
+}
+
+// drainFanout empties the queue the way its drain goroutine does: an item is
+// delivered only while it still belongs to the host's live epoch.
+func drainFanout(hs *hostState) []Event {
+	var got []Event
+	for {
+		select {
+		case item := <-hs.fanout:
+			if hs.fanoutItemCurrent(item) {
+				got = append(got, item.ev)
+			}
+		default:
+			return got
+		}
+	}
+}
+
 // TestEpochResetQueuedBehindRetiredEvents: the subscribed{seq:baseline} reset
-// travels through the per-host fan-out queue, so events of the retired epoch
-// reach the browser first and the reset precedes every new-epoch event.
+// travels through the per-host fan-out queue, so it is delivered after the
+// items already queued for this host and before everything queued after it.
 func TestEpochResetQueuedBehindRetiredEvents(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
-	h.mu.Lock()
-	hs := h.hosts["h1"]
-	h.mu.Unlock()
+	dialFakeHost(t, h, "h1", 7)
+	hs := stageFanout(t, h, "h1", 8)
+	epoch := hs.epoch.Load()
 
-	// Install the queue without its drain goroutine so the test sees exactly
-	// the order the queue holds.
-	hs.fanoutOnce.Do(func() {})
-	hs.mu.Lock()
-	hs.fanout = make(chan fanoutItem, 8)
-	hs.mu.Unlock()
-
-	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(3)})
+	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(3)}, epoch)
 	h.mu.Lock()
 	h.announceEpochReset(hs, 9)
 	h.mu.Unlock()
-	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(10)})
+	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(10)}, epoch)
 
-	var got []Event
-	for len(got) < 3 {
-		select {
-		case item := <-hs.fanout:
-			got = append(got, item.ev)
-		case <-time.After(time.Second):
-			t.Fatalf("queue held only %d events", len(got))
-		}
+	got := drainFanout(hs)
+	if len(got) != 3 {
+		t.Fatalf("queue delivered %d events, want 3", len(got))
 	}
 	if got[0]["type"] != "chunk" || evSeq(got[0]) != 3 {
-		t.Fatalf("first queued event = %v, want the retired epoch's chunk 3", got[0])
+		t.Fatalf("first queued event = %v, want the earlier chunk 3", got[0])
 	}
 	if got[1]["type"] != "subscribed" || got[1]["host"] != "h1" || evSeq(got[1]) != 9 {
 		t.Fatalf("second queued event = %v, want subscribed{host:h1,seq:9}", got[1])
 	}
 	if got[2]["type"] != "chunk" || evSeq(got[2]) != 10 {
-		t.Fatalf("third queued event = %v, want the new epoch's chunk 10", got[2])
+		t.Fatalf("third queued event = %v, want chunk 10", got[2])
+	}
+}
+
+// TestEpochResetDropsRetiredEpochFanout: ingest gates an event on the epoch
+// under hs.mu and enqueues it after the lock is released, so attach can install
+// a new epoch (and queue the reset) in between. That stale item must be dropped
+// at the new epoch: delivered behind a baseline-0 reset, its high seq would be
+// accepted by the FE and shadow every new-epoch event below it.
+func TestEpochResetDropsRetiredEpochFanout(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	dialFakeHost(t, h, "h1", 7)
+	hs := stageFanout(t, h, "h1", 8)
+	retired := hs.epoch.Load()
+
+	// Ingest passed its epoch check, buffered this event, and is about to
+	// enqueue it when the attach below lands.
+	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(500)}, retired)
+
+	// attach installs the new epoch, clears the buffer and queues the reset.
+	hs.epoch.Store(retired + 1)
+	h.mu.Lock()
+	h.announceEpochReset(hs, 0)
+	h.mu.Unlock()
+	hs.enqueueFanout(h, "h1", Event{"v": 1, "type": "chunk", "hostId": "h1", "seq": uint64(1)}, retired+1)
+
+	got := drainFanout(hs)
+	if len(got) != 2 {
+		t.Fatalf("queue delivered %v, want the reset plus the new-epoch event only", got)
+	}
+	if got[0]["type"] != "subscribed" || got[0]["host"] != "h1" || evSeq(got[0]) != 0 {
+		t.Fatalf("first delivered event = %v, want subscribed{host:h1,seq:0}", got[0])
+	}
+	if got[1]["type"] != "chunk" || evSeq(got[1]) != 1 {
+		t.Fatalf("second delivered event = %v, want the new epoch's chunk 1", got[1])
 	}
 }
 
@@ -791,15 +847,23 @@ func TestSessionIdleClose(t *testing.T) {
 }
 
 // TestSessionRequestAckDeadline: a request frame the host never acks fails
-// that request alone, without a "host sent anything" heuristic.
+// that request alone, without a "host sent anything" heuristic. The deadline
+// is derived from the advertised liveness (three heartbeats), not a fixed
+// second count.
 func TestSessionRequestAckDeadline(t *testing.T) {
-	prev := RequestAckTimeout
-	RequestAckTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { RequestAckTimeout = prev })
-
+	// idle above the deadline, so the request fails on its own clock rather
+	// than on the session's liveness close.
+	shortLiveness(t, 1, 10)
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	fh := dialFakeHost(t, h, "h1", 1)
+
+	h.mu.Lock()
+	deadline := h.hosts["h1"].proto.reqAckDeadline
+	h.mu.Unlock()
+	if want := 3 * time.Duration(SessionLiveness.Keepalive) * time.Second; deadline != want {
+		t.Fatalf("request ack deadline = %s, want 3*keepalive = %s", deadline, want)
+	}
 
 	// The fake host never acks, so the dispatch must fail on its deadline.
 	start := time.Now()
@@ -807,16 +871,68 @@ func TestSessionRequestAckDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
+	elapsed := time.Since(start)
 	if resp.Status != 503 {
 		t.Fatalf("dispatch status = %d, want 503 (request frame never acked)", resp.Status)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("dispatch waited %s, deadline is %s", elapsed, RequestAckTimeout)
+	if elapsed < deadline {
+		t.Fatalf("dispatch failed after %s, before the %s deadline", elapsed, deadline)
+	}
+	if elapsed > deadline+5*time.Second {
+		t.Fatalf("dispatch waited %s for a %s deadline", elapsed, deadline)
 	}
 	// The request frame was on the wire exactly as the protocol defines it.
 	f := fh.recvType(wire.TypeRequest, 2*time.Second)
 	if f.ReqID == "" || f.Method != "GET" || f.Path != "/api/status" {
 		t.Fatalf("request frame = %+v", f)
+	}
+}
+
+// TestSessionRequestSurvivesOneLostFrame: delivery is proven by the host's
+// cumulative ack, and a lost request frame is replayed at RTO (2*keepalive).
+// The request deadline must outlive that retransmit, or a single loss fails a
+// request the session already repaired; it is 3*keepalive for exactly that
+// reason.
+func TestSessionRequestSurvivesOneLostFrame(t *testing.T) {
+	shortLiveness(t, 1, 5)
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	rto := 2 * time.Duration(SessionLiveness.Keepalive) * time.Second
+	h.mu.Lock()
+	deadline := h.hosts["h1"].proto.reqAckDeadline
+	h.mu.Unlock()
+	if deadline <= rto {
+		t.Fatalf("request ack deadline %s does not outlive the %s retransmit timer", deadline, rto)
+	}
+
+	done := make(chan RelayResponse, 1)
+	go func() {
+		resp, _ := h.Dispatch(t.Context(), "h1", "GET", "/api/status", nil)
+		done <- resp
+	}()
+
+	// Lose the first request frame: receive it and ack nothing.
+	first := fh.recvType(wire.TypeRequest, 2*time.Second)
+	second := fh.recvType(wire.TypeRequest, rto+2*time.Second)
+	if second.Seq != first.Seq || second.ReqID != first.ReqID {
+		t.Fatalf("retransmit = seq %d req %q, want the original seq %d req %q",
+			second.Seq, second.ReqID, first.Seq, first.ReqID)
+	}
+	// The replay proves delivery before the deadline: answer it.
+	fh.send(wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeHeartbeat, Ack: second.Seq, Status: json.RawMessage(`{}`)})
+	fh.send(wire.Frame{
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: second.Seq,
+		ReqID: second.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
+	})
+	select {
+	case resp := <-done:
+		if resp.Status != 200 {
+			t.Fatalf("status = %d, want 200 after one lost request frame", resp.Status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch did not resolve after the request was retransmitted")
 	}
 }
 
@@ -880,16 +996,19 @@ func TestSessionRetransmitsUnackedRequest(t *testing.T) {
 
 // TestSessionDownOverflowCloses: a down log over its byte budget is a hard
 // stop — the hub closes with overflow rather than buffering without limit.
+// The budget follows the advertised limits.maxRelayBody (2x), so shrinking the
+// advertised cap shrinks the log budget with it.
 func TestSessionDownOverflowCloses(t *testing.T) {
-	prev := maxDownInflight
-	maxDownInflight = 64
-	t.Cleanup(func() { maxDownInflight = prev })
+	prev := SessionLimits
+	SessionLimits = wire.DefaultLimits
+	SessionLimits.MaxRelayBody = 1 << 10
+	t.Cleanup(func() { SessionLimits = prev })
 
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	fh := dialFakeHost(t, h, "h1", 1)
 
-	body := json.RawMessage(`{"pad":"` + strings.Repeat("x", 128) + `"}`)
+	body := json.RawMessage(`{"pad":"` + strings.Repeat("x", 4<<10) + `"}`)
 	if _, err := h.Dispatch(t.Context(), "h1", "POST", "/api/prompt", body); err == nil {
 		t.Fatal("oversized dispatch was accepted")
 	}

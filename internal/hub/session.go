@@ -43,21 +43,31 @@ var (
 	// applies: the up receiver parks at most limits.resumeWindow frames, so
 	// the bound the host is told is the bound in force. Shrunk by tests.
 	SessionLimits = wire.DefaultLimits
-
-	// RequestAckTimeout is how long a relayed request's down frame may stay
-	// unacked before that request is failed. Delivery is proven by the host's
-	// cumulative ack, so this is an RPC deadline inside the session, not a
-	// liveness heuristic: a host that answered is acked, a host that is slow
-	// to ack is treated as having lost the request. A var so tests can shrink
-	// it.
-	RequestAckTimeout = 6 * time.Second
 )
 
-// maxDownInflight bounds the down sender's unacked log. It must comfortably
+// requestAckDeadline is how long a relayed request's down frame may stay
+// unacked before that request is failed. Delivery is proven by the host's
+// cumulative ack, so this is an RPC deadline inside the session, not a
+// liveness heuristic: a host that answered is acked, a host that is slow to
+// ack is treated as having lost the request.
+//
+// It is derived from the advertised liveness rather than a fixed second count,
+// because it must outlive the retransmit timer: RTO is 2*keepalive, so a
+// request frame lost once is replayed at 2*keepalive and only proven one
+// heartbeat later. Three keepalives are one RTO plus one heartbeat of margin;
+// a shorter deadline would fail requests whose frame a single loss delayed.
+func requestAckDeadline() time.Duration {
+	return 3 * time.Duration(SessionLiveness.Keepalive) * time.Second
+}
+
+// downInflightCap bounds the down sender's unacked log. It must comfortably
 // hold one maximum relay body plus its own request frame, and is a hard cap:
 // the hub closes the session with overflow instead of buffering without limit.
-// A var so tests can shrink it.
-var maxDownInflight = 2 * (28 << 20)
+// Derived from limits.maxRelayBody (the cap the hub advertises) so the log
+// budget and the relay cap cannot drift apart.
+func downInflightCap() int {
+	return 2 * SessionLimits.MaxRelayBody
+}
 
 var (
 	errSessionClosed = errors.New("hub: host session is closed")
@@ -87,6 +97,11 @@ type sessionProto struct {
 	// when the seq is acked; a surviving entry past its deadline means the
 	// host never confirmed delivery.
 	reqAcks map[uint64]reqAck
+	// reqAckDeadline is fixed when the sequence space is created, from the
+	// liveness advertised for this process (see requestAckDeadline). A
+	// same-epoch reconnect reuses it; the advertised liveness does not
+	// change inside a run.
+	reqAckDeadline time.Duration
 }
 
 // newSessionProto starts a sequence space. upAcked is the epoch's retired
@@ -96,10 +111,11 @@ type sessionProto struct {
 // window is the advertised limits.resumeWindow for the up receiver.
 func newSessionProto(epoch, upAcked uint64, window int) *sessionProto {
 	return &sessionProto{
-		epoch:   epoch,
-		up:      wire.NewReceiverWindow(upAcked, window),
-		down:    wire.NewSender(0),
-		reqAcks: make(map[uint64]reqAck),
+		epoch:          epoch,
+		up:             wire.NewReceiverWindow(upAcked, window),
+		down:           wire.NewSender(0),
+		reqAcks:        make(map[uint64]reqAck),
+		reqAckDeadline: requestAckDeadline(),
 	}
 }
 
@@ -155,7 +171,7 @@ func (p *sessionProto) appendReliable(build func(seq, ack uint64) wire.Frame) (u
 	if got := p.down.Append(payload); got != seq {
 		return 0, errors.New("hub: down seq assignment drifted")
 	}
-	if p.down.Bytes() > maxDownInflight {
+	if p.down.Bytes() > downInflightCap() {
 		return seq, errDownOverflow
 	}
 	return seq, nil
@@ -177,8 +193,8 @@ func (p *sessionProto) dispatchRequest(reqID string, f wire.Frame) (uint64, erro
 	if got := p.down.Append(payload); got != seq {
 		return 0, errors.New("hub: down seq assignment drifted")
 	}
-	p.reqAcks[seq] = reqAck{reqID: reqID, deadline: time.Now().Add(RequestAckTimeout)}
-	if p.down.Bytes() > maxDownInflight {
+	p.reqAcks[seq] = reqAck{reqID: reqID, deadline: time.Now().Add(p.reqAckDeadline)}
+	if p.down.Bytes() > downInflightCap() {
 		return seq, errDownOverflow
 	}
 	return seq, nil
@@ -498,7 +514,7 @@ func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReaso
 				rtoAt = now.Add(rto)
 			}
 			for _, reqID := range s.proto.expireRequests(now) {
-				log.Printf("[capri-hub] host %s: request %s not acked within %s", s.hostID, reqID, RequestAckTimeout)
+				log.Printf("[capri-hub] host %s: request %s not acked within %s", s.hostID, reqID, s.proto.reqAckDeadline)
 				s.h.failRequest(s.hostID, reqID, 503, "host 未确认中继请求")
 			}
 			if now.Sub(lastRecv) >= idle {
