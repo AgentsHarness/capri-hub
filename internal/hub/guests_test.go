@@ -371,7 +371,7 @@ func TestGuestChildScope(t *testing.T) {
 
 	// Host announces the child on the parent's event stream.
 	h.RegisterRawEvents("h1", []json.RawMessage{
-		json.RawMessage(`{"type":"subagent_spawned","sessionId":"parent","update":{"child_session_id":"child-1","subagent_id":"child-1"}}`),
+		json.RawMessage(`{"type":"subagent_spawned","seq":1,"sessionId":"parent","update":{"child_session_id":"child-1","subagent_id":"child-1"}}`),
 	})
 
 	ch, unsub, _, ok := h.TrySubscribeGuest(0, "h1", g)

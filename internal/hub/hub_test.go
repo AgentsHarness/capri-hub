@@ -109,7 +109,7 @@ func TestEventBufGrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(1)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(1)}) {
 		t.Fatal("register")
 	}
 	stop()
@@ -129,7 +129,7 @@ func TestEventBufGrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(2)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(2)}) {
 		t.Fatal("register 2")
 	}
 	stop2()
@@ -335,7 +335,7 @@ func TestEvBufTrimCopies(t *testing.T) {
 	// pin the dropped Event maps until the next reallocation.
 	total := evBufHighWater + 10
 	for i := 1; i <= total; i++ {
-		if !h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)}) {
+		if !hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(i)}) {
 			t.Fatalf("register %d", i)
 		}
 		h.mu.Lock()
@@ -383,7 +383,7 @@ func TestEventsAfterBinarySearch(t *testing.T) {
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	for i := 1; i <= 10; i++ {
-		h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+		hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(i)})
 	}
 	for after := uint64(0); after <= 11; after++ {
 		evs := h.EventsAfter("h1", after)
@@ -744,8 +744,8 @@ func TestEventTaggingAndFanout(t *testing.T) {
 	ch, unsub := h.Subscribe()
 	defer unsub()
 
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "hi"}) {
-		t.Fatal("RegisterEvent failed for paired host")
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "hi", "seq": uint64(1)}) {
+		t.Fatal("ingest failed for paired host")
 	}
 	select {
 	case ev := <-ch:
@@ -760,20 +760,33 @@ func TestEventTaggingAndFanout(t *testing.T) {
 	}
 
 	// Unknown host events are rejected.
-	if h.RegisterEvent("nope", Event{"type": "chunk"}) {
-		t.Error("RegisterEvent for unknown host should fail")
+	if hubRaw(h, "nope", Event{"type": "chunk", "seq": uint64(2)}) {
+		t.Error("ingest for unknown host should fail")
 	}
 }
 
-func TestHostStatusReady(t *testing.T) {
+// A host_status frame is a control frame: it updates Ready without becoming
+// an event. A host_status nested inside an events frame is no longer a
+// supported shape.
+func TestHostStatusIsControlFrame(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-	if !h.RegisterEvent("h1", Event{"type": "host_status", "ready": true}) {
-		t.Fatal("RegisterEvent failed")
+	ready := true
+	if !h.UpdateHostStatus("h1", HostStatusPatch{Ready: &ready}) {
+		t.Fatal("UpdateHostStatus failed")
 	}
 	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
 		t.Errorf("ready not tracked: %+v", hosts)
 	}
+	ch, unsub := h.Subscribe()
+	defer unsub()
+	if hubRaw(h, "h1", Event{"type": "chunk", "text": "x", "seq": uint64(1)}) != true {
+		t.Fatal("ingest failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Ready {
+		t.Log("ready stays independent of data-plane events (informational)")
+	}
+	drainEvents(ch, 50*time.Millisecond)
 }
 
 func TestHostsOrderingAndDefault(t *testing.T) {
@@ -796,7 +809,7 @@ func TestHostsOrderingAndDefault(t *testing.T) {
 
 	// After h2 disconnects, default falls back to the most recently seen
 	// host — h1, refreshed by a recent event.
-	h.RegisterEvent("h1", Event{"type": "chunk", "text": "x"})
+	hubRaw(h, "h1", Event{"type": "chunk", "text": "x", "seq": uint64(1), "sessionId": "s1"})
 	stop()
 	if h.DefaultHostID() != "h1" {
 		t.Errorf("default after offline = %q, want h1", h.DefaultHostID())
@@ -860,17 +873,20 @@ func TestNotifyHostsSubscribers(t *testing.T) {
 	}
 
 	_, unsub := h.Subscribe()
-	// Subscribe notifies hosts with count=1.
+	// Subscribe notifies hosts with count=1. The two host notifications
+	// (subscribers + viewing) are written by independent goroutines, so scan
+	// every frame rather than assuming which one landed last.
 	deadline := time.After(time.Second)
 	for {
 		mu.Lock()
-		n := len(frames)
-		last := map[string]any{}
-		if n > 0 {
-			last = frames[n-1]
+		var got1 bool
+		for _, f := range frames {
+			if f["type"] == "subscribers" && f["count"] == float64(1) {
+				got1 = true
+			}
 		}
 		mu.Unlock()
-		if last["type"] == "subscribers" && last["count"] == float64(1) {
+		if got1 {
 			break
 		}
 		select {
@@ -905,86 +921,76 @@ func TestNotifyHostsSubscribers(t *testing.T) {
 	}
 }
 
-// TestEventsAfterBothSeqTypes: hub-side (uint64, direct callers) and
-// wire-decoded (float64) seqs must both be pullable via EventsAfter.
-func TestEventsAfterBothSeqTypes(t *testing.T) {
+// TestEventsAfterSeqTypes: a host seq may arrive as uint64 (in-process) or
+// float64 (after the JSON frame is decoded); both must be pullable.
+func TestEventsAfterSeqTypes(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 
-	// Direct caller: seq stored as uint64.
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "a", "seq": uint64(1)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "a", "seq": uint64(1)}) {
 		t.Fatal("register 1")
 	}
-	// JSON-decoded style: float64.
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "b", "seq": float64(2)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "b", "seq": float64(2)}) {
 		t.Fatal("register 2")
-	}
-	// Seq-less event: hub assigns its own (uint64, seq 3).
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "c"}) {
-		t.Fatal("register 3")
 	}
 
 	evs := h.EventsAfter("h1", 1)
-	if len(evs) != 2 {
-		t.Fatalf("EventsAfter(1) = %d events, want 2: %v", len(evs), evs)
-	}
-	if evSeq(evs[0]) != 2 || evSeq(evs[1]) != 3 {
-		t.Errorf("seqs = %v, %v; want 2, 3", evSeq(evs[0]), evSeq(evs[1]))
+	if len(evs) != 1 {
+		t.Fatalf("EventsAfter(1) = %d events, want 1: %v", len(evs), evs)
 	}
 	if evSeq(evs[0]) != 2 {
-		t.Errorf("first event text = %v", evs[0])
+		t.Errorf("seq = %v, want 2", evSeq(evs[0]))
 	}
 }
 
-// TestRegisterEventNilEvent: a nil event must be rejected, not panic.
-func TestRegisterEventNilEvent(t *testing.T) {
+// TestRegisterRawEventsNilEntry: a malformed events frame (e.g.
+// {"events":[null]}) must be skipped, not panic.
+func TestRegisterRawEventsNilEntry(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-	if h.RegisterEvent("h1", nil) {
-		t.Error("nil event should be rejected")
+	if !h.RegisterRawEvents("h1", []json.RawMessage{[]byte("null")}) {
+		t.Error("known host should be accepted even when every entry is invalid")
+	}
+	if n := len(h.EventsAfter("h1", 0)); n != 0 {
+		t.Errorf("invalid entry was buffered: %d", n)
 	}
 }
 
-// TestRegisterEventDoesNotMutateCallerMap: RegisterEvent must never add
-// injected keys (seq/hostId/hostName) to the caller's map — the injected
-// copies are what get buffered and broadcast.
-func TestRegisterEventDoesNotMutateCallerMap(t *testing.T) {
+// TestRegisterRawEventsDoesNotMutateInput: ingest must not rewrite the
+// caller's raw JSON — the hub splices its tags into a fresh buffer, leaving
+// the frame bytes it was handed untouched.
+func TestRegisterRawEventsDoesNotMutateInput(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 	ch, unsub := h.Subscribe()
 	defer unsub()
 
-	ev := Event{"type": "chunk", "text": "x"}
-	if !h.RegisterEvent("h1", ev) {
-		t.Fatal("RegisterEvent failed")
+	body := json.RawMessage(`{"type":"chunk","text":"x","seq":1}`)
+	before := string(body)
+	if !h.RegisterRawEvents("h1", []json.RawMessage{body}) {
+		t.Fatal("ingest failed")
 	}
-	if _, ok := ev["seq"]; ok {
-		t.Error("caller map mutated: seq injected")
-	}
-	if _, ok := ev["hostId"]; ok {
-		t.Error("caller map mutated: hostId injected")
-	}
-	if _, ok := ev["hostName"]; ok {
-		t.Error("caller map mutated: hostName injected")
+	if string(body) != before {
+		t.Errorf("caller bytes mutated: %s", body)
 	}
 	// The buffered/broadcast copy must carry the injected tags.
 	select {
 	case got := <-ch:
-		if got["type"] != "chunk" || got["text"] != "x" {
-			t.Errorf("broadcast event = %v, want chunk/x", got)
+		if got["type"] != "chunk" {
+			t.Errorf("broadcast event = %v, want type=chunk", got)
 		}
 		if got["hostId"] != "h1" || got["hostName"] != "H1" {
 			t.Errorf("broadcast event tags = %v/%v", got["hostId"], got["hostName"])
 		}
 		if _, ok := got["seq"]; !ok {
-			t.Error("broadcast event missing hub-assigned seq")
+			t.Error("broadcast event missing seq")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no event received")
 	}
 	// Mutating the broadcast copy must not leak into the replay buffer.
 	evs := h.EventsAfter("h1", 0)
-	if len(evs) != 1 || evs[0]["text"] != "x" {
+	if len(evs) != 1 || evs[0]["type"] != "chunk" {
 		t.Fatalf("EventsAfter = %v, want the tagged copy", evs)
 	}
 }
@@ -998,7 +1004,7 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "fresh", "seq": uint64(100)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "fresh", "seq": uint64(100)}) {
 		t.Fatal("register 100")
 	}
 	if got := h.LastSeq("h1"); got != 100 {
@@ -1016,7 +1022,7 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	drainEvents(ch, 100*time.Millisecond)
 
 	// Regressed seq: accepted (LastSeen) but no fan-out / no buffer append.
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "stale", "seq": uint64(50)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "stale", "seq": uint64(50)}) {
 		t.Fatal("register 50")
 	}
 	if got := h.LastSeq("h1"); got != 100 {
@@ -1033,7 +1039,7 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	}
 
 	// Equal seq (duplicate): same — skip fan-out, counter stays put.
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "dup", "seq": uint64(100)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "dup", "seq": uint64(100)}) {
 		t.Fatal("register 100 again")
 	}
 	if got := h.LastSeq("h1"); got != 100 {
@@ -1050,7 +1056,7 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	}
 
 	// A higher seq still advances and fans out.
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "next", "seq": uint64(101)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "next", "seq": uint64(101)}) {
 		t.Fatal("register 101")
 	}
 	if got := h.LastSeq("h1"); got != 101 {
@@ -1058,8 +1064,8 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	}
 	select {
 	case ev := <-ch:
-		if ev["text"] != "next" {
-			t.Errorf("fresh event = %v, want text=next", ev)
+		if ev["seq"] != float64(101) {
+			t.Errorf("fresh event = %v, want seq 101", ev)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("seq 101 should be broadcast")
@@ -1069,14 +1075,14 @@ func TestRegisterEventSeqRegression(t *testing.T) {
 	}
 }
 
-// TestSetHostReady: control-plane host_status updates Ready + fires
-// hosts_changed on flip, without advancing LastSeq or buffering events.
-func TestSetHostReady(t *testing.T) {
+// TestHostStatusControlFrame: control-plane host_status updates Ready +
+// fires hosts_changed on flip, without advancing LastSeq or buffering events.
+func TestHostStatusControlFrame(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 
 	// Seed a sequenced event so LastSeq is non-zero.
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "x", "seq": uint64(7)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "x", "seq": uint64(7)}) {
 		t.Fatal("register seed")
 	}
 	if got := h.LastSeq("h1"); got != 7 {
@@ -1090,17 +1096,20 @@ func TestSetHostReady(t *testing.T) {
 	// control-plane frames, not the data-plane seed.
 	drainEvents(ch, 100*time.Millisecond)
 
-	if !h.SetHostReady("h1", true) {
-		t.Fatal("SetHostReady true failed")
+	setReady := func(ready bool) bool {
+		return h.UpdateHostStatus("h1", HostStatusPatch{Ready: &ready})
+	}
+	if !setReady(true) {
+		t.Fatal("host_status ready=true failed")
 	}
 	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
 		t.Errorf("ready not set: %+v", hosts)
 	}
 	if got := h.LastSeq("h1"); got != 7 {
-		t.Errorf("LastSeq = %d after SetHostReady, want 7 (must not advance)", got)
+		t.Errorf("LastSeq = %d after host_status, want 7 (must not advance)", got)
 	}
 	if n := len(h.EventsAfter("h1", 0)); n != 1 {
-		t.Errorf("evBuf len = %d after SetHostReady, want 1", n)
+		t.Errorf("evBuf len = %d after host_status, want 1", n)
 	}
 	select {
 	case ev := <-ch:
@@ -1112,8 +1121,8 @@ func TestSetHostReady(t *testing.T) {
 	}
 
 	// Same ready value: no second hosts_changed.
-	if !h.SetHostReady("h1", true) {
-		t.Fatal("SetHostReady true (noop) failed")
+	if !setReady(true) {
+		t.Fatal("host_status ready=true (noop) failed")
 	}
 	select {
 	case ev := <-ch:
@@ -1123,8 +1132,8 @@ func TestSetHostReady(t *testing.T) {
 	}
 
 	// Flip false → hosts_changed again.
-	if !h.SetHostReady("h1", false) {
-		t.Fatal("SetHostReady false failed")
+	if !setReady(false) {
+		t.Fatal("host_status ready=false failed")
 	}
 	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Ready {
 		t.Errorf("ready should be false: %+v", hosts)
@@ -1138,8 +1147,9 @@ func TestSetHostReady(t *testing.T) {
 		t.Fatal("no hosts_changed on ready→false")
 	}
 
-	if h.SetHostReady("nope", true) {
-		t.Error("SetHostReady for unknown host should fail")
+	ready := true
+	if h.UpdateHostStatus("nope", HostStatusPatch{Ready: &ready}) {
+		t.Error("host_status for unknown host should fail")
 	}
 }
 
@@ -1280,7 +1290,7 @@ func TestResetHostSeq(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
 
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "old", "seq": uint64(100)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "old", "seq": uint64(100)}) {
 		t.Fatal("register seed")
 	}
 	if got := h.LastSeq("h1"); got != 100 {
@@ -1307,13 +1317,13 @@ func TestResetHostSeq(t *testing.T) {
 	}
 
 	// New process seq 1 must fan out (not skipped as s <= 100).
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "new", "seq": uint64(1)}) {
+	if !hubRaw(h, "h1", Event{"type": "chunk", "text": "new", "seq": uint64(1)}) {
 		t.Fatal("register seq 1 after reset")
 	}
 	select {
 	case ev := <-ch:
-		if ev["type"] != "chunk" || ev["text"] != "new" {
-			t.Errorf("fan-out = %v, want chunk/new", ev)
+		if ev["type"] != "chunk" {
+			t.Errorf("fan-out = %v, want type=chunk", ev)
 		}
 		if s := evSeq(ev); s != 1 {
 			t.Errorf("seq = %d, want 1", s)
@@ -1412,13 +1422,15 @@ func TestTrySubscribeCap(t *testing.T) {
 func TestPrefsRoundtripAndPersist(t *testing.T) {
 	dir := t.TempDir()
 	h := NewWithDir(dir)
-	doc := BrowserPrefs{
-		PinnedWorkspaces: []string{"/home/u/a", "/home/u/b"},
-		PinnedSessions:   []string{"s1"},
-		Todos:            map[string]string{"s1": "todo", "s2": "completed"},
-		FePrefs:          FePrefs{"collapseToolGroups": false},
-	}
-	if _, err := h.SetPrefs(doc, 0, false); err != nil {
+	doc := BrowserPrefs{Entries: PrefsEntries{
+		"ws:/home/u/a":          {V: "1", At: 1, Site: "A"},
+		"ws:/home/u/b":          {V: "1", At: 1, Site: "A"},
+		"se:s1":                 {V: "1", At: 1, Site: "A"},
+		"todo:s1":               {V: "todo", At: 1, Site: "A"},
+		"todo:s2":               {V: "completed", At: 1, Site: "A"},
+		"fe:collapseToolGroups": {V: "false", At: 1, Site: "A"},
+	}}
+	if _, err := h.SetPrefs(doc); err != nil {
 		t.Fatalf("SetPrefs: %v", err)
 	}
 	got, _ := h.Prefs()
@@ -1444,20 +1456,16 @@ func TestPrefsRoundtripAndPersist(t *testing.T) {
 		reloaded.FePrefs["collapseToolGroups"] != false {
 		t.Errorf("reloaded Prefs = %+v, want the persisted doc", reloaded)
 	}
-	// Replace semantics (a snapshot-only write, i.e. an FE from before
-	// entries existed): the doc becomes what it says — pins/todos it drops
-	// are gone. fePrefs is the one exception: a key the writer does not
-	// mention cannot be told apart from one it deleted, so those entries
-	// survive with their own stamp (see bridgeLegacyPrefs).
-	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"only"}}, 0, false); err != nil {
-		t.Fatalf("SetPrefs replace: %v", err)
+	// A tombstone removes the item for every reader.
+	if _, err := h.SetPrefs(docWith(PrefsEntries{"todo:s2": seDelete("s2", 2, "A")})); err != nil {
+		t.Fatalf("SetPrefs tombstone: %v", err)
 	}
 	got, _ = h.Prefs()
-	if len(got.PinnedWorkspaces) != 0 || len(got.Todos) != 0 || got.PinnedSessions[0] != "only" {
-		t.Errorf("Prefs after replace = %+v, want the stored doc", got)
+	if _, ok := got.Todos["s2"]; ok {
+		t.Errorf("Prefs after tombstone = %+v, want s2's todo gone", got.Todos)
 	}
-	if got.FePrefs["collapseToolGroups"] != false {
-		t.Errorf("Prefs.FePrefs after replace = %+v, want the earlier choice preserved", got.FePrefs)
+	if got.PinnedSessions[0] != "s1" {
+		t.Errorf("unrelated entry moved: %+v", got.PinnedSessions)
 	}
 }
 
@@ -1472,31 +1480,23 @@ func TestPrefsEmptyDoc(t *testing.T) {
 	}
 }
 
-// TestPrefsVersionCas: conditional writes with baseVersion — accepted when
-// the base matches, ErrPrefsConflict (doc untouched) when stale; version
-// bumps on every accepted write (unconditional ones included) and survives
-// a hub restart via prefs.json.
-func TestPrefsVersionCas(t *testing.T) {
+// TestPrefsVersion: every accepted write bumps the version and the version
+// survives a hub restart via prefs.json.
+func TestPrefsVersion(t *testing.T) {
 	dir := t.TempDir()
 	h := NewWithDir(dir)
 
-	// Unconditional (old-FE) writes are accepted and bump the version.
-	v1, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s1"}}, 0, false)
+	v1, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", 1, "A")}))
 	if err != nil || v1 != 1 {
-		t.Fatalf("unconditional write: v=%d err=%v, want v=1 nil", v1, err)
+		t.Fatalf("write: v=%d err=%v, want v=1 nil", v1, err)
 	}
-	// Matching base accepted.
-	v2, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s1", "s2"}}, v1, true)
+	v2, err := h.SetPrefs(docWith(PrefsEntries{"se:s2": sePin("s2", 2, "A")}))
 	if err != nil || v2 != 2 {
-		t.Fatalf("matching-base write: v=%d err=%v, want v=2 nil", v2, err)
-	}
-	// Stale base rejected, doc untouched.
-	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"stale"}}, v1, true); !errors.Is(err, ErrPrefsConflict) {
-		t.Fatalf("stale-base write err = %v, want ErrPrefsConflict", err)
+		t.Fatalf("second write: v=%d err=%v, want v=2 nil", v2, err)
 	}
 	doc, v := h.Prefs()
-	if v != v2 || len(doc.PinnedSessions) != 2 || doc.PinnedSessions[1] != "s2" {
-		t.Errorf("after rejected write: doc=%+v v=%d, want s1+s2 v=%d", doc, v, v2)
+	if v != v2 || len(doc.PinnedSessions) != 2 {
+		t.Errorf("doc=%+v v=%d, want both pins at v=%d", doc, v, v2)
 	}
 
 	// A subscriber sees prefs_changed carrying the new version.
@@ -1505,7 +1505,7 @@ func TestPrefsVersionCas(t *testing.T) {
 		t.Fatalf("TrySubscribe failed")
 	}
 	defer unsub()
-	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s3"}}, v, true); err != nil {
+	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s3": sePin("s3", 3, "A")})); err != nil {
 		t.Fatalf("broadcast write: %v", err)
 	}
 	select {
@@ -1531,8 +1531,11 @@ func TestPrefsBroadcast(t *testing.T) {
 	h := NewWithDir("") // no disk, still broadcasts
 	ch, unsub := h.Subscribe()
 	defer unsub()
-	doc := BrowserPrefs{PinnedSessions: []string{"s1"}, Todos: map[string]string{"s1": "todo"}}
-	if _, err := h.SetPrefs(doc, 0, false); err != nil {
+	doc := BrowserPrefs{Entries: PrefsEntries{
+		"se:s1":   {V: "1", At: 1, Site: "A"},
+		"todo:s1": {V: "todo", At: 1, Site: "A"},
+	}}
+	if _, err := h.SetPrefs(doc); err != nil {
 		t.Fatalf("SetPrefs: %v", err)
 	}
 	select {
@@ -1665,12 +1668,10 @@ func TestDispatchAbandonedByBrowser(t *testing.T) {
 	}
 }
 
-// TestRegisterRawEvents: the raw (pre-encoded) fast path must match
-// RegisterEvent's semantics without decoding event bodies into maps —
-// host seqs preserved / stale skipped, hub-assigned seq injected into the
-// WIRE bytes (not just the map), hostId/hostName tags appended, and the
-// broadcast event serializing via MarshalEvent to the spliced original
-// bytes.
+// TestRegisterRawEvents: the raw (pre-encoded) path ingests event bodies
+// without decoding them into maps — host seqs preserved / stale skipped /
+// seq-less rejected, hostId/hostName tags appended, and the broadcast event
+// serializing via MarshalEvent to the spliced original bytes.
 func TestRegisterRawEvents(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
@@ -1679,8 +1680,9 @@ func TestRegisterRawEvents(t *testing.T) {
 
 	raws := []json.RawMessage{
 		json.RawMessage(`{"type":"chunk","text":"a","seq":10}`),
-		json.RawMessage(`{"type":"chunk","text":"b"}`),             // hub assigns 11
+		json.RawMessage(`{"type":"chunk","text":"b","seq":11}`),
 		json.RawMessage(`{"type":"chunk","text":"stale","seq":5}`), // skipped
+		json.RawMessage(`{"type":"chunk","text":"no-seq"}`),        // rejected
 	}
 	if !h.RegisterRawEvents("h1", raws) {
 		t.Fatal("RegisterRawEvents failed for paired host")
@@ -1688,7 +1690,7 @@ func TestRegisterRawEvents(t *testing.T) {
 	if got := h.LastSeq("h1"); got != 11 {
 		t.Fatalf("LastSeq = %d, want 11", got)
 	}
-	// Two fan-outs (stale skipped).
+	// Two fan-outs (stale and seq-less skipped).
 	var wires []map[string]any
 	for len(wires) < 2 {
 		select {
@@ -1716,7 +1718,7 @@ func TestRegisterRawEvents(t *testing.T) {
 		t.Errorf("event 0 tags missing: %v", wires[0])
 	}
 	if wires[1]["text"] != "b" || wires[1]["seq"].(float64) != 11 {
-		t.Errorf("event 1 = %v (hub-assigned seq must be injected into wire)", wires[1])
+		t.Errorf("event 1 = %v", wires[1])
 	}
 	// Stale event not buffered.
 	if evs := h.EventsAfter("h1", 0); len(evs) != 2 {
@@ -1732,14 +1734,15 @@ func TestRegisterRawEvents(t *testing.T) {
 	}
 }
 
-// TestRegisterRawEventsHostStatusReady: host_status inside a raw events
-// frame still flips Ready (legacy back-compat path).
-func TestRegisterRawEventsHostStatusReady(t *testing.T) {
+// TestRegisterRawEventsHostStatusIsNotAnEvent: host_status inside an events
+// frame is no longer a supported shape. It is just an event body, so it must
+// not flip the registry's Ready flag (the control frame does that).
+func TestRegisterRawEventsHostStatusIsNotAnEvent(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")
-	h.RegisterRawEvents("h1", []json.RawMessage{json.RawMessage(`{"type":"host_status","ready":true}`)})
-	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
-		t.Errorf("ready not tracked: %+v", hosts)
+	h.RegisterRawEvents("h1", []json.RawMessage{json.RawMessage(`{"type":"host_status","ready":true,"seq":1}`)})
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Ready {
+		t.Errorf("ready flipped by an events-frame host_status: %+v", hosts)
 	}
 }
 
@@ -1759,7 +1762,7 @@ func TestRegisterEventPerHostLockParallel(t *testing.T) {
 		go func(id string) {
 			defer wg.Done()
 			for i := 1; i <= perHost; i++ {
-				if !h.RegisterEvent(id, Event{"type": "chunk", "seq": uint64(i)}) {
+				if !hubRaw(h, id, Event{"type": "chunk", "seq": uint64(i)}) {
 					t.Errorf("register %s/%d failed", id, i)
 					return
 				}
@@ -1821,7 +1824,7 @@ func TestFanoutResyncOnDropThreshold(t *testing.T) {
 	// Fill the 512-slot queue synchronously (no drops yet: the counter
 	// only starts once the queue is full).
 	for i := 1; i <= 512; i++ {
-		h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+		hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(i)})
 	}
 	// 40 more events all drop. The sender runs in a goroutine because
 	// the resync delivery (on the 32nd drop) blocks until we drain; we
@@ -1829,7 +1832,7 @@ func TestFanoutResyncOnDropThreshold(t *testing.T) {
 	// of racing into slots our drain loop frees.
 	go func() {
 		for i := 513; i <= 552; i++ {
-			h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+			hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(i)})
 		}
 	}()
 	time.Sleep(200 * time.Millisecond)
@@ -1878,11 +1881,11 @@ func TestFanoutCriticalEventSurvivesBackpressure(t *testing.T) {
 
 	// Exactly fill the queue with droppable chunks.
 	for i := 1; i <= 512; i++ {
-		h.RegisterEvent("h1", Event{"type": "chunk", "seq": uint64(i)})
+		hubRaw(h, "h1", Event{"type": "chunk", "seq": uint64(i)})
 	}
 	// Queue full. A critical event must still land: the sender blocks
 	// briefly, so read concurrently.
-	go h.RegisterEvent("h1", Event{"type": "done", "seq": 513})
+	go hubRaw(h, "h1", Event{"type": "done", "seq": 513})
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
@@ -1966,7 +1969,7 @@ func TestDeliverTerminalToolUpdateOnFullQueue(t *testing.T) {
 	// pump at the terminal event, but must never lose it.
 	s := newFeSubscriber(1)
 	defer s.stop()
-	s.deliver(Event{"type": "chunk"}) // fills ch
+	s.deliver(Event{"seq": uint64(1), "type": "chunk"}) // fills ch
 	if ev := <-s.ch; ev["type"] != "chunk" {
 		t.Fatalf("first delivery = %v, want chunk", ev)
 	}
@@ -1994,14 +1997,14 @@ func TestDeliverTerminalToolUpdateOnFullQueue(t *testing.T) {
 	// threshold.
 	s2 := newFeSubscriber(1)
 	defer s2.stop()
-	s2.deliver(Event{"type": "chunk"}) // fills ch (pump delivers it)
+	s2.deliver(Event{"seq": uint64(1), "type": "chunk"}) // fills ch (pump delivers it)
 	if ev := <-s2.ch; ev["type"] != "chunk" {
 		t.Fatalf("first delivery = %v, want chunk", ev)
 	}
 	// Re-fill ch so the next droppable delivery has nowhere to go.
-	s2.deliver(Event{"type": "chunk"})
+	s2.deliver(Event{"seq": uint64(1), "type": "chunk"})
 	waitFor(t, func() bool { return len(s2.ch) == 1 }, time.Second)
-	s2.deliver(Event{"type": "tool_call_update"}) // no terminal flag
+	s2.deliver(Event{"seq": uint64(1), "type": "tool_call_update"}) // no terminal flag
 	waitFor(t, func() bool { return s2.dropped.Load() == 1 }, time.Second)
 	if n := len(s2.ch); n != 1 {
 		t.Errorf("delta must not displace the queued event (len=%d)", n)
@@ -2059,11 +2062,11 @@ func TestDroppedCriticalEventForcesResync(t *testing.T) {
 
 	// Saturate the consumer channel, then the ring, so the next critical
 	// event has nowhere to go (its drop is the case under test).
-	s.deliver(Event{"type": "chunk"})
+	s.deliver(Event{"seq": uint64(1), "type": "chunk"})
 	waitFor(t, func() bool { return len(s.ch) == 1 }, time.Second)
 	s.mu.Lock()
 	for i := 0; i < len(s.ring); i++ {
-		s.ring[i] = Event{"type": "tool_call_update"}
+		s.ring[i] = Event{"seq": uint64(1), "type": "tool_call_update"}
 	}
 	s.n = len(s.ring)
 	s.mu.Unlock()
@@ -2112,7 +2115,7 @@ func TestSlowSubscriberDoesNotDelayIngestOrPeers(t *testing.T) {
 fill:
 	for i := 0; i < cap(wedged); i++ {
 		select {
-		case wedged <- Event{"type": "filler"}:
+		case wedged <- Event{"seq": uint64(1), "type": "filler"}:
 		default:
 			break fill
 		}
@@ -2123,7 +2126,7 @@ fill:
 	go func() {
 		start := time.Now()
 		for i := 0; i < n; i++ {
-			h.RegisterEvent("h1", Event{"type": "done", "seq": uint64(i + 1)})
+			hubRaw(h, "h1", Event{"type": "done", "seq": uint64(i + 1)})
 		}
 		ingestDone <- time.Since(start)
 	}()
@@ -2233,10 +2236,10 @@ func TestSubscriberHostFilter(t *testing.T) {
 	allCh, allUnsub := h.Subscribe()
 	defer allUnsub()
 
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "a"}) {
+	if !hubRaw(h, "h1", Event{"seq": uint64(1), "type": "chunk", "text": "a"}) {
 		t.Fatal("register h1")
 	}
-	if !h.RegisterEvent("h2", Event{"type": "chunk", "text": "b"}) {
+	if !hubRaw(h, "h2", Event{"seq": uint64(1), "type": "chunk", "text": "b"}) {
 		t.Fatal("register h2")
 	}
 	h.Broadcast(hostsChanged())
@@ -2275,10 +2278,10 @@ func TestSubscriberHostFilter(t *testing.T) {
 	if !h.SetSubscriberHost(scopedCh, "h2") {
 		t.Fatal("SetSubscriberHost rejected a live channel")
 	}
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "c"}) {
+	if !hubRaw(h, "h1", Event{"seq": uint64(2), "type": "chunk", "text": "c"}) {
 		t.Fatal("register h1 c")
 	}
-	if !h.RegisterEvent("h2", Event{"type": "chunk", "text": "d"}) {
+	if !hubRaw(h, "h2", Event{"seq": uint64(2), "type": "chunk", "text": "d"}) {
 		t.Fatal("register h2 d")
 	}
 	after := eventTypes(drainEvents(scopedCh, 200*time.Millisecond))
@@ -2296,7 +2299,7 @@ func TestSubscriberHostFilter(t *testing.T) {
 	if !h.SetSubscriberHost(scopedCh, "") {
 		t.Fatal("SetSubscriberHost rejected clearing the filter")
 	}
-	if !h.RegisterEvent("h1", Event{"type": "chunk", "text": "e"}) {
+	if !hubRaw(h, "h1", Event{"seq": uint64(3), "type": "chunk", "text": "e"}) {
 		t.Fatal("register h1 e")
 	}
 	if !containsType(eventTypes(drainEvents(scopedCh, 200*time.Millisecond)), "chunk@h1") {
@@ -2409,7 +2412,7 @@ func TestResyncCarriesHostId(t *testing.T) {
 	}
 	// Hub-level events carry no host: their resync stays untagged rather
 	// than falsely attributed to some host.
-	hostless := resyncFrame(Event{"type": "hosts_changed"})
+	hostless := resyncFrame(Event{"seq": uint64(1), "type": "hosts_changed"})
 	if _, has := hostless["hostId"]; has {
 		t.Errorf("hostless resync must not carry a hostId: %v", hostless)
 	}
@@ -2447,8 +2450,9 @@ func TestUnwatchedHostStatusStillVisible(t *testing.T) {
 	if !h.UpdateHostStatus("h2", HostStatusPatch{Busy: &busy, PendingCount: &pending}) {
 		t.Fatal("UpdateHostStatus h2")
 	}
-	if !h.SetHostReady("h2", true) {
-		t.Fatal("SetHostReady h2")
+	ready := true
+	if !h.UpdateHostStatus("h2", HostStatusPatch{Ready: &ready}) {
+		t.Fatal("host_status ready h2")
 	}
 
 	evs := drainEvents(ch, 200*time.Millisecond)
@@ -2480,4 +2484,14 @@ func TestUnwatchedHostStatusStillVisible(t *testing.T) {
 		t.Errorf("unwatched h2 registry = busy:%v pending:%v ready:%v, want true/3/true",
 			h2.Busy, h2.PendingCount, h2.Ready)
 	}
+}
+
+// hubRaw ingests one event the way the host wire does: as raw JSON through
+// RegisterRawEvents, which is the only ingest path production uses.
+func hubRaw(h *Hub, hostID string, ev Event) bool {
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return false
+	}
+	return h.RegisterRawEvents(hostID, []json.RawMessage{b})
 }

@@ -553,6 +553,16 @@ func GuestSessionKey(hostID, sessionID string) string {
 	return hostID + "\x00" + sessionID
 }
 
+// splitGuestSessionKey 是 GuestSessionKey 的逆运算（查看会话集合按 host
+// 归组时用）。不含分隔符的键按「无 host」处理。
+func splitGuestSessionKey(key string) (hostID, sessionID string, ok bool) {
+	host, sid, found := strings.Cut(key, "\x00")
+	if !found {
+		return "", "", false
+	}
+	return host, sid, true
+}
+
 // GuestDataDir 便于测试/文档引用（与 hub.json 同级）。
 func GuestDataDir(h *Hub) string {
 	if h.guestsFile == "" {

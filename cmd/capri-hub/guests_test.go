@@ -43,7 +43,11 @@ func dialFakeHost(t *testing.T, ctx context.Context, srv *httptest.Server, h *hu
 		t.Fatalf("pair %s: %v", hostID, err)
 	}
 	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+		HTTPHeader: http.Header{
+			"Authorization":   []string{"Bearer " + token},
+			"X-Hub-Deflate":   []string{"1"},
+			"X-Hub-State-Ack": []string{"1"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("host ws dial %s: %v", hostID, err)
@@ -123,12 +127,13 @@ func (f *fakeHost) serve(ctx context.Context) {
 // guestFixture boots a handler with two paired fake hosts and one guest
 // token whose whitelist spans (h1,s1) and (h2,s2).
 type guestFixture struct {
-	srv   *httptest.Server
-	h     *hub.Hub
-	admin string
-	guest hub.GuestToken
-	host1 *fakeHost
-	host2 *fakeHost
+	srv     *httptest.Server
+	h       *hub.Hub
+	admin   string
+	guest   hub.GuestToken
+	tickets *feTicketStore
+	host1   *fakeHost
+	host2   *fakeHost
 }
 
 func newGuestFixture(t *testing.T) *guestFixture {
@@ -149,7 +154,7 @@ func newGuestFixture(t *testing.T) *guestFixture {
 	if err != nil {
 		t.Fatalf("create guest: %v", err)
 	}
-	f := &guestFixture{srv: srv, h: h, admin: secret, guest: g}
+	f := &guestFixture{srv: srv, h: h, admin: secret, guest: g, tickets: tickets}
 	f.host1 = dialFakeHost(t, ctx, srv, h, "h1", "H1")
 	f.host2 = dialFakeHost(t, ctx, srv, h, "h2", "H2")
 	t.Cleanup(func() {
@@ -157,6 +162,18 @@ func newGuestFixture(t *testing.T) *guestFixture {
 		f.host2.conn.Close(websocket.StatusNormalClosure, "")
 	})
 	return f
+}
+
+// guestWSURL builds a /ws/fe URL carrying a single-use ticket for the
+// fixture's guest token (the WS gate no longer accepts ?token=).
+func (f *guestFixture) guestWSURL(t *testing.T, host string) string {
+	t.Helper()
+	ticket, _ := f.tickets.issue(f.guest.ID)
+	u := strings.Replace(f.srv.URL, "http", "ws", 1) + "/ws/fe?ticket=" + ticket
+	if host != "" {
+		u += "&host=" + host
+	}
+	return u
 }
 
 func (f *guestFixture) do(t *testing.T, token, method, path string, body any) (*http.Response, map[string]any) {
@@ -451,7 +468,7 @@ func TestGuestRelayChildSession(t *testing.T) {
 	f := newGuestFixture(t)
 	// The host announces the child on the parent's stream.
 	f.h.RegisterRawEvents("h1", []json.RawMessage{
-		json.RawMessage(`{"type":"subagent_spawned","sessionId":"s1","update":{"child_session_id":"child-1","subagent_id":"child-1"}}`),
+		json.RawMessage(`{"type":"subagent_spawned","seq":1,"sessionId":"s1","update":{"child_session_id":"child-1","subagent_id":"child-1"}}`),
 	})
 
 	res, body := f.do(t, f.guest.Token, http.MethodPost, "/api/session-updates?host=h1",
@@ -702,11 +719,7 @@ func TestGuestWSFiltersAndSubscribe(t *testing.T) {
 	defer cancel()
 
 	dial := func(host string) *websocket.Conn {
-		u := strings.Replace(f.srv.URL, "http", "ws", 1) + "/ws/fe?token=" + f.guest.Token
-		if host != "" {
-			u += "&host=" + host
-		}
-		conn, _, err := websocket.Dial(ctx, u, nil)
+		conn, _, err := websocket.Dial(ctx, f.guestWSURL(t, host), nil)
 		if err != nil {
 			t.Fatalf("guest ws dial: %v", err)
 		}
@@ -778,8 +791,7 @@ func TestGuestRevokeClosesWS(t *testing.T) {
 	f := newGuestFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx,
-		strings.Replace(f.srv.URL, "http", "ws", 1)+"/ws/fe?token="+f.guest.Token+"&host=h1", nil)
+	conn, _, err := websocket.Dial(ctx, f.guestWSURL(t, "h1"), nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -84,16 +85,12 @@ func TestCheckFETokenSources(t *testing.T) {
 		t.Error("X-Access-Token should allow")
 	}
 
-	// Query param (EventSource)
+	// Query param is not an auth channel any more: EventSource on the local
+	// host uses its own ?token= route, but the hub's FE gate takes headers or
+	// a single-use ticket.
 	r = httptest.NewRequest(http.MethodGet, "/events?token="+secret, nil)
-	if !checkFEToken(r, secret) {
-		t.Error("?token= should allow")
-	}
-
-	// Wrong query
-	r = httptest.NewRequest(http.MethodGet, "/events?token=nope", nil)
 	if checkFEToken(r, secret) {
-		t.Error("wrong ?token= should deny")
+		t.Error("?token= must not authenticate")
 	}
 }
 
@@ -527,32 +524,39 @@ func TestHandleRelayErrorBranchesStayPlain(t *testing.T) {
 	})
 }
 
-// TestHandleHostFrameSeqLessAdvancesCounter: a seq-less events frame must
-// ADVANCE the per-host counter (RegisterEvent fallback), not reset it to
-// 1 — a reset would make the next reconnect replay the whole backlog.
-func TestHandleHostFrameSeqLessAdvancesCounter(t *testing.T) {
+// TestHandleHostFrameRejectsSeqLessEvents: every uplink event carries the
+// host's own seq, so a seq-less event is a protocol violation. It must not
+// advance the counter (which would reopen a gap the FE can never fill) and
+// must not be fanned out.
+func TestHandleHostFrameRejectsSeqLessEvents(t *testing.T) {
 	h := hub.NewWithDir("")
 	code, _ := h.PairingCode()
 	if _, err := h.Pair(code, "h1", "H1"); err != nil {
 		t.Fatalf("pair: %v", err)
 	}
-	// A seq-carrying frame sets the counter to 42.
+	ch, unsub := h.Subscribe()
+	defer unsub()
 	handleHostFrame(h, "h1",
 		[]byte(`{"v":1,"type":"events","seqStart":42,"events":[{"type":"chunk","text":"a","seq":42}]}`),
 		func([]byte) error { return nil })
 	if got := h.LastSeq("h1"); got != 42 {
 		t.Fatalf("LastSeq after seq frame = %d, want 42", got)
 	}
-	// A seq-less frame must advance to 43 — not reset to 1.
-	// (Back-compat path: host_status still inside events frames.)
-	handleHostFrame(h, "h1",
-		[]byte(`{"v":1,"type":"events","events":[{"type":"host_status","ready":true}]}`),
-		func([]byte) error { return nil })
-	if got := h.LastSeq("h1"); got != 43 {
-		t.Errorf("LastSeq after seq-less frame = %d, want 43", got)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("the seq-carrying event was never fanned out")
 	}
-	if hosts := h.ListHosts(); len(hosts) != 1 || !hosts[0].Ready {
-		t.Errorf("ready not set via events-frame host_status: %+v", hosts)
+	handleHostFrame(h, "h1",
+		[]byte(`{"v":1,"type":"events","events":[{"type":"chunk","text":"no-seq"}]}`),
+		func([]byte) error { return nil })
+	if got := h.LastSeq("h1"); got != 42 {
+		t.Errorf("LastSeq after seq-less event = %d, want 42 (unchanged)", got)
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("seq-less event was fanned out: %v", ev)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -567,8 +571,9 @@ func TestWriteHostPingCarriesSeqAck(t *testing.T) {
 		t.Fatalf("pair: %v", err)
 	}
 	for i := uint64(1); i <= 7; i++ {
-		if !h.RegisterEvent("h1", hub.Event{"type": "chunk", "text": "x", "seq": i}) {
-			t.Fatalf("RegisterEvent %d rejected", i)
+		raw, _ := json.Marshal(hub.Event{"type": "chunk", "text": "x", "seq": i})
+		if !h.RegisterRawEvents("h1", []json.RawMessage{raw}) {
+			t.Fatalf("ingest %d rejected", i)
 		}
 	}
 	var frame []byte
@@ -637,10 +642,11 @@ func TestFEAuthTicketAndLegacyToken(t *testing.T) {
 		t.Fatal("burned ticket must deny")
 	}
 
-	// Legacy ?token=
+	// ?token= is no longer an auth channel: long-lived secrets stay out of
+	// access logs, so WS auth is the single-use ticket.
 	r = httptest.NewRequest(http.MethodGet, "/ws/fe?token=secret", nil)
-	if !auth.check(r) {
-		t.Fatal("legacy ?token= must still allow")
+	if auth.check(r) {
+		t.Fatal("?token= must not authenticate")
 	}
 }
 
@@ -731,7 +737,11 @@ func TestIntegrationHostWSRelayAndFeWS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	hostConn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + pairRes.Token}},
+		HTTPHeader: http.Header{
+			"Authorization":   []string{"Bearer " + pairRes.Token},
+			"X-Hub-Deflate":   []string{"1"},
+			"X-Hub-State-Ack": []string{"1"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("host ws dial: %v", err)
@@ -747,6 +757,10 @@ func TestIntegrationHostWSRelayAndFeWS(t *testing.T) {
 	var hello map[string]any
 	if json.Unmarshal(helloRaw, &hello) != nil || hello["type"] != "hello" {
 		t.Fatalf("hello frame = %s", helloRaw)
+	}
+	// The WS transport is the one the probe capability belongs to.
+	if hello["probe"] != true {
+		t.Errorf("WS hello probe = %v, want true: %s", hello["probe"], helloRaw)
 	}
 
 	// Host uplink loop: answer requests + push an event
@@ -925,7 +939,7 @@ func TestIntegrationQUICHostAuthAndEvent(t *testing.T) {
 		return buf, err
 	}
 
-	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok})
+	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "stateAck": true})
 	if err := writeFrame(auth); err != nil {
 		t.Fatal(err)
 	}
@@ -936,6 +950,12 @@ func TestIntegrationQUICHostAuthAndEvent(t *testing.T) {
 	var hm map[string]any
 	if json.Unmarshal(hello, &hm) != nil || hm["type"] != "hello" {
 		t.Fatalf("hello = %s", hello)
+	}
+	// QUIC has no protocol-level pong, so the probe capability must not be
+	// advertised there: a host that believed it would slow its heartbeat
+	// while nothing refreshes LastSeen.
+	if v, ok := hm["probe"]; ok {
+		t.Errorf("QUIC hello must omit probe, got %v: %s", v, hello)
 	}
 
 	// Wait until host is online (ConnectStream after hello write on server).
@@ -1194,7 +1214,11 @@ func TestIntegrationSupersededHostConnIgnoredAndDropped(t *testing.T) {
 	dialHost := func(name string) *websocket.Conn {
 		t.Helper()
 		c, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-			HTTPHeader: http.Header{"Authorization": []string{"Bearer " + pairRes.Token}},
+			HTTPHeader: http.Header{
+				"Authorization":   []string{"Bearer " + pairRes.Token},
+				"X-Hub-Deflate":   []string{"1"},
+				"X-Hub-State-Ack": []string{"1"},
+			},
 		})
 		if err != nil {
 			t.Fatalf("%s dial: %v", name, err)
@@ -1410,8 +1434,9 @@ func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 
 	// Negotiated connection.
 	conn := dial(http.Header{
-		"Authorization": []string{"Bearer " + tok},
-		"X-Hub-Deflate": []string{"1"},
+		"Authorization":   []string{"Bearer " + tok},
+		"X-Hub-Deflate":   []string{"1"},
+		"X-Hub-State-Ack": []string{"1"},
 	})
 	defer conn.Close(websocket.StatusNormalClosure, "")
 	_, helloRaw, err := conn.Read(ctx)
@@ -1462,33 +1487,68 @@ func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 	}
 	waitChunk("plain")
 
-	// Un-negotiated connection: hello must NOT echo deflate, and binary
-	// frames are dropped (backward compat: bare JSON only).
-	conn2 := dial(http.Header{"Authorization": []string{"Bearer " + tok}})
+	// A handshake without the capability headers is an older peer: the hub
+	// refuses it instead of running on bare JSON.
+	conn2 := dial(http.Header{
+		"Authorization": []string{"Bearer " + tok},
+		"X-Hub-Deflate": []string{"1"},
+	})
 	defer conn2.Close(websocket.StatusNormalClosure, "")
-	_, hello2Raw, err := conn2.Read(ctx)
+	if _, _, err := conn2.Read(ctx); err == nil {
+		t.Fatal("handshake without X-Hub-State-Ack must be refused")
+	}
+}
+
+// A binary frame the hub cannot inflate ends the session instead of being
+// skipped. Skipping it (the old `continue`) let the next frame's higher seq
+// move the delivery watermark past the hole, and the host then deleted its
+// replay copies on that ack — permanent loss. QUIC already ended the session
+// on the same error; the two transports must agree.
+func TestUplinkInflateFailureEndsSession(t *testing.T) {
+	h := hub.NewWithDir("")
+	srv := httptest.NewServer(buildHandler(h, "", newFETicketStore(), newPairLimiter(), nil))
+	defer srv.Close()
+	code, _ := h.PairingCode()
+	tok, err := h.Pair(code, "h1", "H1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(hello2Raw, []byte(`"deflate"`)) {
-		t.Fatalf("un-negotiated hello must not mention deflate: %s", hello2Raw)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Authorization":   []string{"Bearer " + tok},
+			"X-Hub-Deflate":   []string{"1"},
+			"X-Hub-State-Ack": []string{"1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("host ws dial: %v", err)
 	}
-	var buf2 bytes.Buffer
-	fw2, _ := flate.NewWriter(&buf2, flate.BestSpeed)
-	fw2.Write([]byte(`{"v":1,"type":"events","seqStart":3,"events":[{"type":"chunk","text":"sneaky","seq":3}]}`))
-	fw2.Close()
-	if err := conn2.Write(ctx, websocket.MessageBinary, buf2.Bytes()); err != nil {
-		t.Fatal(err)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	if _, _, err := conn.Read(ctx); err != nil {
+		t.Fatalf("hello: %v", err)
 	}
-	select {
-	case ev := <-feCh:
-		if typ, _ := ev["type"].(string); typ == "chunk" {
-			wire, _ := hub.MarshalEvent(ev)
-			if bytes.Contains(wire, []byte("sneaky")) {
-				t.Fatal("un-negotiated compressed frame must be dropped")
-			}
-		}
-	case <-time.After(300 * time.Millisecond):
+
+	// Pure garbage: flate.NewReader succeeds (it is lazy) but io.ReadAll
+	// fails at the first block header.
+	if err := conn.Write(ctx, websocket.MessageBinary, []byte{0xff, 0xff, 0xff, 0xff}); err != nil {
+		return // already closed; the read below is what matters
+	}
+	_, _, err = conn.Read(ctx)
+	var ce websocket.CloseError
+	if err == nil {
+		t.Fatal("session must end after an undecodable frame")
+	}
+	if !errors.As(err, &ce) {
+		t.Fatalf("read error = %v, want a close frame", err)
+	}
+	if ce.Reason != reasonUnreadable {
+		t.Fatalf("close reason = %q, want %q", ce.Reason, reasonUnreadable)
+	}
+	if got := h.LastSeq("h1"); got != 0 {
+		t.Fatalf("watermark = %d; an undecodable frame must not advance it", got)
 	}
 }
 
@@ -1571,7 +1631,7 @@ func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 		return buf, err
 	}
 
-	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true})
+	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true, "stateAck": true})
 	if err := writeFrame(auth, false); err != nil {
 		t.Fatal(err)
 	}
@@ -1684,7 +1744,7 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 		return buf, err
 	}
 
-	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true})
+	auth, _ := json.Marshal(map[string]any{"type": "auth", "token": tok, "deflate": true, "stateAck": true})
 	if err := wf(control, auth, false); err != nil {
 		t.Fatal(err)
 	}
@@ -1877,7 +1937,11 @@ func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + tok}},
+		HTTPHeader: http.Header{
+			"Authorization":   []string{"Bearer " + tok},
+			"X-Hub-Deflate":   []string{"1"},
+			"X-Hub-State-Ack": []string{"1"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("host ws dial: %v", err)
@@ -1892,6 +1956,10 @@ func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
 	var hello map[string]any
 	if json.Unmarshal(helloRaw, &hello) != nil || hello["type"] != "hello" {
 		t.Fatalf("hello frame = %s", helloRaw)
+	}
+	// The WS transport is the one the probe capability belongs to.
+	if hello["probe"] != true {
+		t.Errorf("WS hello probe = %v, want true: %s", hello["probe"], helloRaw)
 	}
 
 	// The "host's" answer: one history page big enough to compress.
@@ -1979,7 +2047,11 @@ func dialPairedHost(t *testing.T, ctx context.Context, srv *httptest.Server, h *
 		t.Fatalf("pair %s: %v", hostID, err)
 	}
 	conn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/host", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+		HTTPHeader: http.Header{
+			"Authorization":   []string{"Bearer " + token},
+			"X-Hub-Deflate":   []string{"1"},
+			"X-Hub-State-Ack": []string{"1"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("host ws dial %s: %v", hostID, err)
@@ -2260,4 +2332,50 @@ func containsStr(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestSubscribeFrameKeepsViewingAll drives the pre-viewing `subscribe`
+// control frame exactly as an old FE sends it — no `session` field, and no
+// `viewing` frame ever — and asserts the host's viewing set stays all:true.
+// A page that only speaks `subscribe` must never have its transcript
+// trimmed (PROTOCOL.md §6.4).
+func TestSubscribeFrameKeepsViewingAll(t *testing.T) {
+	h := hub.NewWithDir("")
+	srv := httptest.NewServer(buildHandler(h, "", nil, nil, nil))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	feConn, _, err := websocket.Dial(ctx, strings.Replace(srv.URL, "http", "ws", 1)+"/ws/fe?host=h1", nil)
+	if err != nil {
+		t.Fatalf("fe ws dial: %v", err)
+	}
+	defer feConn.Close(websocket.StatusNormalClosure, "")
+	feConn.SetReadLimit(1 << 20)
+
+	// The legacy frame: host only, no session.
+	if err := feConn.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"subscribe","host":"h1"}`)); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+	for {
+		_, raw, err := feConn.Read(ctx)
+		if err != nil {
+			t.Fatalf("waiting for subscribed ack: %v", err)
+		}
+		var frame map[string]any
+		if json.Unmarshal(raw, &frame) != nil {
+			continue
+		}
+		if frame["type"] == "subscribed" {
+			break
+		}
+	}
+
+	v, _, ok := h.ViewingFrameFor("h1")
+	if !ok {
+		t.Fatal("no viewing set for a host with a live page")
+	}
+	if !v.All || len(v.Sessions) != 0 {
+		t.Fatalf("viewing after a legacy subscribe = %+v, want all:true (old FE must never lose transcript)", v)
+	}
 }

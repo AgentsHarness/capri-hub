@@ -25,8 +25,8 @@ import (
 // entries are older, and the newer tombstone wins.
 //
 // The pinnedSessions / pinnedWorkspaces / todos / fePrefs fields remain on
-// the wire as a PROJECTION of entries, so old FEs and old prefs.json files
-// keep working unchanged.
+// the wire as a PROJECTION of entries, which is also how a prefs.json written
+// before entries existed is read back.
 //
 // Key grammar (shared with the FE's store/prefsEntries.ts):
 //
@@ -46,9 +46,9 @@ const (
 	// dead weight and can be dropped.
 	prefsTombstoneHorizon = 60 * 24 * time.Hour
 
-	// prefsLegacySite labels entries the hub had to invent (a materialized
-	// snapshot from before entries existed, or a legacy full-document
-	// write). Such an entry always loses a tie against a real client.
+	// prefsLegacySite labels entries the hub had to invent while migrating a
+	// prefs.json written before entries existed. Such an entry always loses a
+	// tie against a real client.
 	prefsLegacySite = "hub-legacy"
 )
 
@@ -91,11 +91,6 @@ func mergePrefsEntries(dst, src PrefsEntries) PrefsEntries {
 	return dst
 }
 
-// tombstonePrefsKey builds the deletion record for a key.
-func tombstonePrefsKey(at int64, site string) PrefsEntry {
-	return PrefsEntry{At: at, Site: site, Del: true}
-}
-
 // prunePrefsTombstones drops deletion records older than the horizon.
 func prunePrefsTombstones(entries PrefsEntries, now time.Time) {
 	cut := now.Add(-prefsTombstoneHorizon).UnixMilli()
@@ -115,8 +110,8 @@ func prefsLive(entries PrefsEntries, key string) (PrefsEntry, bool) {
 }
 
 // projectPrefsEntries fills the document's snapshot fields from entries. The
-// snapshot is what FEs render and what old FEs understand; entries stay the
-// authority, so this is always recomputed rather than trusted from outside.
+// snapshot is what FEs render; entries stay the authority, so this is always
+// recomputed rather than trusted from outside.
 func projectPrefsEntries(entries PrefsEntries) (workspaces, sessions []string, todos map[string]string, fe FePrefs) {
 	workspaces = []string{}
 	sessions = []string{}
@@ -151,10 +146,9 @@ func applyPrefsProjection(p *BrowserPrefs) {
 	p.FePrefs = fe
 }
 
-// entriesFromSnapshot materializes a snapshot-only document (an old FE's
-// write, or a prefs.json written before entries existed) into entries
-// stamped at `at`. It cannot express deletions — see bridgeLegacyPrefs for
-// the version that diffs against the previous state to record them.
+// entriesFromSnapshot materializes a snapshot-only prefs.json (written before
+// entries existed) into entries stamped at `at`. This is a one-time on-disk
+// migration, not a wire path.
 func entriesFromSnapshot(p BrowserPrefs, at int64) PrefsEntries {
 	out := PrefsEntries{}
 	stamp := func(key, val string) { out[key] = PrefsEntry{V: val, At: at, Site: prefsLegacySite} }
@@ -180,58 +174,6 @@ func boolEntryValue(b bool) string {
 		return "true"
 	}
 	return "false"
-}
-
-// bridgeLegacyPrefs folds a legacy full-document write into the entries map.
-//
-// An old FE genuinely means "this snapshot IS the state" (that is its
-// last-write-wins contract), so pins/todos that vanished relative to the
-// previous view get tombstones and the surviving ones are restamped to the
-// arrival time; deletions already on record are carried forward unchanged.
-// FE appearance flags are the exception: the legacy doc cannot
-// tell "this client never chose it" from "another client deleted it" (an FE
-// that has never touched liteReplay simply omits the key), so those entries
-// are applied as upserts and carried forward untouched — an old client can
-// never wipe, nor re-date, a newer client's explicit choice.
-func bridgeLegacyPrefs(prev PrefsEntries, incoming BrowserPrefs, at int64) PrefsEntries {
-	next := entriesFromSnapshot(incoming, at)
-	live := func(prefix, id string) bool {
-		_, ok := prefsLive(next, prefix+id)
-		return ok
-	}
-	for k, e := range prev {
-		if e.Del {
-			// A deletion the incoming snapshot cannot speak to stays on the
-			// record — dropping it would let some other client's stale copy
-			// resurrect the item, which is the whole failure this models
-			// exists to prevent.
-			if _, ok := next[k]; !ok {
-				next[k] = e
-			}
-			continue
-		}
-		switch {
-		case len(k) > len(prefsKeyWorkspacePrefix) && k[:len(prefsKeyWorkspacePrefix)] == prefsKeyWorkspacePrefix:
-			if !live(prefsKeyWorkspacePrefix, k[len(prefsKeyWorkspacePrefix):]) {
-				next[k] = tombstonePrefsKey(at, prefsLegacySite)
-			}
-		case len(k) > len(prefsKeySessionPrefix) && k[:len(prefsKeySessionPrefix)] == prefsKeySessionPrefix:
-			if !live(prefsKeySessionPrefix, k[len(prefsKeySessionPrefix):]) {
-				next[k] = tombstonePrefsKey(at, prefsLegacySite)
-			}
-		case len(k) > len(prefsKeyTodoPrefix) && k[:len(prefsKeyTodoPrefix)] == prefsKeyTodoPrefix:
-			if !live(prefsKeyTodoPrefix, k[len(prefsKeyTodoPrefix):]) {
-				next[k] = tombstonePrefsKey(at, prefsLegacySite)
-			}
-		case len(k) > len(prefsKeyFePrefix) && k[:len(prefsKeyFePrefix)] == prefsKeyFePrefix:
-			// Not mentioned by the snapshot ≠ deleted by it: keep the record
-			// (and its original stamp) instead of tombstoning.
-			if _, ok := next[k]; !ok {
-				next[k] = e
-			}
-		}
-	}
-	return next
 }
 
 // samePrefsEntries reports two entry sets holding exactly the same records.

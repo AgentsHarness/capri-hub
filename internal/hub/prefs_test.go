@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,10 +35,10 @@ func TestPrefsEntriesMergeNeverResurrectsADeletedPin(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 
 	// Client A pins s1, then cancels the pin (a tombstone, not an absence).
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", t0, "A")}), 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", t0, "A")})); err != nil {
 		t.Fatalf("pin: %v", err)
 	}
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": seDelete("s1", t0+100, "A")}), 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": seDelete("s1", t0+100, "A")})); err != nil {
 		t.Fatalf("unpin: %v", err)
 	}
 	got, _ := h.Prefs()
@@ -49,7 +48,7 @@ func TestPrefsEntriesMergeNeverResurrectsADeletedPin(t *testing.T) {
 
 	// A third client that never saw the delete pushes its stale copy —
 	// including the older "pinned s1" record.
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", t0, "C")}), 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", t0, "C")})); err != nil {
 		t.Fatalf("stale write must still be accepted: %v", err)
 	}
 	got, _ = h.Prefs()
@@ -63,7 +62,7 @@ func TestPrefsEntriesMergeNeverResurrectsADeletedPin(t *testing.T) {
 	}
 
 	// And a genuinely newer write still lands.
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", t0+200, "C")}), 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", t0+200, "C")})); err != nil {
 		t.Fatalf("newer write: %v", err)
 	}
 	got, _ = h.Prefs()
@@ -86,7 +85,7 @@ func TestPrefsEntriesMergeIsOrderIndependent(t *testing.T) {
 		docs []PrefsEntries
 	}{{forward, []PrefsEntries{a, b}}, {reverse, []PrefsEntries{b, a}}} {
 		for _, d := range step.docs {
-			if _, err := step.h.SetPrefs(docWith(d), 0, false); err != nil {
+			if _, err := step.h.SetPrefs(docWith(d)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -113,7 +112,7 @@ func TestPrefsEntriesSameClockTieBreak(t *testing.T) {
 	run := func(order ...PrefsEntries) BrowserPrefs {
 		h := NewWithDir(t.TempDir())
 		for _, d := range order {
-			if _, err := h.SetPrefs(docWith(d), 0, false); err != nil {
+			if _, err := h.SetPrefs(docWith(d)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -139,7 +138,7 @@ func TestPrefsProjectionRecomputedFromEntries(t *testing.T) {
 		Entries:        PrefsEntries{"se:real": sePin("real", t0, "A")},
 		PinnedSessions: []string{"ghost"},
 	}
-	if _, err := h.SetPrefs(lying, 0, false); err != nil {
+	if _, err := h.SetPrefs(lying); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := h.Prefs()
@@ -151,104 +150,27 @@ func TestPrefsProjectionRecomputedFromEntries(t *testing.T) {
 	}
 }
 
-// Legacy FE writes (no entries) keep their last-write-wins contract: the
-// snapshot IS the state, so what vanished from it is tombstoned — recorded as
-// a deletion rather than silently dropped, which is what stops a later
-// entries-aware merge from resurrecting it.
-func TestPrefsLegacyWriteTombstonesWhatVanished(t *testing.T) {
+// A snapshot-only write (no entries) carries no state the hub can merge:
+// nothing is tombstoned, and every existing entry keeps its record. This also
+// pins the on-disk migration shape, which reads pre-entries prefs.json files
+// through the same materializer.
+func TestPrefsSnapshotOnlyWriteIsInert(t *testing.T) {
 	h := NewWithDir(t.TempDir())
-	if _, err := h.SetPrefs(BrowserPrefs{
-		PinnedSessions: []string{"s1", "s2"},
-		Todos:          map[string]string{"s1": "todo"},
-		FePrefs:        FePrefs{"collapseToolGroups": true},
-	}, 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(PrefsEntries{
+		"se:s1":                 sePin("s1", t0, "A"),
+		"fe:collapseToolGroups": {V: "true", At: t0, Site: "A"},
+	})); err != nil {
 		t.Fatal(err)
 	}
-	// An old FE drops s2 and the s1 todo, and omits liteReplay (an FE that
-	// never chose it does not write the key — absence must not read as delete).
-	if _, err := h.SetPrefs(BrowserPrefs{
-		PinnedSessions: []string{"s1"},
-		FePrefs:        FePrefs{"collapseToolGroups": true},
-	}, 0, false); err != nil {
+	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"ghost"}}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := h.Prefs()
 	if len(got.PinnedSessions) != 1 || got.PinnedSessions[0] != "s1" {
-		t.Fatalf("pinnedSessions = %v, want [s1]", got.PinnedSessions)
+		t.Errorf("pinnedSessions = %v, want the stored entries' projection ([s1])", got.PinnedSessions)
 	}
-	if e, ok := got.Entries["se:s2"]; !ok || !e.Del {
-		t.Errorf("entries[se:s2] = %+v, want a tombstone for the dropped pin", e)
-	}
-	if _, ok := got.Todos["s1"]; ok {
-		t.Errorf("todos = %v, want the dropped todo removed", got.Todos)
-	}
-	if e, ok := got.Entries["todo:s1"]; !ok || !e.Del {
-		t.Errorf("entries[todo:s1] = %+v, want a tombstone", e)
-	}
-	// A deletion the legacy snapshot does not mention stays on the record
-	// (dropping it is what lets some other client's stale copy resurrect the
-	// item later). A legacy write that *does* name a key still re-pins it —
-	// that is the old client's last-write-wins contract, unchanged.
-	s2Tombstone := got.Entries["se:s2"]
-	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s1"}}, 0, false); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = h.Prefs()
-	if got.Entries["se:s2"] != s2Tombstone {
-		t.Errorf("entries[se:s2] = %+v, want the earlier tombstone preserved verbatim (%+v)",
-			got.Entries["se:s2"], s2Tombstone)
-	}
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s2": sePin("s2", t0-5000, "stale")}), 0, false); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = h.Prefs()
-	for _, id := range got.PinnedSessions {
-		if id == "s2" {
-			t.Errorf("a stale client resurrected s2 after the legacy write: %v", got.PinnedSessions)
-		}
-	}
-
-	// An fePrefs key another client chose survives a legacy write that does
-	// not mention it — and keeps its own stamp rather than being re-dated.
-	feEntry := got.Entries["fe:collapseToolGroups"]
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"fe:liteReplay": {V: "true", At: t0 + 86400000, Site: "A"}}), 0, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"s1"}}, 0, false); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = h.Prefs()
-	if got.FePrefs["liteReplay"] != true {
-		t.Errorf("fePrefs = %v, want an unmentioned fePrefs key left alone", got.FePrefs)
-	}
-	if got.Entries["fe:collapseToolGroups"] != feEntry {
-		t.Errorf("fePrefs entry was re-dated by a legacy write: %+v", got.Entries["fe:collapseToolGroups"])
-	}
-}
-
-// A conditional write from a stale legacy client is still rejected (its whole
-// document would otherwise clobber a newer one); an entries write is never
-// rejected, because merging cannot clobber anything.
-func TestPrefsConditionalWriteOnlyGuardsLegacy(t *testing.T) {
-	h := NewWithDir(t.TempDir())
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s1": sePin("s1", t0, "A")}), 7, false); err != nil {
-		t.Fatal(err)
-	}
-	// Legacy snapshot write with a stale base → conflict.
-	if _, err := h.SetPrefs(BrowserPrefs{PinnedSessions: []string{"legacy"}}, 3, true); !errors.Is(err, ErrPrefsConflict) {
-		t.Fatalf("stale legacy conditional write = %v, want ErrPrefsConflict", err)
-	}
-	got, _ := h.Prefs()
-	if len(got.PinnedSessions) != 1 || got.PinnedSessions[0] != "s1" {
-		t.Errorf("rejected write mutated the doc: %v", got.PinnedSessions)
-	}
-	// Entries write with the same stale base → merged in, no conflict.
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:s9": sePin("s9", t0+10, "B")}), 3, true); err != nil {
-		t.Fatalf("entries write must ignore a stale base: %v", err)
-	}
-	got, _ = h.Prefs()
-	if len(got.PinnedSessions) != 2 {
-		t.Errorf("pinnedSessions = %v, want s1 and s9", got.PinnedSessions)
+	if got.Entries["fe:collapseToolGroups"].V != "true" {
+		t.Errorf("unmentioned entry was dropped: %+v", got.Entries)
 	}
 }
 
@@ -260,12 +182,12 @@ func TestPrefsNoopWriteKeepsVersionAndStaysQuiet(t *testing.T) {
 	ch, unsub := h.Subscribe()
 	defer unsub()
 	entries := PrefsEntries{"se:s1": sePin("s1", t0, "A")}
-	v1, err := h.SetPrefs(docWith(entries), 0, false)
+	v1, err := h.SetPrefs(docWith(entries))
 	if err != nil {
 		t.Fatal(err)
 	}
 	drainPrefsEvents(ch)
-	v2, err := h.SetPrefs(docWith(entries), 0, false)
+	v2, err := h.SetPrefs(docWith(entries))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +211,7 @@ func TestPrefsTombstonesPrunedAfterHorizon(t *testing.T) {
 		"se:new":  seDelete("new", young, "A"),
 		"se:keep": sePin("keep", expired, "A"),
 	}
-	if _, err := h.SetPrefs(docWith(entries), 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(entries)); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := h.Prefs()
@@ -313,7 +235,7 @@ func TestPrefsEntriesPersistedAcrossRestart(t *testing.T) {
 	if _, err := h.SetPrefs(docWith(PrefsEntries{
 		"se:s1": sePin("s1", t0, "A"),
 		"se:s2": seDelete("s2", t0+10, "A"),
-	}), 0, false); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	restarted := NewWithDir(dir)
@@ -325,7 +247,7 @@ func TestPrefsEntriesPersistedAcrossRestart(t *testing.T) {
 		t.Fatalf("tombstone lost across restart: %+v", got.Entries)
 	}
 	// A stale client still cannot resurrect s2 after the restart.
-	if _, err := restarted.SetPrefs(docWith(PrefsEntries{"se:s2": sePin("s2", t0-1000, "B")}), 0, false); err != nil {
+	if _, err := restarted.SetPrefs(docWith(PrefsEntries{"se:s2": sePin("s2", t0-1000, "B")})); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = restarted.Prefs()
@@ -358,7 +280,7 @@ func TestPrefsUpgradedHubMaterializesLegacyFile(t *testing.T) {
 		"se:s1":   sePin("s1", 0, "old"),
 		"todo:s1": {V: "completed", At: 0, Site: "old"},
 	}
-	if _, err := h.SetPrefs(docWith(staleClient), 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(staleClient)); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = h.Prefs()
@@ -367,7 +289,7 @@ func TestPrefsUpgradedHubMaterializesLegacyFile(t *testing.T) {
 	}
 	// A key the hub has never heard of still comes through — a genuinely
 	// local-only pin is data, not noise.
-	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:localonly": sePin("localonly", 0, "old")}), 0, false); err != nil {
+	if _, err := h.SetPrefs(docWith(PrefsEntries{"se:localonly": sePin("localonly", 0, "old")})); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = h.Prefs()
