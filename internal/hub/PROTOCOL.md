@@ -16,10 +16,16 @@ browser-facing details that are not in the shared spec.
   `hello_ack` and from then on owns seq assignment (down), the ack
   watermark (up), retransmission and the idle timer.
 * A reconnect with the same `(hostId, epoch)` resumes the existing
-  receiver/sender state. A new epoch resets both sequence spaces and the
-  gap-pull buffer, and sends `/ws/fe` subscribers
-  `{"v":1,"type":"subscribed","host":<id>,"seq":0}` before any event of
-  the new epoch.
+  receiver/sender state; `hello.resume` is ignored there because the hub's
+  `ackUp` / `ackDown` are authoritative.
+* A new epoch starts from the baseline the host declares in
+  `hello.resume.up`: the high-water mark of its event bus that the hub never
+  saw (the FE rebuilds that history). `hello_ack.ackUp` echoes it, the first
+  live event must be `resume.up + 1`, and anything at or below the baseline
+  is a duplicate. The down sequence space always starts at 0. The hub clears
+  the gap-pull buffer and sends `/ws/fe` subscribers
+  `{"v":1,"type":"subscribed","host":<id>,"seq":<baseline>}` before any event
+  of the new epoch.
 * The session seq space is the **event** seq space: an `events` frame whose
   body is a contiguous run of N events advances the delivery watermark by N,
   so the next frame continues from the last event's seq.
@@ -130,8 +136,9 @@ GET /ws/fe?ticket=…&host=<hostId>&c=1          (filter from the first frame)
 {"v":1,"type":"subscribed","host":"<hostId>","seq":S}
 ```
 
-`seq` is that host's current hub-side watermark (`0` after an epoch
-change, which resets the FE's per-host coordinate) — the FE **aligns** to it
+`seq` is that host's current hub-side watermark, or the new epoch's
+baseline after an epoch change (which resets the FE's per-host coordinate) —
+the FE **aligns** to it
 (and, when it already saw events, gap-pulls only the real hole). Without it
 a host switch leaves the client at watermark 0, whose first event triggers
 `GET /api/events?host=…&after=0` — the whole per-host ring buffer (up to

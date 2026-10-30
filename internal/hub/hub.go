@@ -946,11 +946,13 @@ func (h *Hub) HostIDForToken(token string) (string, bool) {
 // epoch); its loop is stopped by the caller.
 //
 // A same-epoch reconnect resumes the existing protocol state, so the peer's
-// unacked log is replayed against the same watermarks. A new epoch resets both
-// sequence spaces and the gap-pull buffer, sends /ws/fe subscribers
-// subscribed{seq:0} before any new-epoch event, and leaves the per-host
-// audience generation increasing.
-func (h *Hub) attach(hostID string, epoch uint64, deflate bool) (s *session, old *session, ack wire.HelloAck, err error) {
+// unacked log is replayed against the same watermarks and resume.up is
+// ignored: the hub's ackUp is authoritative there. A new epoch starts from
+// the host's declared baseline (resume.up — the retired high-water mark of its
+// event bus), resets the gap-pull buffer, tells /ws/fe subscribers the same
+// baseline via subscribed{seq:baseline} before any new-epoch event, and leaves
+// the per-host audience generation increasing.
+func (h *Hub) attach(hostID string, epoch, resumeUp uint64, deflate bool) (s *session, old *session, ack wire.HelloAck, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	hs := h.hosts[hostID]
@@ -965,16 +967,17 @@ func (h *Hub) attach(hostID string, epoch uint64, deflate bool) (s *session, old
 		if hs.proto != nil {
 			h.failPendingLocked(hostID)
 		}
-		hs.proto = newSessionProto(epoch)
+		hs.proto = newSessionProto(epoch, resumeUp)
 		hs.epoch.Store(epoch)
-		hs.upAcked.Store(0)
+		hs.upAcked.Store(resumeUp)
 		hs.mu.Lock()
 		hs.evBuf = nil
 		hs.evBufBytes = 0
 		hs.mu.Unlock()
 		// The FE watermark is per host, so it must be told about the restart
-		// before it sees an event numbered in the new space.
-		h.broadcastSeqReset(hostID)
+		// before it sees an event numbered in the new space. The baseline is
+		// the new coordinate's origin, not necessarily 0.
+		h.broadcastSeqReset(hostID, resumeUp)
 	}
 	s = &session{
 		h:      h,
@@ -2780,8 +2783,8 @@ func (h *Hub) notifyAudience() {
 
 // broadcastSeqReset tells /ws/fe subscribers of hostID that its sequence space
 // restarted, so their per-host watermark resets before any new-epoch event.
-func (h *Hub) broadcastSeqReset(hostID string) {
-	ev := Event{"v": 1, "type": "subscribed", "host": hostID, "seq": uint64(0)}
+func (h *Hub) broadcastSeqReset(hostID string, baseline uint64) {
+	ev := Event{"v": 1, "type": "subscribed", "host": hostID, "seq": baseline}
 	if cur := h.subs.Load(); cur != nil {
 		for _, s := range *cur {
 			if s.watches(hostID) {

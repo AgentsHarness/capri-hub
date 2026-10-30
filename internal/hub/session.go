@@ -84,10 +84,14 @@ type sessionProto struct {
 	reqAcks map[uint64]reqAck
 }
 
-func newSessionProto(epoch uint64) *sessionProto {
+// newSessionProto starts a sequence space. upAcked is the epoch's retired
+// high-water baseline declared in hello.resume.up: the host's event bus may be
+// past events the hub never saw (the FE rebuilds those from history), so the
+// first live event is baseline+1 and everything at or below is a duplicate.
+func newSessionProto(epoch, upAcked uint64) *sessionProto {
 	return &sessionProto{
 		epoch:   epoch,
-		up:      wire.NewReceiver(0),
+		up:      wire.NewReceiver(upAcked),
 		down:    wire.NewSender(0),
 		reqAcks: make(map[uint64]reqAck),
 	}
@@ -354,7 +358,7 @@ func (h *Hub) serveHost(expected string, t Transport) wire.CloseReason {
 	keepalive := time.Duration(SessionLiveness.Keepalive) * time.Second
 	t.SetKeepalive(keepalive)
 
-	s, old, ack, err := h.attach(hostID, hello.Epoch, deflate)
+	s, old, ack, err := h.attach(hostID, hello.Epoch, hello.Resume.Up, deflate)
 	if err != nil {
 		log.Printf("[capri-hub] host %s: attach: %v", hostID, err)
 		if errors.Is(err, ErrHostUnknown) {

@@ -102,12 +102,21 @@ type fakeHost struct {
 	ft   *fakeTransport
 	ack  wire.Frame // hello_ack
 	end  chan wire.CloseReason
+	done chan struct{} // closed when ServeHost returns, reason already sent
 	host string
 }
 
 // dialFakeHost pairs hostID in h (call testPair first), performs the hello
 // handshake and returns the connected fake host.
 func dialFakeHost(t *testing.T, h *Hub, hostID string, epoch uint64) *fakeHost {
+	t.Helper()
+	return dialFakeHostResume(t, h, hostID, epoch, 0)
+}
+
+// dialFakeHostResume is dialFakeHost with an epoch baseline: the host declares
+// that its event bus is already at resumeUp, so the first live event is
+// resumeUp+1.
+func dialFakeHostResume(t *testing.T, h *Hub, hostID string, epoch, resumeUp uint64) *fakeHost {
 	t.Helper()
 	h.mu.Lock()
 	hs := h.hosts[hostID]
@@ -121,12 +130,21 @@ func dialFakeHost(t *testing.T, h *Hub, hostID string, epoch uint64) *fakeHost {
 	}
 
 	ft := newFakeTransport()
-	fh := &fakeHost{t: t, h: h, ft: ft, end: make(chan wire.CloseReason, 1), host: hostID}
-	go func() { fh.end <- h.ServeHost("", ft) }()
+	fh := &fakeHost{
+		t: t, h: h, ft: ft,
+		end:  make(chan wire.CloseReason, 1),
+		done: make(chan struct{}),
+		host: hostID,
+	}
+	go func() {
+		reason := h.ServeHost("", ft)
+		fh.end <- reason
+		close(fh.done)
+	}()
 	t.Cleanup(func() {
 		ft.hangup()
 		select {
-		case <-fh.end:
+		case <-fh.done:
 		case <-time.After(5 * time.Second):
 		}
 	})
@@ -134,7 +152,7 @@ func dialFakeHost(t *testing.T, h *Hub, hostID string, epoch uint64) *fakeHost {
 	fh.send(wire.NewHello(wire.Hello{
 		Epoch:  epoch,
 		Token:  token,
-		Resume: &wire.Resume{},
+		Resume: &wire.Resume{Up: resumeUp},
 	}))
 	fh.ack = fh.recvType(wire.TypeHelloAck, 5*time.Second)
 	if got := fh.ack.Epoch; got != epoch {
@@ -309,8 +327,9 @@ func TestSessionHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ha.Epoch != 42 || ha.AckUp != 0 || ha.AckDown != 0 {
-		t.Fatalf("hello_ack = epoch %d ackUp %d ackDown %d, want 42/0/0", ha.Epoch, ha.AckUp, ha.AckDown)
+	if ha.Epoch != 42 || ha.AckUp != 7 || ha.AckDown != 0 {
+		t.Fatalf("hello_ack = epoch %d ackUp %d ackDown %d, want 42/7/0 (resume.up is the new baseline)",
+			ha.Epoch, ha.AckUp, ha.AckDown)
 	}
 	if ha.Audience == nil || ha.Audience.Gen != 1 || ha.Audience.Watchers != 0 {
 		t.Fatalf("audience = %+v, want gen 1 / 0 watchers", ha.Audience)
@@ -467,6 +486,72 @@ func TestSessionSameEpochResume(t *testing.T) {
 	}
 	if got := first.waitReason(2 * time.Second); got != wire.CloseSuperseded {
 		t.Fatalf("first session close = %s, want superseded", got)
+	}
+}
+
+// TestSessionEpochBaselineFromHello: a new epoch starts at the baseline the
+// host declares in hello.resume.up, not at 0. The host's event bus may already
+// be past events the hub never saw (the FE rebuilds those from history), so the
+// first live event is baseline+1 and anything at or below it is a duplicate.
+func TestSessionEpochBaselineFromHello(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	ch, unsub := h.Subscribe()
+	defer unsub()
+	drainEvents(ch, 50*time.Millisecond)
+
+	fh := dialFakeHostResume(t, h, "h1", 3, 500)
+	if got := fh.ack.AckUp; got != 500 {
+		t.Fatalf("hello_ack ackUp = %d, want 500 (the declared baseline)", got)
+	}
+	if got := h.LastSeq("h1"); got != 500 {
+		t.Fatalf("LastSeq after baseline hello = %d, want 500", got)
+	}
+
+	// The first live event continues the host's bus at baseline+1.
+	fh.events(501, 0, chunkEvent(501, "live"))
+	waitFor(t, func() bool { return h.LastSeq("h1") == 501 }, 2*time.Second)
+
+	hbDeadline := time.Now().Add(2 * time.Second)
+	for {
+		hb := fh.recvType(wire.TypeHeartbeat, time.Until(hbDeadline))
+		if hb.Ack == 501 {
+			break
+		}
+		if time.Now().After(hbDeadline) {
+			t.Fatalf("heartbeat ack = %d, want 501", hb.Ack)
+		}
+	}
+
+	// A retransmission at or below the baseline is a duplicate: applied
+	// nothing, opens no hole, and must not reach a browser.
+	fh.events(500, 0, chunkEvent(500, "old"))
+	fh.noFrame(200 * time.Millisecond)
+	if got := h.LastSeq("h1"); got != 501 {
+		t.Fatalf("LastSeq after duplicate = %d, want 501", got)
+	}
+
+	// The live event itself was fanned out, the duplicate was not.
+	var sawLive bool
+	for {
+		select {
+		case ev := <-ch:
+			if ev["type"] != "chunk" {
+				continue // subscribed{seq:baseline} and other hub-level noise
+			}
+			if evSeq(ev) == 500 {
+				t.Fatalf("duplicate event 500 was fanned out: %v", ev)
+			}
+			if evSeq(ev) == 501 {
+				sawLive = true
+			}
+			continue
+		case <-time.After(100 * time.Millisecond):
+		}
+		break
+	}
+	if !sawLive {
+		t.Fatal("event 501 was not fanned out")
 	}
 }
 
@@ -778,7 +863,7 @@ func testSession(h *Hub, hostID string) *session {
 		return hs.session
 	}
 	if hs.proto == nil {
-		hs.proto = newSessionProto(1)
+		hs.proto = newSessionProto(1, 0)
 		hs.epoch.Store(1)
 		hs.upAcked.Store(0)
 	}
