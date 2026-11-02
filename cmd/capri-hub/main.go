@@ -606,6 +606,8 @@ func handlePrefsGet(h *hub.Hub) http.HandlerFunc {
 //
 // The hub MERGES per item (see internal/hub/prefs.go), so the write needs no
 // condition; the doc is small (pins + todos) and no size cap is enforced.
+// The success response carries the merged doc: a client uses its presence as
+// proof that its write was folded in, and keeps its retry marker otherwise.
 func handlePrefsPut(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -615,12 +617,15 @@ func handlePrefsPut(h *hub.Hub) http.HandlerFunc {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 prefs 字段"})
 			return
 		}
-		version, err := h.SetPrefs(*body.Prefs)
-		if err != nil {
+		if _, err := h.SetPrefs(*body.Prefs); err != nil {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"ok": true, "version": version})
+		// Read the doc+version as one pair: a concurrent writer may have
+		// advanced past our SetPrefs, and returning that newer authoritative
+		// state is still correct for the client's merge.
+		doc, version := h.Prefs()
+		writeJSON(w, 200, map[string]any{"ok": true, "version": version, "prefs": doc})
 	}
 }
 

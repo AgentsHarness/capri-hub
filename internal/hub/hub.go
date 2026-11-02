@@ -184,8 +184,10 @@ type Event map[string]any
 // transient, never persisted. Port is the host's local HTTP listen port (so
 // the browser can try 127.0.0.1:<port>); it is persisted. LastSeen is the last
 // attach/detach activity, refreshed by every frame the host sends, and orders
-// the host list / powers the FE freshness probe: online is derived from the
-// attachment, never from this timestamp.
+// the host list: online is derived from the attachment, never from this
+// timestamp. LastSeenAgeMs is computed on the hub clock for FE freshness
+// checks — browsers must not subtract LastSeen from their own clock because
+// the two machines' clocks are independent (and may be skewed by minutes).
 type HostInfo struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
@@ -199,9 +201,10 @@ type HostInfo struct {
 	PendingCount int `json:"pendingCount,omitempty"`
 	// Port: host's local HTTP listen port (e.g. 8765). FE probes
 	// http://127.0.0.1:<port> for a same-machine shortcut.
-	Port     int       `json:"port,omitempty"`
-	LastSeen time.Time `json:"lastSeen"`
-	Local    bool      `json:"local,omitempty"`
+	Port          int       `json:"port,omitempty"`
+	LastSeen      time.Time `json:"lastSeen"`
+	LastSeenAgeMs int64     `json:"lastSeenAgeMs"`
+	Local         bool      `json:"local,omitempty"`
 }
 
 // RelayResponse is the host's answer (WS type:"respond").
@@ -2263,7 +2266,15 @@ func (h *Hub) ListHosts() []HostInfo {
 	defer h.mu.Unlock()
 	out := make([]HostInfo, 0, len(h.hosts))
 	for _, hs := range h.hosts {
-		out = append(out, hs.info)
+		info := hs.info
+		// Age is computed here, not in the browser: LastSeen comes from this
+		// process's clock and is meaningless against a client's clock.
+		if !info.LastSeen.IsZero() {
+			if age := time.Since(info.LastSeen); age > 0 {
+				info.LastSeenAgeMs = age.Milliseconds()
+			}
+		}
+		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Online != out[j].Online {

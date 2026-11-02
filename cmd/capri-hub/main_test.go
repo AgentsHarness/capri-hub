@@ -863,6 +863,38 @@ func TestHandleUnpair(t *testing.T) {
 	}
 }
 
+// TestHandlePrefsPutReturnsMergedDoc: the FE treats the presence of
+// `prefs.entries` in the PUT response as proof its write was folded in and
+// keeps its retry marker otherwise. The handler must therefore return the
+// merged authoritative doc, including the projection fields.
+func TestHandlePrefsPutReturnsMergedDoc(t *testing.T) {
+	h := hub.NewWithDir("")
+	body := `{"prefs":{"entries":{"ws:/w":{"v":"1","at":10,"site":"me"}}}}`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/prefs", strings.NewReader(body))
+	handlePrefsPut(h).ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		OK      bool             `json:"ok"`
+		Version uint64           `json:"version"`
+		Prefs   hub.BrowserPrefs `json:"prefs"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !resp.OK || resp.Version == 0 {
+		t.Fatalf("resp = %+v, want ok with a bumped version", resp)
+	}
+	if got := resp.Prefs.Entries["ws:/w"]; got.V != "1" || got.Site != "me" {
+		t.Fatalf("entries = %+v, want the merged write", resp.Prefs.Entries)
+	}
+	if len(resp.Prefs.PinnedWorkspaces) != 1 || resp.Prefs.PinnedWorkspaces[0] != "/w" {
+		t.Fatalf("projection = %v, want [/w]", resp.Prefs.PinnedWorkspaces)
+	}
+}
+
 // A superseded host connection must stop feeding the hub: after a second
 // connection for the same hostId registers, events uplinked on the old
 // one are ignored (never fanned out to the FE) and the old transport is

@@ -652,6 +652,35 @@ func TestHostsOrderingAndDefault(t *testing.T) {
 	}
 }
 
+// TestListHostsLastSeenAge pins the freshness value the FE silence probe
+// reads: it must be measured on the hub clock, so a skewed browser clock
+// cannot change the verdict. A host that just sent a frame is fresh; an
+// artificially old stamp must show up as an old age.
+func TestListHostsLastSeenAge(t *testing.T) {
+	h := NewWithDir(t.TempDir())
+	testPair(t, h, "h1", "H1")
+	dialFakeHost(t, h, "h1", 1)
+	waitFor(t, func() bool {
+		hosts := h.ListHosts()
+		return len(hosts) == 1 && hosts[0].Online
+	}, 2*time.Second)
+
+	hosts := h.ListHosts()
+	if len(hosts) != 1 {
+		t.Fatalf("hosts = %+v, want one entry", hosts)
+	}
+	if age := hosts[0].LastSeenAgeMs; age < 0 || age > 1000 {
+		t.Fatalf("fresh host LastSeenAgeMs = %d, want 0..1000", age)
+	}
+
+	h.mu.Lock()
+	h.hosts["h1"].info.LastSeen = time.Now().Add(-5 * time.Second)
+	h.mu.Unlock()
+	if age := h.ListHosts()[0].LastSeenAgeMs; age < 4_000 || age > 6_000 {
+		t.Fatalf("stale host LastSeenAgeMs = %d, want about 5000", age)
+	}
+}
+
 func TestHostsChangedBroadcast(t *testing.T) {
 	h := NewWithDir(t.TempDir())
 	testPair(t, h, "h1", "H1")

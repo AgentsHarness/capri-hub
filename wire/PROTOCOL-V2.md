@@ -363,8 +363,10 @@ One time scale, advertised by the hub:
   the probe path is not entered just because tool output is quiet.
 - Hub registry: online while a session is attached; offline on session
   close. No sweep and no separate watchdog. `lastSeen` is refreshed on every
-  host frame and exposed through `/api/hosts`; the browser's silence probe
-  reads it for UI state, while session liveness remains the `hb`/probe clock.
+  host frame and exposed through `/api/hosts` together with
+  `lastSeenAgeMs`, which the hub computes on its own clock; the browser's
+  silence probe reads the age (never subtracts the timestamp from its local
+  clock) for UI state, while session liveness remains the `hb`/probe clock.
 - Request deadline is RPC, not liveness: the request ack deadline is
   `3*keepalive` (one retransmit RTO of `2*keepalive` plus a heartbeat of
   margin) and `RelayTimeout` (45m).
