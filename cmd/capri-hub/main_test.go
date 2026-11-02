@@ -639,12 +639,15 @@ func TestIntegrationHostWSRelayAndFeWS(t *testing.T) {
 			if json.Unmarshal(data, &frame) != nil {
 				continue
 			}
+			if answerRelayProbe(ctx, hostConn, frame) {
+				continue
+			}
 			if frame["type"] == "request" {
 				reqID, _ := frame["reqId"].(string)
 				seq, _ := frame["seq"].(float64)
 				out, _ := json.Marshal(map[string]any{
 					"v": 2, "type": "respond", "reqId": reqID, "seq": 0,
-					"ack": uint64(seq), "status": 200,
+					"ack": uint64(seq), "chunkSeq": 1, "status": 200,
 					"body": map[string]any{"ok": true, "via": "ws"},
 				})
 				_ = hostConn.Write(ctx, websocket.MessageText, out)
@@ -785,28 +788,14 @@ func TestIntegrationQUICHostAuthAndEvent(t *testing.T) {
 	defer stream.Close()
 
 	writeFrame := func(payload []byte) error {
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-		if _, err := stream.Write(lenBuf[:]); err != nil {
-			return err
-		}
-		_, err := stream.Write(payload)
-		return err
+		return writeControlUnit(stream, payload, false, 1)
 	}
-	readFrame := func() ([]byte, error) {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-			return nil, err
-		}
-		n := binary.BigEndian.Uint32(lenBuf[:])
-		buf := make([]byte, n)
-		_, err := io.ReadFull(stream, buf)
-		return buf, err
-	}
+	readFrame := func() ([]byte, error) { return readControlUnit(stream) }
 
 	helloFrame, _ := json.Marshal(map[string]any{
 		"v": 2, "type": "hello", "epoch": 6001, "token": tok,
 		"resume": map[string]any{"up": 0, "down": 0},
+		"caps":   map[string]any{"transportUnits": true},
 	})
 	if err := writeFrame(helloFrame); err != nil {
 		t.Fatal(err)
@@ -918,6 +907,7 @@ func TestIntegrationSupersededHostConnIgnoredAndDropped(t *testing.T) {
 		hello, _ := json.Marshal(map[string]any{
 			"v": 2, "type": "hello", "epoch": epoch, "token": pairRes.Token,
 			"resume": map[string]any{"up": 0, "down": 0},
+			"caps":   map[string]any{"transportUnits": true},
 		})
 		if err := c.Write(ctx, websocket.MessageText, hello); err != nil {
 			t.Fatalf("%s hello write: %v", name, err)
@@ -1112,7 +1102,7 @@ func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 	hello, _ := json.Marshal(map[string]any{
 		"v": 2, "type": "hello", "epoch": 7001, "token": tok,
 		"resume": map[string]any{"up": 0, "down": 0},
-		"caps":   map[string]any{"deflate": true},
+		"caps":   map[string]any{"deflate": true, "transportUnits": true},
 	})
 	if err := conn.Write(ctx, websocket.MessageText, hello); err != nil {
 		t.Fatal(err)
@@ -1153,13 +1143,17 @@ func TestUplinkDeflateWSRoundtrip(t *testing.T) {
 		}
 	}
 
-	// flate-compressed events frame as a BINARY message.
+	// flate-compressed events frame as one compressed BINARY unit.
 	payload := []byte(`{"v":2,"type":"events","seq":1,"events":[{"type":"chunk","text":"deflated","seq":1}]}`)
 	var buf bytes.Buffer
 	fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
 	fw.Write(payload)
 	fw.Close()
-	if err := conn.Write(ctx, websocket.MessageBinary, buf.Bytes()); err != nil {
+	units, err := wire.SplitFrame(buf.Bytes(), true, 1, 0)
+	if err != nil || len(units) != 1 {
+		t.Fatalf("split compressed frame: %v (%d units)", err, len(units))
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, units[0]); err != nil {
 		t.Fatal(err)
 	}
 	waitChunk("deflated")
@@ -1303,33 +1297,14 @@ func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 	defer stream.Close()
 
 	writeFrame := func(payload []byte, compressed bool) error {
-		var cFlag uint32
-		if compressed {
-			cFlag = uplinkCompressedFlag
-		}
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload))|cFlag)
-		if _, err := stream.Write(lenBuf[:]); err != nil {
-			return err
-		}
-		_, err := stream.Write(payload)
-		return err
+		return writeControlUnit(stream, payload, compressed, 1)
 	}
-	readFrame := func() ([]byte, error) {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-			return nil, err
-		}
-		n := binary.BigEndian.Uint32(lenBuf[:])
-		buf := make([]byte, n)
-		_, err := io.ReadFull(stream, buf)
-		return buf, err
-	}
+	readFrame := func() ([]byte, error) { return readControlUnit(stream) }
 
 	hello, _ := json.Marshal(map[string]any{
 		"v": 2, "type": "hello", "epoch": 6101, "token": tok,
 		"resume": map[string]any{"up": 0, "down": 0},
-		"caps":   map[string]any{"deflate": true},
+		"caps":   map[string]any{"deflate": true, "transportUnits": true},
 	})
 	if err := writeFrame(hello, false); err != nil {
 		t.Fatal(err)
@@ -1351,18 +1326,11 @@ func TestIntegrationQUICUplinkDeflate(t *testing.T) {
 		t.Fatalf("hello_ack must echo caps.deflate:true, got %s", ack)
 	}
 
-	flateBytes := func(v any) []byte {
-		b, _ := json.Marshal(v)
-		var buf bytes.Buffer
-		fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
-		fw.Write(b)
-		fw.Close()
-		return buf.Bytes()
-	}
-	if err := writeFrame(flateBytes(map[string]any{
+	compressedEvents, _ := json.Marshal(map[string]any{
 		"v": 2, "type": "events", "seq": 1,
 		"events": []any{map[string]any{"type": "chunk", "text": "z", "seq": 1}},
-	}), true); err != nil {
+	})
+	if err := writeFrame(compressedEvents, true); err != nil {
 		t.Fatal(err)
 	}
 	// Plain frame alongside (host skips compression under its floor).
@@ -1420,7 +1388,11 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer control.Close()
+	// Control stream: transport units. Request streams: complete frames.
 	wf := func(s *quic.Stream, payload []byte, compressed bool) error {
+		return writeControlUnit(s, payload, compressed, 1)
+	}
+	wfFrame := func(s *quic.Stream, payload []byte, compressed bool) error {
 		var cFlag uint32
 		if compressed {
 			cFlag = uplinkCompressedFlag
@@ -1433,21 +1405,12 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 		_, err := s.Write(payload)
 		return err
 	}
-	rf := func(s *quic.Stream) ([]byte, error) {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(s, lenBuf[:]); err != nil {
-			return nil, err
-		}
-		n := binary.BigEndian.Uint32(lenBuf[:])
-		buf := make([]byte, n)
-		_, err := io.ReadFull(s, buf)
-		return buf, err
-	}
+	rf := func(s *quic.Stream) ([]byte, error) { return readControlUnit(s) }
 
 	hello, _ := json.Marshal(map[string]any{
 		"v": 2, "type": "hello", "epoch": 6201, "token": tok,
 		"resume": map[string]any{"up": 0, "down": 0},
-		"caps":   map[string]any{"deflate": true},
+		"caps":   map[string]any{"deflate": true, "transportUnits": true},
 	})
 	if err := wf(control, hello, false); err != nil {
 		t.Fatal(err)
@@ -1516,13 +1479,13 @@ func TestIntegrationQUICMultiStreamRequestPlane(t *testing.T) {
 	rbody, _ := json.Marshal(map[string]any{"ok": true, "via": "request-stream"})
 	frameJSON, _ := json.Marshal(map[string]any{
 		"v": 2, "type": "respond", "reqId": reqID, "seq": 0, "ack": reqSeq,
-		"status": 234, "body": json.RawMessage(rbody),
+		"chunkSeq": 1, "status": 234, "body": json.RawMessage(rbody),
 	})
 	var zbuf bytes.Buffer
 	zw, _ := flate.NewWriter(&zbuf, flate.BestSpeed)
 	zw.Write(frameJSON)
 	zw.Close()
-	if err := wf(rs, zbuf.Bytes(), true); err != nil {
+	if err := wfFrame(rs, zbuf.Bytes(), true); err != nil {
 		t.Fatal(err)
 	}
 	rs.Close() // normal end of the request plane for this request
@@ -1648,14 +1611,20 @@ func TestIntegrationRelayGzipRoundtrip(t *testing.T) {
 				return
 			}
 			var frame map[string]any
-			if json.Unmarshal(data, &frame) != nil || frame["type"] != "request" {
+			if json.Unmarshal(data, &frame) != nil {
+				continue
+			}
+			if answerRelayProbe(ctx, conn, frame) {
+				continue
+			}
+			if frame["type"] != "request" {
 				continue
 			}
 			reqID, _ := frame["reqId"].(string)
 			seq, _ := frame["seq"].(float64)
 			out, _ := json.Marshal(map[string]any{
 				"v": 2, "type": "respond", "reqId": reqID, "seq": 0,
-				"ack": uint64(seq), "status": 200, "body": json.RawMessage(page),
+				"ack": uint64(seq), "chunkSeq": 1, "status": 200, "body": json.RawMessage(page),
 			})
 			if err := conn.Write(ctx, websocket.MessageText, out); err != nil {
 				return
@@ -1746,6 +1715,7 @@ func dialHostWithToken(t *testing.T, ctx context.Context, srv *httptest.Server, 
 	hello, _ := json.Marshal(map[string]any{
 		"v": 2, "type": "hello", "epoch": epoch, "token": token,
 		"resume": map[string]any{"up": 0, "down": 0},
+		"caps":   map[string]any{"transportUnits": true},
 	})
 	if err := conn.Write(ctx, websocket.MessageText, hello); err != nil {
 		t.Fatalf("host hello %s: %v", hostID, err)
@@ -1759,6 +1729,23 @@ func dialHostWithToken(t *testing.T, ctx context.Context, srv *httptest.Server, 
 		t.Fatalf("host hello_ack frame %s = %s", hostID, raw)
 	}
 	return conn
+}
+
+// answerRelayProbe replies to the hub's preflight/liveness probe on a fake
+// host. It reports whether frame was a probe and has been handled.
+func answerRelayProbe(ctx context.Context, conn *websocket.Conn, frame map[string]any) bool {
+	if frame["type"] != "hb" {
+		return false
+	}
+	n, ok := frame["probe"].(float64)
+	if !ok || n == 0 {
+		return false
+	}
+	out, _ := json.Marshal(map[string]any{
+		"v": 2, "type": "hb", "probeAck": uint64(n), "status": map[string]any{},
+	})
+	_ = conn.Write(ctx, websocket.MessageText, out)
+	return true
 }
 
 // pushHostEvent sends one events frame from a host uplink. The session seq

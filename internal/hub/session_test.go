@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,15 @@ type fakeTransport struct {
 	keepalive time.Duration
 	// deflate records the caps.deflate echo the session applied.
 	deflate bool
+	// lastRead is when Recv last returned a frame.
+	lastRead atomic.Int64
+	// writeTimeout / maxFrame record the handshake tuning.
+	writeTimeout time.Duration
+	maxFrame     int
+	// fragmentHook runs after each accepted unit, so a test can interleave
+	// inbound traffic with a frame's fragment run.
+	hookMu       sync.Mutex
+	fragmentHook func()
 }
 
 func newFakeTransport() *fakeTransport {
@@ -48,16 +58,24 @@ func (f *fakeTransport) setBlock(c chan struct{}) {
 	f.blockMu.Unlock()
 }
 
-func (f *fakeTransport) Send(payload []byte) error {
+func (f *fakeTransport) waitBlock() error {
 	f.blockMu.Lock()
 	block := f.block
 	f.blockMu.Unlock()
-	if block != nil {
-		select {
-		case <-block:
-		case <-f.done:
-			return io.ErrClosedPipe
-		}
+	if block == nil {
+		return nil
+	}
+	select {
+	case <-block:
+		return nil
+	case <-f.done:
+		return io.ErrClosedPipe
+	}
+}
+
+func (f *fakeTransport) Send(payload []byte) error {
+	if err := f.waitBlock(); err != nil {
+		return err
 	}
 	select {
 	case f.outbox <- append([]byte(nil), payload...):
@@ -67,16 +85,46 @@ func (f *fakeTransport) Send(payload []byte) error {
 	}
 }
 
+// SendFragment records one transport unit in the same stream as Send; the
+// outbox is the transport's wire, not a frame queue.
+func (f *fakeTransport) SendFragment(unit []byte) error {
+	if err := f.Send(unit); err != nil {
+		return err
+	}
+	f.hookMu.Lock()
+	hook := f.fragmentHook
+	f.hookMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return nil
+}
+
+func (f *fakeTransport) onFragment(hook func()) {
+	f.hookMu.Lock()
+	f.fragmentHook = hook
+	f.hookMu.Unlock()
+}
+
 func (f *fakeTransport) Recv() ([]byte, error) {
 	select {
 	case b, ok := <-f.inbox:
 		if !ok {
 			return nil, io.EOF
 		}
+		f.lastRead.Store(time.Now().UnixNano())
 		return b, nil
 	case <-f.done:
 		return nil, io.EOF
 	}
+}
+
+func (f *fakeTransport) LastActivity() time.Time {
+	n := f.lastRead.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 func (f *fakeTransport) SetDeflate(v bool) { f.deflate = v }
@@ -90,6 +138,10 @@ func (f *fakeTransport) Close(r wire.CloseReason) error {
 }
 
 func (f *fakeTransport) SetKeepalive(d time.Duration) { f.keepalive = d }
+
+func (f *fakeTransport) SetWriteTimeout(d time.Duration) { f.writeTimeout = d }
+
+func (f *fakeTransport) SetMaxFrame(n int) { f.maxFrame = n }
 
 // hangup makes Recv fail the way a peer disconnect does.
 func (f *fakeTransport) hangup() {
@@ -161,6 +213,7 @@ func dialFakeHostFull(t *testing.T, h *Hub, hostID string, epoch, resumeUp, resu
 		Epoch:  epoch,
 		Token:  token,
 		Resume: &wire.Resume{Up: resumeUp, Down: resumeDown},
+		Caps:   &wire.Caps{TransportUnits: true},
 	}))
 	fh.ack = fh.recvType(wire.TypeHelloAck, 5*time.Second)
 	if got := fh.ack.Epoch; got != epoch {
@@ -489,7 +542,7 @@ func TestSessionHandshake(t *testing.T) {
 		Epoch:  42,
 		Token:  token,
 		Resume: &wire.Resume{Up: 7, Down: 3},
-		Caps:   &wire.Caps{Deflate: true},
+		Caps:   &wire.Caps{Deflate: true, TransportUnits: true},
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -528,11 +581,21 @@ func TestSessionHandshake(t *testing.T) {
 	if ha.Caps == nil || !ha.Caps.Deflate {
 		t.Fatalf("caps = %+v, want deflate echo", ha.Caps)
 	}
+	if !ha.Caps.TransportUnits || !ha.Caps.RelayAck {
+		t.Fatalf("caps = %+v, want transportUnits and relayAck echoed", ha.Caps)
+	}
 	if !ft.deflate {
 		t.Fatal("deflate capability was not applied to the transport")
 	}
 	if ft.keepalive != time.Duration(SessionLiveness.Keepalive)*time.Second {
 		t.Fatalf("keepalive = %s", ft.keepalive)
+	}
+	idle := time.Duration(SessionLiveness.Idle) * time.Second
+	if ft.writeTimeout != idle*3/4 {
+		t.Fatalf("write timeout = %s, want idle*3/4 = %s", ft.writeTimeout, idle*3/4)
+	}
+	if ft.maxFrame != SessionLimits.MaxFrame {
+		t.Fatalf("maxFrame = %d, want the advertised %d", ft.maxFrame, SessionLimits.MaxFrame)
 	}
 }
 
@@ -548,7 +611,7 @@ func TestSessionAuthRejects(t *testing.T) {
 	}{
 		{
 			name:   "bad token",
-			first:  wire.NewHello(wire.Hello{Epoch: 1, Token: "nope", Resume: &wire.Resume{}}),
+			first:  wire.NewHello(wire.Hello{Epoch: 1, Token: "nope", Resume: &wire.Resume{}, Caps: &wire.Caps{TransportUnits: true}}),
 			expect: wire.CloseAuth,
 		},
 		{
@@ -573,10 +636,10 @@ func TestSessionAuthRejects(t *testing.T) {
 			first := tc.first
 			switch tc.name {
 			case "host mismatch":
-				first = wire.NewHello(wire.Hello{Epoch: 1, Token: token, Resume: &wire.Resume{}})
+				first = wire.NewHello(wire.Hello{Epoch: 1, Token: token, Resume: &wire.Resume{}, Caps: &wire.Caps{TransportUnits: true}})
 				go func() { h.ServeHost("other", ft) }()
 			case "bad token":
-				first = wire.NewHello(wire.Hello{Epoch: 1, Token: "nope", Resume: &wire.Resume{}})
+				first = wire.NewHello(wire.Hello{Epoch: 1, Token: "nope", Resume: &wire.Resume{}, Caps: &wire.Caps{TransportUnits: true}})
 				go func() { h.ServeHost("", ft) }()
 			default:
 				go func() { h.ServeHost("", ft) }()
@@ -859,11 +922,15 @@ func TestSessionRequestAckDeadline(t *testing.T) {
 	fh := dialFakeHost(t, h, "h1", 1)
 
 	h.mu.Lock()
-	deadline := h.hosts["h1"].proto.reqAckDeadline
+	derived := h.hosts["h1"].proto.reqAckDeadline
 	h.mu.Unlock()
-	if want := 3 * time.Duration(SessionLiveness.Keepalive) * time.Second; deadline != want {
-		t.Fatalf("request ack deadline = %s, want 3*keepalive = %s", deadline, want)
+	if want := 3 * time.Duration(SessionLiveness.Keepalive) * time.Second; derived != want {
+		t.Fatalf("general request ack deadline = %s, want 3*keepalive = %s", derived, want)
 	}
+	// Dispatch uses the short interactive window; shrink it so this test does
+	// not wait the production 5s.
+	shortInteractiveAck(t, 3*time.Second)
+	deadline := interactiveAckWindow
 
 	// The fake host never acks, so the dispatch must fail on its deadline.
 	start := time.Now()
@@ -901,10 +968,13 @@ func TestSessionRequestSurvivesOneLostFrame(t *testing.T) {
 
 	rto := 2 * time.Duration(SessionLiveness.Keepalive) * time.Second
 	h.mu.Lock()
-	deadline := h.hosts["h1"].proto.reqAckDeadline
+	general := h.hosts["h1"].proto.reqAckDeadline
 	h.mu.Unlock()
-	if deadline <= rto {
-		t.Fatalf("request ack deadline %s does not outlive the %s retransmit timer", deadline, rto)
+	if general <= rto {
+		t.Fatalf("general request ack deadline %s does not outlive the %s retransmit timer", general, rto)
+	}
+	if interactiveAckWindow <= rto {
+		t.Fatalf("interactive ack window %s does not outlive the %s retransmit timer", interactiveAckWindow, rto)
 	}
 
 	done := make(chan RelayResponse, 1)
@@ -923,7 +993,7 @@ func TestSessionRequestSurvivesOneLostFrame(t *testing.T) {
 	// The replay proves delivery before the deadline: answer it.
 	fh.send(wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeHeartbeat, Ack: second.Seq, Status: json.RawMessage(`{}`)})
 	fh.send(wire.Frame{
-		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: second.Seq,
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: second.Seq, ChunkSeq: 1,
 		ReqID: second.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
 	})
 	select {
@@ -958,7 +1028,7 @@ func TestSessionRequestAckStopsRetransmit(t *testing.T) {
 	// Ack the request frame, then answer it.
 	fh.send(wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeHeartbeat, Ack: req.Seq, Status: json.RawMessage(`{}`)})
 	fh.send(wire.Frame{
-		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: req.Seq,
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: req.Seq, ChunkSeq: 1,
 		ReqID: req.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
 	})
 	select {
@@ -979,7 +1049,7 @@ func TestSessionRequestAckStopsRetransmit(t *testing.T) {
 // TestSessionRetransmitsUnackedRequest: an unacked down frame is replayed at
 // RTO (2*keepalive), byte-identical, with no max-retry counter.
 func TestSessionRetransmitsUnackedRequest(t *testing.T) {
-	shortLiveness(t, 1, 5)
+	shortLiveness(t, 1, 10)
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	fh := dialFakeHost(t, h, "h1", 1)
@@ -987,7 +1057,9 @@ func TestSessionRetransmitsUnackedRequest(t *testing.T) {
 	go func() { _, _ = h.Dispatch(t.Context(), "h1", "GET", "/api/status", nil) }()
 
 	first := fh.recvType(wire.TypeRequest, 2*time.Second)
-	second := fh.recvType(wire.TypeRequest, 3*time.Second)
+	// The replay is scheduled at 2*keepalive; leave headroom for a loaded CI
+	// scheduler without changing what the test proves.
+	second := fh.recvType(wire.TypeRequest, 5*time.Second)
 	if second.Seq != first.Seq || second.ReqID != first.ReqID {
 		t.Fatalf("retransmit = seq %d req %q, want the original seq %d req %q",
 			second.Seq, second.ReqID, first.Seq, first.ReqID)
@@ -1014,6 +1086,103 @@ func TestSessionDownOverflowCloses(t *testing.T) {
 	}
 	if got := fh.waitReason(2 * time.Second); got != wire.CloseOverflow {
 		t.Fatalf("close reason = %s, want overflow", got)
+	}
+}
+
+// TestSessionAudienceMergeKeepsOneFrame: audience is absolute state, so a
+// burst of viewer changes keeps the first unacked seq and only carries the
+// newest generation in its payload.
+func TestSessionAudienceMergeKeepsOneFrame(t *testing.T) {
+	p := newSessionProto(1, 0, 8)
+	for gen := uint64(1); gen <= 4; gen++ {
+		seq, _, err := p.pushAudience(wire.Audience{Gen: gen, Watchers: int(gen)})
+		if err != nil {
+			t.Fatalf("push gen %d: %v", gen, err)
+		}
+		if seq != 1 {
+			t.Fatalf("push gen %d got seq %d, want the pending seq 1", gen, seq)
+		}
+	}
+	// A stale snapshot arriving late must not replace the newer payload.
+	if _, _, err := p.pushAudience(wire.Audience{Gen: 2, Watchers: 2}); err != nil {
+		t.Fatalf("stale push: %v", err)
+	}
+	entries := p.entries()
+	if len(entries) != 1 {
+		t.Fatalf("unacked log has %d entries, want 1: %+v", len(entries), entries)
+	}
+	f, err := wire.Decode(entries[0].Payload)
+	if err != nil {
+		t.Fatalf("decode merged audience: %v", err)
+	}
+	if f.Type != wire.TypeAudience || f.Seq != 1 || f.Gen != 4 || f.Watchers != 4 {
+		t.Fatalf("merged frame = %+v, want audience seq 1 gen 4 watchers 4", f)
+	}
+}
+
+// TestSessionAudienceMergeAppendsAfterAck: once the sole audience frame is
+// confirmed the next snapshot gets a fresh seq, so the log stays gapless.
+func TestSessionAudienceMergeAppendsAfterAck(t *testing.T) {
+	p := newSessionProto(1, 0, 8)
+	seq, _, err := p.pushAudience(wire.Audience{Gen: 1, Watchers: 1})
+	if err != nil || seq != 1 {
+		t.Fatalf("first push = %d, %v", seq, err)
+	}
+	if got := p.ackDown(1); got != 1 {
+		t.Fatalf("ack = %d, want 1", got)
+	}
+	seq, _, err = p.pushAudience(wire.Audience{Gen: 2, Watchers: 1})
+	if err != nil || seq != 2 {
+		t.Fatalf("second push = %d, %v, want seq 2", seq, err)
+	}
+}
+
+// TestSessionAudienceMergeResendsOverwrittenWrittenFrame: a payload replaced
+// after its frame was written can lose the race with the ack — the rewrite may
+// never reach the host, and a receiver that already applied the seq discards a
+// duplicate. ackDown must therefore queue the newest snapshot for a fresh seq.
+func TestSessionAudienceMergeResendsOverwrittenWrittenFrame(t *testing.T) {
+	p := newSessionProto(1, 0, 8)
+	seq, _, err := p.pushAudience(wire.Audience{Gen: 1, Watchers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := p.entries()[0]
+	p.noteWritten(seq, first.Payload) // gen 1 reached the wire
+
+	if _, _, err := p.pushAudience(wire.Audience{Gen: 2, Watchers: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.ackDown(seq); got != seq {
+		t.Fatalf("ack = %d, want %d", got, seq)
+	}
+	aud, ok := p.takeAudienceResend()
+	if !ok || aud.Gen != 2 || aud.Watchers != 2 {
+		t.Fatalf("resend = %+v, %v; want gen 2 watchers 2", aud, ok)
+	}
+	next, _, err := p.pushAudience(aud)
+	if err != nil || next != seq+1 {
+		t.Fatalf("resend seq = %d, %v, want %d", next, err, seq+1)
+	}
+}
+
+// TestSessionAudienceMergeNoResendWhenLatestWritten: when the newest payload
+// did reach the wire before the ack, the ack completes the state and nothing
+// extra is queued.
+func TestSessionAudienceMergeNoResendWhenLatestWritten(t *testing.T) {
+	p := newSessionProto(1, 0, 8)
+	seq, _, err := p.pushAudience(wire.Audience{Gen: 1, Watchers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.noteWritten(seq, p.entries()[0].Payload)
+	if _, _, err := p.pushAudience(wire.Audience{Gen: 2, Watchers: 2}); err != nil {
+		t.Fatal(err)
+	}
+	p.noteWritten(seq, p.entries()[0].Payload) // gen 2 reached the wire
+	p.ackDown(seq)
+	if aud, ok := p.takeAudienceResend(); ok {
+		t.Fatalf("unexpected resend %+v", aud)
 	}
 }
 
@@ -1078,7 +1247,7 @@ func TestSessionUnreadableFrame(t *testing.T) {
 	h.mu.Lock()
 	token := h.hosts["h1"].token
 	h.mu.Unlock()
-	b, _ := wire.Encode(wire.NewHello(wire.Hello{Epoch: 1, Token: token, Resume: &wire.Resume{}}))
+	b, _ := wire.Encode(wire.NewHello(wire.Hello{Epoch: 1, Token: token, Resume: &wire.Resume{}, Caps: &wire.Caps{TransportUnits: true}}))
 	ft.inbox <- b
 	select {
 	case <-ft.outbox:
@@ -1177,4 +1346,373 @@ func testIngest(h *Hub, hostID string, raws []json.RawMessage) bool {
 		h.mu.Unlock()
 	}
 	return true
+}
+
+// ── P1-1: writer goroutine, framing, probes, LastSeen ────────────────
+
+// shortProbe shrinks the probe timers for one test.
+func shortProbe(t *testing.T, after, timeout time.Duration) {
+	t.Helper()
+	prevAfter, prevTimeout := probeAfter, probeTimeout
+	probeAfter, probeTimeout = after, timeout
+	t.Cleanup(func() {
+		probeAfter, probeTimeout = prevAfter, prevTimeout
+	})
+}
+
+// recvRaw returns the next raw transport message (a complete frame or one
+// transport unit) from the hub.
+func (fh *fakeHost) recvRaw(timeout time.Duration) []byte {
+	fh.t.Helper()
+	select {
+	case b := <-fh.ft.outbox:
+		return b
+	case <-time.After(timeout):
+		fh.t.Fatalf("no downlink message within %s", timeout)
+		return nil
+	}
+}
+
+// waitWriterBusy waits until the session's writer is inside a write.
+func waitWriterBusy(t *testing.T, h *Hub, hostID string) {
+	t.Helper()
+	waitFor(t, func() bool {
+		h.mu.Lock()
+		s := h.hosts[hostID].session
+		h.mu.Unlock()
+		w := (*writer)(nil)
+		if s != nil {
+			w = s.writer.Load()
+		}
+		return w != nil && w.Busy()
+	}, 2*time.Second)
+}
+
+// TestWriterInterleavesControlBetweenUnits: a large reliable frame is written
+// as transport units, and an hb posted while the frame is being written lands
+// between two units instead of after the whole frame.
+func TestWriterInterleavesControlBetweenUnits(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	var once sync.Once
+	fh.ft.onFragment(func() {
+		once.Do(func() {
+			// A new up seq makes the session post an hb on the control slot
+			// while the writer is parked between fragments.
+			fh.events(1, 0, chunkEvent(1, "tick"))
+			waitFor(t, func() bool {
+				h.mu.Lock()
+				s := h.hosts["h1"].session
+				h.mu.Unlock()
+				if s == nil {
+					return false
+				}
+				w := s.writer.Load()
+				return w != nil && w.controlLen() > 0
+			}, 2*time.Second)
+		})
+	})
+
+	body := json.RawMessage(`{"pad":"` + strings.Repeat("x", 100<<10) + `"}`)
+	go func() {
+		_, _ = h.Dispatch(context.Background(), "h1", "POST", "/api/prompt", body)
+	}()
+
+	var (
+		units    int
+		expected int
+		hbIndex  = -1
+		last     = -1
+	)
+	for i := 0; ; i++ {
+		raw := fh.recvRaw(2 * time.Second)
+		if len(raw) >= 13 && raw[0] <= wire.UnitCompressed|wire.UnitFragment {
+			u, err := wire.DecodeUnit(raw)
+			if err != nil {
+				t.Fatalf("decode unit: %v", err)
+			}
+			if u.Flags&wire.UnitFragment != 0 {
+				if expected == 0 {
+					expected = int((uint64(u.Total) + wire.UnitSize - 1) / wire.UnitSize)
+				}
+				units++
+				last = i
+			}
+			if units >= expected {
+				break
+			}
+			continue
+		}
+		f, err := wire.Decode(raw)
+		if err != nil {
+			t.Fatalf("decode control frame: %v", err)
+		}
+		if f.Type == wire.TypeHeartbeat && hbIndex < 0 {
+			hbIndex = i
+		}
+	}
+	if units < 3 {
+		t.Fatalf("large frame produced %d fragments, want at least 3", units)
+	}
+	if hbIndex <= 0 || hbIndex >= last {
+		t.Fatalf("control hb at %d, fragments end at %d: hb was not interleaved", hbIndex, last)
+	}
+}
+
+// TestWriterDoesNotBlockSessionLoop: while the transport's write is wedged,
+// the session still applies incoming events and updates its watermark.
+func TestWriterDoesNotBlockSessionLoop(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	release := make(chan struct{})
+	fh.ft.setBlock(release)
+	defer close(release)
+
+	go func() { _, _ = h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil) }()
+	waitWriterBusy(t, h, "h1")
+
+	fh.events(1, 0, chunkEvent(1, "a"))
+	waitFor(t, func() bool { return h.LastSeq("h1") == 1 }, 2*time.Second)
+}
+
+// TestRTOReplaySuppressedWhileWriterBusy: a write stalled past the RTO does not
+// queue a replay behind itself; after the write completes the request exists
+// on the wire exactly once.
+func TestRTOReplaySuppressedWhileWriterBusy(t *testing.T) {
+	shortLiveness(t, 1, 10)
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	release := make(chan struct{})
+	fh.ft.setBlock(release)
+	go func() { _, _ = h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil) }()
+	waitWriterBusy(t, h, "h1")
+
+	// Two RTO periods pass with the writer stuck in one write.
+	time.Sleep(3 * time.Second)
+	close(release)
+
+	requests := 0
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case raw := <-fh.ft.outbox:
+			f, err := wire.Decode(raw)
+			if err == nil && f.Type == wire.TypeRequest {
+				requests++
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("request frames after release = %d, want exactly 1 (no replay queued behind a busy writer)", requests)
+	}
+
+}
+
+// TestSessionProbeAckKeepsSessionAlive: after silence the hub probes; each
+// probe ack keeps the session alive past several probe intervals.
+func TestSessionProbeAckKeepsSessionAlive(t *testing.T) {
+	shortLiveness(t, 1, 10)
+	shortProbe(t, 200*time.Millisecond, 200*time.Millisecond)
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	var probes int
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case raw := <-fh.ft.outbox:
+			f, err := wire.Decode(raw)
+			if err != nil {
+				t.Fatalf("decode downlink: %v", err)
+			}
+			if f.Type == wire.TypeHeartbeat && f.Probe != 0 {
+				probes++
+				ack, err := wire.NewHeartbeatProbe(0, f.Probe, wire.HeartbeatStatus{}, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fh.send(ack)
+			}
+		case <-fh.done:
+			t.Fatalf("session closed despite probe acks")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if probes == 0 {
+		t.Fatal("no liveness probe was sent after silence")
+	}
+	select {
+	case r := <-fh.end:
+		t.Fatalf("session ended: %s", r)
+	default:
+	}
+}
+
+// TestSessionProbeTimeoutClosesLiveness: a probe the host never answers ends
+// the session with liveness, ahead of the idle timer.
+func TestSessionProbeTimeoutClosesLiveness(t *testing.T) {
+	shortLiveness(t, 5, 20)
+	shortProbe(t, 100*time.Millisecond, 150*time.Millisecond)
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	sawProbe := false
+	timeout := time.After(3 * time.Second)
+	for !sawProbe {
+		select {
+		case raw := <-fh.ft.outbox:
+			f, err := wire.Decode(raw)
+			if err != nil {
+				t.Fatalf("decode downlink: %v", err)
+			}
+			if f.Type == wire.TypeHeartbeat && f.Probe != 0 {
+				sawProbe = true
+			}
+		case <-timeout:
+			t.Fatal("no probe was sent")
+		}
+	}
+	if got := fh.waitReason(3 * time.Second); got != wire.CloseLiveness {
+		t.Fatalf("close reason = %s, want liveness", got)
+	}
+}
+
+// TestSessionLastSeenAdvancesOnHostFrame: every host frame refreshes the
+// registry stamp without broadcasting hosts_changed.
+func TestSessionLastSeenAdvancesOnHostFrame(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	h.mu.Lock()
+	before := h.hosts["h1"].info.LastSeen
+	h.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	hb, err := wire.NewHeartbeat(0, wire.HeartbeatStatus{Ready: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fh.send(hb)
+	waitFor(t, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.hosts["h1"].info.LastSeen.After(before)
+	}, 2*time.Second)
+}
+
+// TestSessionHelloRequiresTransportUnits: a peer that cannot reassemble units
+// is speaking the wrong protocol.
+func TestSessionHelloRequiresTransportUnits(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	h.mu.Lock()
+	token := h.hosts["h1"].token
+	h.mu.Unlock()
+
+	ft := newFakeTransport()
+	done := make(chan wire.CloseReason, 1)
+	go func() { done <- h.ServeHost("", ft) }()
+	b, err := wire.Encode(wire.NewHello(wire.Hello{
+		Epoch: 1, Token: token, Resume: &wire.Resume{}, Caps: &wire.Caps{Deflate: true},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ft.inbox <- b
+	select {
+	case got := <-done:
+		if got != wire.CloseProtocol {
+			t.Fatalf("close reason = %s, want protocol", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not close")
+	}
+}
+
+// TestRequestAckDeadlineStartsAtWriteCompletion: a request stuck behind a slow
+// write does not expire before it is written; after the write it gets the full
+// deadline and then fails normally.
+func TestRequestAckDeadlineStartsAtWriteCompletion(t *testing.T) {
+	shortLiveness(t, 1, 10)
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	shortInteractiveAck(t, time.Second)
+	deadline := interactiveAckWindow
+
+	release := make(chan struct{})
+	fh.ft.setBlock(release)
+	done := make(chan RelayResponse, 1)
+	go func() {
+		resp, _ := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
+		done <- resp
+	}()
+	waitWriterBusy(t, h, "h1")
+
+	select {
+	case resp := <-done:
+		t.Fatalf("request failed before its frame was written: %+v", resp)
+	case <-time.After(deadline + 300*time.Millisecond):
+	}
+
+	close(release)
+	writtenAt := time.Now()
+	select {
+	case resp := <-done:
+		elapsed := time.Since(writtenAt)
+		if resp.Status != 503 {
+			t.Fatalf("status = %d, want 503 after the frame was written and never acked", resp.Status)
+		}
+		if elapsed < deadline-200*time.Millisecond {
+			t.Fatalf("request failed %s after the write, before the %s deadline", elapsed, deadline)
+		}
+	case <-time.After(deadline + 3*time.Second):
+		t.Fatal("request did not fail after the write deadline")
+	}
+}
+
+// TestRequestAckDeadlineArmsOnlyAfterWrite: proto-level view of the same rule,
+// plus the late-retransmission re-arm.
+func TestRequestAckDeadlineArmsOnlyAfterWrite(t *testing.T) {
+	p := newSessionProto(1, 0, 8)
+	f := wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeRequest, ReqID: "r1", Method: "GET", Path: "/x"}
+	seq, err := p.dispatchRequest("r1", f, 0)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if _, ok := p.nextRequestDeadline(); ok {
+		t.Fatal("unwritten request has a deadline")
+	}
+	if got := p.expireRequests(time.Now().Add(time.Hour)); len(got) != 0 {
+		t.Fatalf("unwritten request expired: %v", got)
+	}
+
+	p.noteWritten(seq, nil)
+	armed, ok := p.nextRequestDeadline()
+	if !ok || !armed.After(time.Now()) {
+		t.Fatalf("deadline after write = %v/%v, want a future one", armed, ok)
+	}
+
+	// A replay that completes after the old deadline elapsed starts a fresh
+	// window (the previous copy may never have reached the host).
+	p.mu.Lock()
+	ra := p.reqAcks[seq]
+	ra.deadline = time.Now().Add(-time.Second)
+	p.reqAcks[seq] = ra
+	p.mu.Unlock()
+	p.noteWritten(seq, nil)
+	if rearmed, ok := p.nextRequestDeadline(); !ok || !rearmed.After(time.Now()) {
+		t.Fatalf("deadline after late replay = %v/%v, want a fresh one", rearmed, ok)
+	}
 }

@@ -674,14 +674,16 @@ func handleRenameHost(h *hub.Hub) http.HandlerFunc {
 
 // ── host transports ───────────────────────────────────────────────────
 //
-// One Transport adapter per wire. Both hand the hub a stream of JSON frames
-// and let hub.ServeHost own the session — handshake, seq/ack, retransmit,
+// One Transport adapter per wire. Both hand the hub complete JSON frames —
+// transport units are a transport detail, reassembled before the session sees
+// them — and let hub.ServeHost own the session: handshake, seq/ack, retransmit,
 // liveness and the close reason all live there. Nothing below interprets the
 // protocol.
 
-// hostWriteTimeout caps one downlink write so a half-open peer cannot pin the
-// session loop forever.
-const hostWriteTimeout = 30 * time.Second
+// defaultHostWriteTimeout caps one downlink write until the session applies
+// the configured value (three quarters of the advertised idle period) at
+// handshake, so a half-open peer cannot pin a writer forever.
+const defaultHostWriteTimeout = 15 * time.Second
 
 // hostFrameLimit bounds one frame (compressed or not) on either transport. A
 // relayed respond carries up to 28MB of body, so a tighter cap would kill the
@@ -690,9 +692,10 @@ const hostFrameLimit = 32 << 20
 
 // ── WebSocket ─────────────────────────────────────────────────────────
 
-// wsTransport adapts one /ws/host WebSocket. A text message is one plain JSON
-// frame; a binary message is one raw-deflate stream of a JSON frame, allowed
-// only after hello.caps.deflate was echoed in hello_ack.
+// wsTransport adapts one /ws/host WebSocket. After hello_ack echoes
+// caps.transportUnits the downlink is a text message per complete frame and a
+// binary message per transport unit; the uplink accepts the same split, with
+// a compressed unit only after caps.deflate was echoed.
 type wsTransport struct {
 	conn *websocket.Conn
 	// deflate is set by the session once the capability was negotiated.
@@ -700,6 +703,14 @@ type wsTransport struct {
 	// stop ends the transport keepalive loop.
 	stop      chan struct{}
 	closeOnce sync.Once
+
+	// reassembler turns uplink units back into frames; Recv is called from a
+	// single reader goroutine, so it needs no lock.
+	reassembler wire.Reassembler
+
+	lastActivity atomic.Int64 // unix nanos of the last successful read
+	maxFrameVal  atomic.Int64 // 0 until the session applies limits.maxFrame
+	writeTimeout atomic.Int64 // 0 until the session applies idle*3/4
 }
 
 func newWSTransport(conn *websocket.Conn) *wsTransport {
@@ -707,30 +718,90 @@ func newWSTransport(conn *websocket.Conn) *wsTransport {
 }
 
 func (t *wsTransport) Send(payload []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), hostWriteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), t.timeout())
 	defer cancel()
 	return t.conn.Write(ctx, websocket.MessageText, payload)
 }
 
+// SendFragment writes one encoded transport unit as a binary message.
+func (t *wsTransport) SendFragment(unit []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), t.timeout())
+	defer cancel()
+	return t.conn.Write(ctx, websocket.MessageBinary, unit)
+}
+
+// Recv returns one complete logical frame: text is a whole frame, binary is a
+// unit that may need assembly with later ones before it becomes a frame.
 func (t *wsTransport) Recv() ([]byte, error) {
-	typ, data, err := t.conn.Read(context.Background())
-	if err != nil {
-		return nil, err
+	for {
+		typ, data, err := t.conn.Read(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		t.lastActivity.Store(time.Now().UnixNano())
+		switch typ {
+		case websocket.MessageText:
+			return data, nil
+		case websocket.MessageBinary:
+			frame, compressed, complete, err := t.reassembler.Accept(data, t.frameLimit())
+			if err != nil {
+				return nil, fmt.Errorf("%w: transport unit: %v", wire.ErrUnreadable, err)
+			}
+			if !complete {
+				continue
+			}
+			if !compressed {
+				return frame, nil
+			}
+			if !t.deflate.Load() {
+				return nil, fmt.Errorf("%w: compressed unit without deflate negotiation", wire.ErrUnreadable)
+			}
+			out, err := inflateUplink(frame)
+			if err != nil {
+				return nil, fmt.Errorf("%w: inflate: %v", wire.ErrUnreadable, err)
+			}
+			return out, nil
+		default:
+			return nil, fmt.Errorf("%w: unsupported message type %v", wire.ErrUnreadable, typ)
+		}
 	}
-	if typ != websocket.MessageBinary {
-		return data, nil
-	}
-	if !t.deflate.Load() {
-		return nil, fmt.Errorf("%w: binary frame without deflate negotiation", wire.ErrUnreadable)
-	}
-	out, err := inflateUplink(data)
-	if err != nil {
-		return nil, fmt.Errorf("%w: inflate: %v", wire.ErrUnreadable, err)
-	}
-	return out, nil
 }
 
 func (t *wsTransport) SetDeflate(v bool) { t.deflate.Store(v) }
+
+func (t *wsTransport) SetWriteTimeout(d time.Duration) {
+	if d > 0 {
+		t.writeTimeout.Store(int64(d))
+	}
+}
+
+func (t *wsTransport) SetMaxFrame(n int) {
+	if n > 0 {
+		t.maxFrameVal.Store(int64(n))
+	}
+}
+
+func (t *wsTransport) LastActivity() time.Time {
+	n := t.lastActivity.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+func (t *wsTransport) timeout() time.Duration {
+	if d := time.Duration(t.writeTimeout.Load()); d > 0 {
+		return d
+	}
+	return defaultHostWriteTimeout
+}
+
+func (t *wsTransport) frameLimit() int {
+	if n := int(t.maxFrameVal.Load()); n > 0 {
+		return n
+	}
+	return hostFrameLimit
+}
 
 // SetKeepalive runs WS control pings at the negotiated cadence. The ping is
 // not a protocol signal: it keeps NAT bindings alive and surfaces half-open
@@ -1769,15 +1840,28 @@ func serveQUIC(ln *quic.Listener, h *hub.Hub) {
 }
 
 // quicTransport adapts one host QUIC connection. The control stream carries
-// the session in both directions; request streams carry the host's `respond`
-// frames only, and the hub never writes on them.
+// the session in both directions as length-prefixed transport units; request
+// streams carry the host's `respond` frames as complete length-prefixed
+// frames (no units: a request stream is already per-request).
 type quicTransport struct {
 	conn      *quic.Conn
 	control   *quic.Stream
 	frames    chan []byte
-	errs      chan error
+	term      chan struct{}
+	termOnce  sync.Once
+	termMu    sync.Mutex
+	termErr   error
 	stop      chan struct{}
 	closeOnce sync.Once
+
+	// reassembler turns control-stream units back into frames; only
+	// readControl touches it.
+	reassembler  wire.Reassembler
+	deflate      atomic.Bool
+	lastActivity atomic.Int64
+	maxFrameVal  atomic.Int64
+	writeTimeout atomic.Int64
+	frameID      atomic.Uint32
 }
 
 func newQUICTransport(conn *quic.Conn, control *quic.Stream) *quicTransport {
@@ -1785,7 +1869,7 @@ func newQUICTransport(conn *quic.Conn, control *quic.Stream) *quicTransport {
 		conn:    conn,
 		control: control,
 		frames:  make(chan []byte, 64),
-		errs:    make(chan error, 1),
+		term:    make(chan struct{}),
 		stop:    make(chan struct{}),
 	}
 	go t.readControl()
@@ -1793,34 +1877,80 @@ func newQUICTransport(conn *quic.Conn, control *quic.Stream) *quicTransport {
 	return t
 }
 
+// fail records the terminal transport error once. Recv drains frames that
+// readControl already queued before it reports the error: a close racing the
+// last frames must not throw them away.
 func (t *quicTransport) fail(err error) {
-	select {
-	case t.errs <- err:
-	default:
-	}
+	t.termOnce.Do(func() {
+		t.termMu.Lock()
+		t.termErr = err
+		t.termMu.Unlock()
+		close(t.term)
+	})
 }
 
+func (t *quicTransport) terminalError() error {
+	t.termMu.Lock()
+	defer t.termMu.Unlock()
+	if t.termErr == nil {
+		return io.EOF
+	}
+	return t.termErr
+}
+
+// Send writes one complete logical frame as one transport unit.
 func (t *quicTransport) Send(payload []byte) error {
-	if err := t.control.SetWriteDeadline(time.Now().Add(hostWriteTimeout)); err != nil {
+	units, err := wire.SplitFrame(payload, false, t.nextFrameID(), wire.UnitSize)
+	if err != nil {
+		return err
+	}
+	for _, unit := range units {
+		if err := t.writeUnit(unit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SendFragment writes one already-encoded transport unit.
+func (t *quicTransport) SendFragment(unit []byte) error { return t.writeUnit(unit) }
+
+func (t *quicTransport) writeUnit(unit []byte) error {
+	if err := t.control.SetWriteDeadline(time.Now().Add(t.timeout())); err != nil {
 		return err
 	}
 	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(unit)))
 	if _, err := t.control.Write(lenBuf[:]); err != nil {
 		return err
 	}
-	_, err := t.control.Write(payload)
+	_, err := t.control.Write(unit)
 	return err
 }
 
 func (t *quicTransport) Recv() ([]byte, error) {
+	// Complete frames already queued by readControl win over the terminal
+	// error: the reader may have queued every frame and then hit EOF, and a
+	// select over both channels would otherwise drop the tail at random.
 	select {
 	case b := <-t.frames:
 		return b, nil
-	case err := <-t.errs:
-		return nil, err
+	default:
+	}
+	select {
+	case b := <-t.frames:
+		return b, nil
 	case <-t.stop:
 		return nil, io.EOF
+	case <-t.term:
+		// The terminal signal is sticky; one more non-blocking drain picks up
+		// a frame queued in the same instant.
+		select {
+		case b := <-t.frames:
+			return b, nil
+		default:
+		}
+		return nil, t.terminalError()
 	}
 }
 
@@ -1828,21 +1958,88 @@ func (t *quicTransport) Recv() ([]byte, error) {
 // option set when the listener dials (see listenQUIC), not a per-stream one.
 func (t *quicTransport) SetKeepalive(time.Duration) {}
 
+func (t *quicTransport) SetDeflate(v bool) { t.deflate.Store(v) }
+
+func (t *quicTransport) SetWriteTimeout(d time.Duration) {
+	if d > 0 {
+		t.writeTimeout.Store(int64(d))
+	}
+}
+
+func (t *quicTransport) SetMaxFrame(n int) {
+	if n > 0 {
+		t.maxFrameVal.Store(int64(n))
+	}
+}
+
+func (t *quicTransport) LastActivity() time.Time {
+	n := t.lastActivity.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+func (t *quicTransport) timeout() time.Duration {
+	if d := time.Duration(t.writeTimeout.Load()); d > 0 {
+		return d
+	}
+	return defaultHostWriteTimeout
+}
+
+func (t *quicTransport) frameLimit() int {
+	if n := int(t.maxFrameVal.Load()); n > 0 {
+		return n
+	}
+	return hostFrameLimit
+}
+
+// nextFrameID keeps control-frame ids in a namespace disjoint from the
+// writer's fragment ids. Both share the one control stream, and a complete
+// unit that reuses the open fragment's frameID is a protocol error, so two
+// independent counters starting at 1 would collide on the first interleaved
+// heartbeat.
+func (t *quicTransport) nextFrameID() uint32 { return 1<<31 | t.frameID.Add(1) }
+
 func (t *quicTransport) Close(r wire.CloseReason) error {
 	t.closeOnce.Do(func() { close(t.stop) })
 	_ = t.control.Close()
 	return t.conn.CloseWithError(quic.ApplicationErrorCode(r.QUICCode()), r.String())
 }
 
+// readControl turns control-stream units back into frames and hands each
+// complete one to Recv. Compressed frames are inflated once the whole unit
+// sequence arrived.
 func (t *quicTransport) readControl() {
 	for {
-		b, err := readQUICFrame(t.control, 0)
+		unit, err := readQUICUnit(t.control)
 		if err != nil {
 			t.fail(err)
 			return
 		}
+		t.lastActivity.Store(time.Now().UnixNano())
+		frame, compressed, complete, err := t.reassembler.Accept(unit, t.frameLimit())
+		if err != nil {
+			t.fail(fmt.Errorf("%w: transport unit: %v", wire.ErrUnreadable, err))
+			return
+		}
+		if !complete {
+			continue
+		}
+		if compressed {
+			if !t.deflate.Load() {
+				t.fail(fmt.Errorf("%w: compressed unit without deflate negotiation", wire.ErrUnreadable))
+				return
+			}
+			out, err := inflateUplink(frame)
+			if err != nil {
+				t.fail(fmt.Errorf("%w: inflate: %v", wire.ErrUnreadable, err))
+				return
+			}
+			frame = out
+		}
 		select {
-		case t.frames <- b:
+		case t.frames <- frame:
 		case <-t.stop:
 			return
 		}
@@ -1866,6 +2063,7 @@ func (t *quicTransport) acceptRequests() {
 				if err != nil {
 					return // EOF / timeout / reset: end of this stream only
 				}
+				t.lastActivity.Store(time.Now().UnixNano())
 				select {
 				case t.frames <- b:
 				case <-t.stop:
@@ -1898,7 +2096,27 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	log.Printf("[capri-hub] host quic session ended (%s) %s", reason, conn.RemoteAddr())
 }
 
-// readQUICFrame reads one length-prefixed frame (bit 31 = raw deflate).
+// readQUICUnit reads one length-prefixed transport unit from the control
+// stream. The length prefix is plain: compression is a unit flag, not a prefix
+// bit, on the unit-carrying stream.
+func readQUICUnit(stream *quic.Stream) ([]byte, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(lenBuf[:])
+	if n > hostFrameLimit {
+		return nil, fmt.Errorf("%w: unit too large: %d", wire.ErrUnreadable, n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// readQUICFrame reads one length-prefixed complete frame (bit 31 = raw
+// deflate). Request streams keep this framing and are never unit-fragmented.
 // readTimeout > 0 arms a per-read deadline for request streams.
 func readQUICFrame(stream *quic.Stream, readTimeout time.Duration) ([]byte, error) {
 	if readTimeout > 0 {

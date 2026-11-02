@@ -50,13 +50,27 @@ func TestChunkedRespondRelayedToBrowser(t *testing.T) {
 				Type  string `json:"type"`
 				ReqID string `json:"reqId"`
 				Seq   uint64 `json:"seq"`
+				Probe uint64 `json:"probe"`
 			}
-			if json.Unmarshal(data, &f) != nil || f.Type != "request" {
+			if json.Unmarshal(data, &f) != nil {
+				continue
+			}
+			if f.Type == "hb" && f.Probe != 0 {
+				ack, _ := json.Marshal(map[string]any{
+					"v": 2, "type": "hb", "probeAck": f.Probe, "status": map[string]any{},
+				})
+				if err := conn.Write(ctx, websocket.MessageText, ack); err != nil {
+					return
+				}
+				continue
+			}
+			if f.Type != "request" {
 				continue
 			}
 			for i, part := range []string{body[:split], body[split:]} {
 				frame, _ := json.Marshal(map[string]any{
 					"v": 2, "type": "respond", "reqId": f.ReqID, "status": 200, "ack": f.Seq,
+					"chunkSeq": i + 1,
 					"chunk":    base64.StdEncoding.EncodeToString([]byte(part)),
 					"encoding": "base64",
 					"more":     i == 0,

@@ -1,10 +1,20 @@
 package wire
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // ResumeWindow is how many out-of-order frames a Receiver parks before it gives
 // up with ErrOverflow.
 const ResumeWindow = 1500
+
+// Probe and heartbeat cadence, shared so host and hub act on the same clock.
+const (
+	ProbeAfter    = 7 * time.Second // no frame for this long -> send probe
+	ProbeTimeout  = 3 * time.Second // no response -> close liveness
+	BusyKeepalive = 1 * time.Second // hb cadence while a turn is active
+)
 
 // Defaults. Liveness and Limits are advertised by the hub in hello_ack; these
 // are what a fresh peer assumes and what the hub itself uses. Treat them as

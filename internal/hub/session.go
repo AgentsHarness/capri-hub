@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -12,14 +13,24 @@ import (
 )
 
 // Transport is one attached host link. The session calls Recv from a single
-// reader goroutine and Send / SetKeepalive from its own goroutine. Close may be
-// called from any goroutine and MUST unblock Recv, which is how a superseded
-// link is torn down.
+// reader goroutine; a session's writer goroutine owns Send and SendFragment,
+// and Close may be called from any goroutine and MUST unblock both.
+//
+// Send writes one complete logical frame. SendFragment writes one encoded
+// wire transport unit, which carries either a whole frame or one slice of a
+// fragmented one. SetWriteTimeout and SetMaxFrame are applied once at
+// handshake, from the advertised liveness and limits. LastActivity reports
+// the last time the transport read anything from the peer; it never covers
+// writes, so a blackhole is not hidden by our own heartbeats.
 type Transport interface {
 	Send([]byte) error
+	SendFragment([]byte) error
 	Recv() ([]byte, error)
 	Close(wire.CloseReason) error
 	SetKeepalive(time.Duration)
+	SetWriteTimeout(time.Duration)
+	SetMaxFrame(int)
+	LastActivity() time.Time
 }
 
 // deflateSetter is the optional capability a transport exposes when its wire
@@ -43,7 +54,26 @@ var (
 	// applies: the up receiver parks at most limits.resumeWindow frames, so
 	// the bound the host is told is the bound in force. Shrunk by tests.
 	SessionLimits = wire.DefaultLimits
+
+	// probeAfter is how long the hub lets the host stay silent before it
+	// sends an hb liveness probe, and probeTimeout is how long the probe may
+	// stay unanswered before the session closes with liveness. They default
+	// to the shared wire constants; tests shrink them to exercise the path.
+	probeAfter   = wire.ProbeAfter
+	probeTimeout = wire.ProbeTimeout
+
+	// relayHealthWindow is how recently the session must have received a
+	// frame for Dispatch to trust the link without a preflight round trip.
+	// relayProbeTimeout bounds that probe: a host that cannot answer in this
+	// window is reported as reconnecting instead of receiving a request that
+	// would likely never run to completion.
+	relayHealthWindow = 2 * time.Second
+	relayProbeTimeout = 1500 * time.Millisecond
 )
+
+// errRelayProbe reports that the fast liveness preflight did not get a
+// matching probeAck in time.
+var errRelayProbe = errors.New("hub: relay preflight probe failed")
 
 // requestAckDeadline is how long a relayed request's down frame may stay
 // unacked before that request is failed. Delivery is proven by the host's
@@ -56,6 +86,11 @@ var (
 // request frame lost once is replayed at 2*keepalive and only proven one
 // heartbeat later. Three keepalives are one RTO plus one heartbeat of margin;
 // a shorter deadline would fail requests whose frame a single loss delayed.
+//
+// Dispatch overrides this with the shorter interactiveAckWindow: a browser
+// request prefers a fast 503 over waiting out a retransmit, and the preflight
+// probe has already checked the link before the frame is written. Other
+// callers get this window.
 func requestAckDeadline() time.Duration {
 	return 3 * time.Duration(SessionLiveness.Keepalive) * time.Second
 }
@@ -75,8 +110,15 @@ var (
 )
 
 // reqAck is one dispatched request whose frame has not been acked yet.
+//
+// window is how long this request may stay unacked once its frame is on the
+// wire: interactive browser requests use a short budget so a prompt that was
+// never delivered fails fast, while other callers fall back to the general
+// requestAckDeadline. deadline stays zero until the writer completes the
+// frame (see noteWritten).
 type reqAck struct {
 	reqID    string
+	window   time.Duration
 	deadline time.Time
 }
 
@@ -102,6 +144,22 @@ type sessionProto struct {
 	// same-epoch reconnect reuses it; the advertised liveness does not
 	// change inside a run.
 	reqAckDeadline time.Duration
+
+	// audienceSeq is the seq of the newest audience frame still in the down
+	// log, 0 when there is none. Audience is absolute state: while that frame
+	// is unacknowledged every newer snapshot replaces its payload in place
+	// instead of appending another entry. audienceGen is the generation the
+	// entry currently carries; audienceSentGen is the newest generation of
+	// that entry a writer has actually written to a transport. If a replacement
+	// lands after the old payload was written, the peer may already have
+	// applied it under this seq and will discard a retransmission as a
+	// duplicate, so ackDown arms a resend under a fresh seq. audienceLatest is
+	// the newest snapshot seen, used for that resend.
+	audienceSeq     uint64
+	audienceGen     uint64
+	audienceSentGen uint64
+	audienceLatest  wire.Audience
+	audienceResend  *wire.Audience
 }
 
 // newSessionProto starts a sequence space. upAcked is the epoch's retired
@@ -155,7 +213,32 @@ func (p *sessionProto) ackDown(n uint64) uint64 {
 			delete(p.reqAcks, seq)
 		}
 	}
+	if p.audienceSeq != 0 && p.audienceSeq <= applied {
+		// The ack covers the audience frame, but if its payload was replaced
+		// after the last write the peer never saw the newest generation.
+		// Reusing the acked seq would be dropped as a duplicate, so queue the
+		// latest snapshot for a fresh seq.
+		if p.audienceSentGen < p.audienceGen {
+			aud := p.audienceLatest
+			p.audienceResend = &aud
+		}
+		p.audienceSeq, p.audienceGen, p.audienceSentGen = 0, 0, 0
+	}
 	return applied
+}
+
+// takeAudienceResend returns a snapshot that must be sent because the payload
+// folded into an already-written audience frame was newer than anything the
+// peer could have applied. It clears the flag; a no-op read.
+func (p *sessionProto) takeAudienceResend() (wire.Audience, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.audienceResend == nil {
+		return wire.Audience{}, false
+	}
+	a := *p.audienceResend
+	p.audienceResend = nil
+	return a, true
 }
 
 // appendReliable assigns the next down seq, stamps the current up watermark,
@@ -177,10 +260,12 @@ func (p *sessionProto) appendReliable(build func(seq, ack uint64) wire.Frame) (u
 	return seq, nil
 }
 
-// dispatchRequest appends a relay request and records the deadline that proves
-// its delivery, atomically with the append so an ack racing the dispatch can
-// never leave a phantom deadline behind.
-func (p *sessionProto) dispatchRequest(reqID string, f wire.Frame) (uint64, error) {
+// dispatchRequest appends a relay request and records its reqId atomically with
+// the append, so an ack racing the dispatch can never leave a phantom entry
+// behind. The ack deadline stays zero until the writer has written the frame:
+// a request stuck behind a slow socket must not time out before the host could
+// possibly have seen it.
+func (p *sessionProto) dispatchRequest(reqID string, f wire.Frame, window time.Duration) (uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	seq := p.down.Next() + 1
@@ -193,11 +278,47 @@ func (p *sessionProto) dispatchRequest(reqID string, f wire.Frame) (uint64, erro
 	if got := p.down.Append(payload); got != seq {
 		return 0, errors.New("hub: down seq assignment drifted")
 	}
-	p.reqAcks[seq] = reqAck{reqID: reqID, deadline: time.Now().Add(p.reqAckDeadline)}
+	p.reqAcks[seq] = reqAck{reqID: reqID, window: window}
 	if p.down.Bytes() > downInflightCap() {
 		return seq, errDownOverflow
 	}
 	return seq, nil
+}
+
+// noteWritten arms the request ack deadline for the frame at seq, or re-arms it
+// after a retransmission. It is called by the writer only after the complete
+// logical frame reached the transport, which is the moment the host may
+// actually have seen it. For an audience frame it also records the generation
+// that was actually written: a later payload replacement under the same seq
+// must not pretend the newer snapshot reached the host.
+//
+// A replay while the current deadline is still in force does not extend it: the
+// deadline is an upper bound of 3*keepalive on unacked delivery, and RTO is
+// 2*keepalive, so extending on every replay would let a host that never acks
+// postpone its own failure forever. A replay that completes after the deadline
+// (the writer was blocked) starts a fresh window, because only then did a new
+// copy actually reach the wire.
+func (p *sessionProto) noteWritten(seq uint64, payload []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if seq != 0 && seq == p.audienceSeq {
+		if f, err := wire.Decode(payload); err == nil && f.Type == wire.TypeAudience && f.Gen > p.audienceSentGen {
+			p.audienceSentGen = f.Gen
+		}
+	}
+	ra, ok := p.reqAcks[seq]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	if ra.deadline.IsZero() || !now.Before(ra.deadline) {
+		window := ra.window
+		if window <= 0 {
+			window = p.reqAckDeadline
+		}
+		ra.deadline = now.Add(window)
+		p.reqAcks[seq] = ra
+	}
 }
 
 // entriesAfter returns the unacked log entries above seq.
@@ -211,6 +332,13 @@ func (p *sessionProto) entriesAfter(seq uint64) []wire.Entry {
 		}
 	}
 	return out
+}
+
+// entry returns the unacked log entry for seq, if it is still present.
+func (p *sessionProto) entry(seq uint64) (wire.Entry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.down.Entry(seq)
 }
 
 // entries returns the whole unacked log, in seq order.
@@ -232,12 +360,17 @@ func (p *sessionProto) hasUnacked() bool {
 	return p.down.Len() > 0
 }
 
-// nextRequestDeadline is the earliest ack deadline still outstanding.
+// nextRequestDeadline is the earliest armed ack deadline still outstanding. A
+// request whose frame has not been written yet has no deadline and cannot make
+// the session loop spin.
 func (p *sessionProto) nextRequestDeadline() (time.Time, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var out time.Time
 	for _, ra := range p.reqAcks {
+		if ra.deadline.IsZero() {
+			continue
+		}
 		if out.IsZero() || ra.deadline.Before(out) {
 			out = ra.deadline
 		}
@@ -252,7 +385,7 @@ func (p *sessionProto) expireRequests(now time.Time) []string {
 	defer p.mu.Unlock()
 	var out []string
 	for seq, ra := range p.reqAcks {
-		if now.Before(ra.deadline) {
+		if ra.deadline.IsZero() || now.Before(ra.deadline) {
 			continue
 		}
 		out = append(out, ra.reqID)
@@ -261,15 +394,43 @@ func (p *sessionProto) expireRequests(now time.Time) []string {
 	return out
 }
 
-// session is one attached host transport. Its loop owns every write and every
+// oldestUnacked returns at most max entries of the unacked log above the acked
+// watermark, capped by bytes. An RTO replays this batch instead of the whole
+// log: one lost frame must not cost a full replay of everything in flight.
+func (p *sessionProto) oldestUnacked(max, maxBytes int) []wire.Entry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	acked := p.down.Acked()
+	var (
+		out   []wire.Entry
+		bytes int
+	)
+	for _, e := range p.down.Entries() {
+		if e.Seq <= acked {
+			continue
+		}
+		if len(out) >= max || (len(out) > 0 && bytes+len(e.Payload) > maxBytes) {
+			break
+		}
+		out = append(out, e)
+		bytes += len(e.Payload)
+	}
+	return out
+}
+
+// session is one attached host transport. Its loop owns every read and every
 // timer; the hub reaches it through dispatch / pushAudience, which only append
-// to the down log and wake the loop.
+// to the down log and wake the loop. Socket writes belong to the writer
+// goroutine, so a wedged write cannot stall reads, timers or ingestion.
 type session struct {
 	h         *Hub
 	hostID    string
 	epoch     uint64
 	proto     *sessionProto
 	transport Transport
+	writer    atomic.Pointer[writer]
+	// deflate is the downlink compression capability echoed at handshake.
+	deflate bool
 
 	wake chan struct{}
 	stop chan struct{}
@@ -279,11 +440,127 @@ type session struct {
 	stopOnce   sync.Once
 	finished   atomic.Bool
 
-	// Loop-owned link state: how far the down log has been handed to THIS
-	// transport, and the last watermarks exchanged on it.
-	written     uint64
+	// Loop-owned link state: the last watermarks exchanged on THIS transport.
 	lastDownAck uint64
 	lastAckSent uint64
+
+	// Liveness probe state, loop-owned. A probe is outstanding from the moment
+	// it is posted to the writer until any frame (or its probeAck) arrives.
+	probeNonce    uint64
+	probePending  bool
+	probeDeadline time.Time
+
+	// lastFrameAt is the wall time of the last frame the session decoded. It
+	// feeds Dispatch's preflight freshness check; it never counts our own
+	// writes, so a silent peer still looks silent.
+	lastFrameAt atomic.Int64
+
+	// Preflight probe state. One probe is outstanding at a time; concurrent
+	// Dispatch callers join its wait group instead of each writing an hb.
+	probeMu    sync.Mutex
+	probeGroup *relayProbe
+	probeSeq   uint64
+}
+
+// relayProbe is one outstanding preflight probe. done closes exactly once;
+// ok is read after done is closed.
+type relayProbe struct {
+	nonce uint64
+	ok    atomic.Bool
+	done  chan struct{}
+	once  sync.Once
+}
+
+func (g *relayProbe) succeed() {
+	g.ok.Store(true)
+	g.once.Do(func() { close(g.done) })
+}
+
+func (g *relayProbe) fail() { g.once.Do(func() { close(g.done) }) }
+
+// wait blocks until the probe is answered, the caller gives up, the timeout
+// fires, or the session ends.
+func (g *relayProbe) wait(ctx context.Context, stop <-chan struct{}, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-g.done:
+		if g.ok.Load() {
+			return nil
+		}
+		return errRelayProbe
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-stop:
+		return errSessionClosed
+	case <-timer.C:
+		return errRelayProbe
+	}
+}
+
+// healthy reports whether a frame arrived within window.
+func (s *session) healthy(window time.Duration) bool {
+	last := s.lastFrameAt.Load()
+	if last == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, last)) < window
+}
+
+// probe sends hb{probe:N} through the writer's control slot and waits for the
+// matching probeAck. Concurrent callers share one outstanding probe: the first
+// sends it, the rest wait on the same result. A nil return means the link
+// answered; any error means no request should be dispatched on it.
+func (s *session) probe(ctx context.Context, timeout time.Duration) error {
+	if s.finished.Load() {
+		return errSessionClosed
+	}
+
+	s.probeMu.Lock()
+	if g := s.probeGroup; g != nil {
+		s.probeMu.Unlock()
+		return g.wait(ctx, s.stop, timeout)
+	}
+	s.probeSeq++
+	g := &relayProbe{nonce: s.probeSeq, done: make(chan struct{})}
+	s.probeGroup = g
+	s.probeMu.Unlock()
+
+	// The caller that owns the group clears it and fails every joiner if the
+	// probe did not complete. A success is published by completeProbe, which
+	// clears the slot before waking the waiters.
+	defer func() {
+		s.probeMu.Lock()
+		if s.probeGroup == g {
+			s.probeGroup = nil
+		}
+		s.probeMu.Unlock()
+		g.fail()
+	}()
+
+	f, err := wire.NewHeartbeatProbe(s.proto.upAcked(), g.nonce, s.h.heartbeatStatus(s.hostID), false)
+	if err != nil {
+		return errRelayProbe
+	}
+	f.RelayAcks = s.h.relayAcks(s.hostID)
+	if reason := s.postControl(f); reason != 0 {
+		return errSessionClosed
+	}
+	return g.wait(ctx, s.stop, timeout)
+}
+
+// completeProbe resolves the outstanding preflight probe whose nonce the host
+// echoed. A stale ack (the probe already timed out) is ignored.
+func (s *session) completeProbe(nonce uint64) {
+	s.probeMu.Lock()
+	g := s.probeGroup
+	if g != nil && g.nonce == nonce {
+		s.probeGroup = nil
+	}
+	s.probeMu.Unlock()
+	if g != nil && g.nonce == nonce {
+		g.succeed()
+	}
 }
 
 func (s *session) requestStop(r wire.CloseReason) {
@@ -306,7 +583,9 @@ func (s *session) signal() {
 }
 
 // dispatch appends one relay request to the down log and wakes the loop.
-func (s *session) dispatch(reqID, method, path string, body []byte) error {
+// window is the per-request ack budget armed when the writer completes the
+// frame (0 falls back to the session's general requestAckDeadline).
+func (s *session) dispatch(reqID, method, path string, body []byte, window time.Duration) error {
 	if s.finished.Load() {
 		return errSessionClosed
 	}
@@ -314,7 +593,7 @@ func (s *session) dispatch(reqID, method, path string, body []byte) error {
 	if len(body) > 0 {
 		f.Body = body
 	}
-	if _, err := s.proto.dispatchRequest(reqID, f); err != nil {
+	if _, err := s.proto.dispatchRequest(reqID, f, window); err != nil {
 		if errors.Is(err, errDownOverflow) {
 			s.requestStop(wire.CloseOverflow)
 		}
@@ -324,19 +603,82 @@ func (s *session) dispatch(reqID, method, path string, body []byte) error {
 	return nil
 }
 
-// pushAudience appends one absolute audience snapshot to the down log.
+// pushAudience logs one absolute audience snapshot, replacing the payload of
+// the single unacknowledged audience frame when there is one. Keeping the seq
+// stable retains a gapless log; replacing rather than appending keeps a burst
+// of viewer changes from filling the down log with obsolete generations.
+// replaced reports that an existing entry's payload changed, so the session
+// can ask the writer to put the new snapshot on the wire even though its seq is
+// at or below the writer's progress watermark.
+func (p *sessionProto) pushAudience(a wire.Audience) (seq uint64, replaced bool, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if a.Gen < p.audienceLatest.Gen {
+		// A snapshot minted before one already pushed arrived late; it can
+		// never move the absolute state backwards.
+		return 0, false, nil
+	}
+	p.audienceLatest = a
+	// A newer snapshot supersedes a queued post-ack resend.
+	p.audienceResend = nil
+	if p.audienceSeq != 0 && p.audienceSeq <= p.down.Acked() {
+		// Ack bookkeeping normally clears this; guard against a stale seq if
+		// it was advanced elsewhere.
+		p.audienceSeq, p.audienceGen, p.audienceSentGen = 0, 0, 0
+	}
+	if p.audienceSeq != 0 {
+		if a.Gen <= p.audienceGen {
+			return p.audienceSeq, false, nil
+		}
+		seq := p.audienceSeq
+		payload, err := wire.Encode(wire.NewAudience(seq, p.up.Acked(), a))
+		if err != nil {
+			return 0, false, err
+		}
+		if err := p.down.Elide(seq, payload); err == nil {
+			p.audienceGen = a.Gen
+			if p.down.Bytes() > downInflightCap() {
+				return seq, false, errDownOverflow
+			}
+			return seq, true, nil
+		}
+		// The entry vanished between the ack check and Elide; fall through to
+		// appending rather than losing the snapshot.
+		p.audienceSeq, p.audienceGen, p.audienceSentGen = 0, 0, 0
+	}
+	seq = p.down.Next() + 1
+	payload, err := wire.Encode(wire.NewAudience(seq, p.up.Acked(), a))
+	if err != nil {
+		return 0, false, err
+	}
+	if got := p.down.Append(payload); got != seq {
+		return 0, false, errors.New("hub: down seq assignment drifted")
+	}
+	p.audienceSeq = seq
+	p.audienceGen = a.Gen
+	p.audienceSentGen = 0
+	if p.down.Bytes() > downInflightCap() {
+		return seq, false, errDownOverflow
+	}
+	return seq, false, nil
+}
+
+// pushAudience appends or updates the one absolute audience snapshot.
 func (s *session) pushAudience(a wire.Audience) error {
 	if s.finished.Load() {
 		return errSessionClosed
 	}
-	_, err := s.proto.appendReliable(func(seq, ack uint64) wire.Frame {
-		return wire.NewAudience(seq, ack, a)
-	})
+	seq, replaced, err := s.proto.pushAudience(a)
 	if err != nil {
 		if errors.Is(err, errDownOverflow) {
 			s.requestStop(wire.CloseOverflow)
 		}
 		return err
+	}
+	if replaced {
+		if w := s.writer.Load(); w != nil {
+			w.rewrite(seq)
+		}
 	}
 	s.signal()
 	return nil
@@ -374,18 +716,30 @@ func (h *Hub) serveHost(expected string, t Transport) wire.CloseReason {
 		log.Printf("[capri-hub] host %s: bad hello (%s)", expected, reason)
 		return reason
 	}
+	// Transport units are mandatory in v2: every downlink frame may arrive as
+	// fragments, and a peer that cannot reassemble them cannot run a session.
+	if hello.Caps == nil || !hello.Caps.TransportUnits {
+		log.Printf("[capri-hub] host %s: hello without caps.transportUnits", expected)
+		return wire.CloseProtocol
+	}
 	hostID, ok := h.HostIDForToken(hello.Token)
 	if !ok || (expected != "" && expected != hostID) {
 		log.Printf("[capri-hub] host %s: hello token rejected", expected)
 		return wire.CloseAuth
 	}
 
-	deflate := hello.Caps != nil && hello.Caps.Deflate
+	deflate := hello.Caps.Deflate
 	if ds, ok := t.(deflateSetter); ok {
 		ds.SetDeflate(deflate)
 	}
 	keepalive := time.Duration(SessionLiveness.Keepalive) * time.Second
+	idle := time.Duration(SessionLiveness.Idle) * time.Second
 	t.SetKeepalive(keepalive)
+	// A write may not outlive the idle verdict: the writer is allowed to be
+	// slow, but never so slow that a peer already declared dead still holds a
+	// socket write open.
+	t.SetWriteTimeout(idle * 3 / 4)
+	t.SetMaxFrame(SessionLimits.MaxFrame)
 
 	s, old, ack, err := h.attach(hostID, hello.Epoch, hello.Resume.Up, hello.Resume.Down, deflate)
 	if err != nil {
@@ -396,6 +750,7 @@ func (h *Hub) serveHost(expected string, t Transport) wire.CloseReason {
 		return wire.CloseProtocol
 	}
 	s.transport = t
+	s.deflate = deflate
 	if old != nil {
 		// The new transport owns the down log now; the old loop exits on stop
 		// and its ServeHost closes the old transport.
@@ -424,8 +779,10 @@ func (s *session) finish(reason wire.CloseReason) {
 	s.h.detach(s)
 }
 
-// run is the one session loop: read frames, apply them, send heartbeats,
-// retransmit unacked down frames and enforce idle. It returns the close reason.
+// run is the one session loop: read frames, apply them, schedule heartbeats
+// and probes, and enforce idle. Socket writes run on the session's writer
+// goroutine, so a blocked write delays output but never this loop. It returns
+// the close reason.
 func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReason {
 	if err := s.transport.Send(helloAck); err != nil {
 		log.Printf("[capri-hub] host %s: hello_ack write: %v", s.hostID, err)
@@ -435,9 +792,12 @@ func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReaso
 	idle := time.Duration(SessionLiveness.Idle) * time.Second
 	rto := 2 * keepalive
 
-	s.written = s.proto.downAcked()
-	s.lastDownAck = s.written
+	s.lastDownAck = s.proto.downAcked()
 	s.lastAckSent = s.proto.upAcked()
+
+	w := newWriter(s, s.transport, s.deflate)
+	s.writer.Store(w)
+	w.start()
 
 	// A same-epoch resume must replay the entries this transport has not
 	// carried yet; they were appended before this link existed.
@@ -452,8 +812,19 @@ func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReaso
 	defer timer.Stop()
 
 	for {
+		frameClock := lastRecv
+		if a := s.transport.LastActivity(); a.After(frameClock) {
+			frameClock = a
+		}
 		next := nextHB
-		if d := lastRecv.Add(idle); d.Before(next) {
+		if d := frameClock.Add(idle); d.Before(next) {
+			next = d
+		}
+		if s.probePending {
+			if s.probeDeadline.Before(next) {
+				next = s.probeDeadline
+			}
+		} else if d := lastRecv.Add(probeAfter); d.Before(next) {
 			next = d
 		}
 		if s.proto.hasUnacked() && rtoAt.Before(next) {
@@ -499,8 +870,25 @@ func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReaso
 				return reason
 			}
 
+		case <-w.progress:
+			// A completed write means bytes are moving again; restart the
+			// retransmit clock instead of replaying a frame that just left.
+			rtoAt = time.Now().Add(rto)
+
 		case <-timer.C:
 			now := time.Now()
+			// Probe escalation runs ahead of idle: silence gets one cheap
+			// round-trip before the session is declared dead.
+			if s.probePending {
+				if !now.Before(s.probeDeadline) {
+					log.Printf("[capri-hub] host %s: no probe ack for %s, closing session", s.hostID, probeTimeout)
+					return wire.CloseLiveness
+				}
+			} else if !now.Before(lastRecv.Add(probeAfter)) {
+				if reason := s.sendProbe(now); reason != 0 {
+					return reason
+				}
+			}
 			if !now.Before(nextHB) {
 				if reason := s.sendHeartbeat(); reason != 0 {
 					return reason
@@ -508,16 +896,26 @@ func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReaso
 				nextHB = now.Add(keepalive)
 			}
 			if s.proto.hasUnacked() && !now.Before(rtoAt) {
-				if reason := s.retransmit(); reason != 0 {
-					return reason
+				// The writer is already moving bytes; a replay would queue
+				// behind the frame it is trying to replace.
+				if w.Busy() {
+					rtoAt = now.Add(rto)
+				} else {
+					if reason := s.retransmit(); reason != 0 {
+						return reason
+					}
+					rtoAt = now.Add(rto)
 				}
-				rtoAt = now.Add(rto)
 			}
 			for _, reqID := range s.proto.expireRequests(now) {
 				log.Printf("[capri-hub] host %s: request %s not acked within %s", s.hostID, reqID, s.proto.reqAckDeadline)
 				s.h.failRequest(s.hostID, reqID, 503, "host 未确认中继请求")
 			}
-			if now.Sub(lastRecv) >= idle {
+			frameClock := lastRecv
+			if a := s.transport.LastActivity(); a.After(frameClock) {
+				frameClock = a
+			}
+			if now.Sub(frameClock) >= idle {
 				log.Printf("[capri-hub] host %s: no frame for %s, closing session", s.hostID, idle)
 				return wire.CloseLiveness
 			}
@@ -554,13 +952,30 @@ func (s *session) handleFrame(data []byte) wire.CloseReason {
 	// processed as "not delivered".
 	if f.Ack > s.lastDownAck {
 		s.lastDownAck = s.proto.ackDown(f.Ack)
+		// A newer audience snapshot folded into the acked seq after that
+		// frame was written never reached the peer. Send it under a fresh
+		// seq now; the receiver would drop a duplicate seq as already
+		// applied.
+		if aud, ok := s.proto.takeAudienceResend(); ok {
+			if err := s.pushAudience(aud); err != nil {
+				if errors.Is(err, errDownOverflow) {
+					return wire.CloseOverflow
+				}
+				log.Printf("[capri-hub] host %s: audience resend: %v", s.hostID, err)
+			}
+		}
 	}
+	// Any frame from the host proves the link is live and moves the registry
+	// freshness stamp /api/hosts exposes. No hosts_changed: this is per-frame
+	// bookkeeping, not a registry transition.
+	s.probePending = false
+	s.lastFrameAt.Store(time.Now().UnixNano())
+	s.h.touchHost(s.hostID)
 	switch f.Type {
 	case wire.TypeEvents:
 		return s.handleEvents(data, f)
 	case wire.TypeRespond:
-		s.handleRespond(f)
-		return 0
+		return s.handleRespond(f)
 	case wire.TypeHeartbeat:
 		return s.handleHeartbeat(f)
 	default:
@@ -618,19 +1033,34 @@ func (s *session) handleEvents(raw []byte, f wire.Frame) wire.CloseReason {
 	return 0
 }
 
-func (s *session) handleRespond(f wire.Frame) {
-	if f.Chunk != "" || f.Encoding != "" || f.More {
-		if !s.h.RespondChunk(s.hostID, f.ReqID, f.RespondStatus(), f.Encoding, f.Chunk, f.More) {
-			log.Printf("[capri-hub] host %s: respond chunk for unknown reqId %s", s.hostID, f.ReqID)
-		}
-		return
-	}
-	if !s.h.Respond(s.hostID, f.ReqID, RelayResponse{Status: f.RespondStatus(), Body: f.Body}) {
+// handleRespond applies one answer frame in the relay plane's chunk order.
+// A frame that advances the per-request ack or ends the request triggers an
+// immediate hb, so the host learns what it may drop without waiting for the
+// next heartbeat tick.
+func (s *session) handleRespond(f wire.Frame) wire.CloseReason {
+	known, notify := s.h.acceptRespond(s.hostID, f)
+	if !known {
 		log.Printf("[capri-hub] host %s: respond for unknown reqId %s", s.hostID, f.ReqID)
 	}
+	if notify {
+		return s.sendHeartbeat()
+	}
+	return 0
 }
 
 func (s *session) handleHeartbeat(f wire.Frame) wire.CloseReason {
+	// A host probe is answered immediately through the control slot; it rides
+	// the same latest-wins channel as the periodic hb so a busy writer never
+	// accumulates a backlog of probes.
+	if f.Probe != 0 {
+		if reason := s.sendProbeAck(f.Probe); reason != 0 {
+			return reason
+		}
+	}
+	if f.ProbeAck != 0 {
+		s.probePending = false
+		s.completeProbe(f.ProbeAck)
+	}
 	st, err := f.Heartbeat()
 	if err != nil {
 		return wire.CloseProtocol
@@ -654,53 +1084,95 @@ func (s *session) stopped() bool {
 	}
 }
 
-// flushNew writes the down log entries this transport has not seen yet.
+// flushNew hands the down log to the writer. It never writes: the writer
+// goroutine pulls the entries this transport has not carried yet.
 func (s *session) flushNew() wire.CloseReason {
 	if s.stopped() {
 		// A superseded link must not write frames the new link owns; entries
 		// appended after the handover belong to the replacement.
 		return s.closeReason()
 	}
-	for _, e := range s.proto.entriesAfter(s.written) {
-		if err := s.transport.Send(e.Payload); err != nil {
-			log.Printf("[capri-hub] host %s: downlink write: %v", s.hostID, err)
-			return wire.CloseNormal
-		}
-		s.written = e.Seq
+	if w := s.writer.Load(); w != nil {
+		w.kick()
 	}
 	return 0
 }
 
-// retransmit replays the whole unacked down log after an RTO.
+// retransmit asks the writer to replay the oldest unacked batch. The writer
+// owns the socket, so this only signals it; the batch is bounded so a lost
+// frame never costs a replay of the whole in-flight log.
 func (s *session) retransmit() wire.CloseReason {
 	if s.stopped() {
 		return s.closeReason()
 	}
-	for _, e := range s.proto.entries() {
-		if err := s.transport.Send(e.Payload); err != nil {
-			log.Printf("[capri-hub] host %s: retransmit write: %v", s.hostID, err)
-			return wire.CloseNormal
-		}
-		if e.Seq > s.written {
-			s.written = e.Seq
-		}
+	w := s.writer.Load()
+	if w == nil {
+		return s.closeReason()
 	}
+	w.retransmit()
 	return 0
 }
 
+// sendHeartbeat builds the periodic hb and posts it to the writer's
+// latest-wins control slot. While a probe is outstanding the hb carries the
+// same nonce again, so a heartbeat queued behind the probe cannot erase it.
 func (s *session) sendHeartbeat() wire.CloseReason {
-	f, err := wire.NewHeartbeat(s.proto.upAcked(), s.h.heartbeatStatus(s.hostID))
+	var (
+		f   wire.Frame
+		err error
+	)
+	if s.probePending {
+		f, err = wire.NewHeartbeatProbe(s.proto.upAcked(), s.probeNonce, s.h.heartbeatStatus(s.hostID), false)
+	} else {
+		f, err = wire.NewHeartbeat(s.proto.upAcked(), s.h.heartbeatStatus(s.hostID))
+	}
 	if err != nil {
 		return wire.CloseProtocol
 	}
+	f.RelayAcks = s.h.relayAcks(s.hostID)
+	return s.postControl(f)
+}
+
+// sendProbe posts a fresh liveness probe and arms its deadline.
+func (s *session) sendProbe(now time.Time) wire.CloseReason {
+	if s.probeNonce == 0 {
+		s.probeNonce = uint64(now.UnixNano()) | 1
+	} else {
+		s.probeNonce++
+	}
+	f, err := wire.NewHeartbeatProbe(s.proto.upAcked(), s.probeNonce, s.h.heartbeatStatus(s.hostID), false)
+	if err != nil {
+		return wire.CloseProtocol
+	}
+	f.RelayAcks = s.h.relayAcks(s.hostID)
+	if reason := s.postControl(f); reason != 0 {
+		return reason
+	}
+	s.probePending = true
+	s.probeDeadline = now.Add(probeTimeout)
+	return 0
+}
+
+// sendProbeAck echoes a host probe nonce immediately.
+func (s *session) sendProbeAck(nonce uint64) wire.CloseReason {
+	f, err := wire.NewHeartbeatProbe(s.proto.upAcked(), nonce, s.h.heartbeatStatus(s.hostID), true)
+	if err != nil {
+		return wire.CloseProtocol
+	}
+	f.RelayAcks = s.h.relayAcks(s.hostID)
+	return s.postControl(f)
+}
+
+func (s *session) postControl(f wire.Frame) wire.CloseReason {
 	payload, err := wire.Encode(f)
 	if err != nil {
 		return wire.CloseProtocol
 	}
-	if err := s.transport.Send(payload); err != nil {
-		log.Printf("[capri-hub] host %s: heartbeat write: %v", s.hostID, err)
-		return wire.CloseNormal
+	w := s.writer.Load()
+	if w == nil {
+		return s.closeReason()
 	}
+	w.postControl(payload)
 	return 0
 }
 

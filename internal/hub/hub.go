@@ -85,6 +85,45 @@ var evBufByteCap = 64 << 20
 // the worst case. A var so tests can shrink it.
 var maxPendingRelayPerHost = 16
 
+// hostRelayChunkSize is the host's current relay chunk size (capri-host
+// relayChunkSize). It is the assumed minimum chunk size when deriving how many
+// parked chunks one maximum answer can produce.
+const hostRelayChunkSize = 256 << 10
+
+// Out-of-order relay chunks are parked per host until the gap fills. The
+// bounds keep a broken or hostile chunk stream from turning the parked map
+// into unbounded memory: over either bound the affected request fails with a
+// 502 and an abort tombstone, while the session and other requests survive.
+//
+// They must not be so tight that a legitimate resume fails: a 28MiB answer at
+// the host's 256KiB chunk size is ~112 chunks, so a lost first chunk parks the
+// other 111. The count bound therefore holds two answers' worth (a resume can
+// overlap another in-flight request), never below 256 chunks. Parked frames
+// carry base64 chunks, so the byte bound allows the 4/3 encoding expansion for
+// two answers plus one chunk of slack. Both are aggregate per host, not per
+// request. They are derived from the default maxChunkedRelayBody at process
+// start; tests that shrink the body cap override them explicitly.
+var (
+	maxParkedRelayChunksPerHost = max(256, 2*(maxChunkedRelayBody/hostRelayChunkSize+1))
+	maxParkedRelayBytesPerHost  = 2 * (maxChunkedRelayBody*4/3 + hostRelayChunkSize)
+)
+
+// The ack table keeps a short tombstone for every resolved or aborted request
+// so a reconnecting host (same epoch) learns which answers it may forget.
+// Bounded by count and age: a host that stays away longer than the TTL gets
+// no stale instructions.
+var (
+	maxRelayTombstonesPerHost = 256
+	relayTombstoneTTL         = 5 * time.Minute
+)
+
+// interactiveAckWindow is how long a browser-facing (interactive) request may
+// stay unacked before the hub fails just that request. It is deliberately
+// shorter than the general requestAckDeadline: an interactive caller prefers
+// a fast 503 over waiting out a retransmit, and the preflight probe already
+// checked the link before the frame was written.
+var interactiveAckWindow = 5 * time.Second
+
 // EventBufGrace is how long after a host disconnect we keep its gap-pull
 // buffer so a short blip can still be filled via GET /api/events. Zero
 // clears immediately (tests may shrink this).
@@ -143,9 +182,10 @@ type Event map[string]any
 // HostInfo is the public registry entry (GET /api/hosts). busy/booting/
 // pendingCount are the host's live snapshot (the hb.status field) —
 // transient, never persisted. Port is the host's local HTTP listen port (so
-// the browser can try 127.0.0.1:<port>); it is persisted. LastSeen is the
-// last attach/detach activity and only orders the host list: online is
-// derived from the attachment, never from this timestamp.
+// the browser can try 127.0.0.1:<port>); it is persisted. LastSeen is the last
+// attach/detach activity, refreshed by every frame the host sends, and orders
+// the host list / powers the FE freshness probe: online is derived from the
+// attachment, never from this timestamp.
 type HostInfo struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
@@ -171,18 +211,37 @@ type RelayResponse struct {
 }
 
 // pendingReq is one relayed request waiting for the host's answer.
+//
+// Answer assembly is ordered by the relay plane's per-request ChunkSeq:
+// nextChunk is the highest contiguous chunk applied (0 = none), parked holds
+// frames that arrived ahead of the gap, and finalChunk is the ChunkSeq that
+// resolved the request. The hub acknowledges progress per request through
+// relayAcks, independently of the session's cumulative seq.
 type pendingReq struct {
 	resp chan RelayResponse
 	done chan struct{}
 
-	// Chunked relay response assembly (see Hub.RespondChunk). A body over
+	// Ordered relay response assembly (see Hub.acceptRespond). A body over
 	// the host's relay chunk size arrives as several `respond` frames of
-	// base64; chunks accumulates the decoded bytes and chunkStatus is the
-	// status reported by the first frame. Guarded by Hub.mu, like the map
-	// entry itself.
+	// base64; chunks accumulates the body bytes, chunkStatus is the status
+	// from the first applied frame, and chunked marks a multi-frame answer.
+	// Guarded by Hub.mu, like the map entry itself.
+	nextChunk      uint64
+	finalChunk     uint64
+	parked         map[uint64]wire.Frame
+	parkedBytes    int
 	chunks         []byte
 	chunkStatus    int
 	chunkStatusSet bool
+	chunked        bool
+}
+
+// relayTombstone remembers how a request ended after its pending entry is
+// gone, so a reconnecting host learns which answers it may forget and a late
+// or duplicate respond is answered with the right verdict.
+type relayTombstone struct {
+	ack wire.RelayAck
+	at  time.Time
 }
 
 // hostState is one paired host. Lock order is always h.mu → hs.mu; nothing
@@ -366,6 +425,13 @@ type Hub struct {
 	// readers never contend on h.mu.
 	subs    atomic.Pointer[[]*feSubscriber]
 	pending map[string]map[string]*pendingReq
+	// relayTombstones carries the terminal state of recently resolved or
+	// aborted relay requests (hostId → reqId → tombstone). It feeds the ack
+	// table in hello_ack and hb, so a host that reconnects in the same epoch
+	// knows which answers it may drop and which requests were abandoned.
+	// Guarded by h.mu; bounded by maxRelayTombstonesPerHost and
+	// relayTombstoneTTL, and cleared on a new epoch or unpair.
+	relayTombstones map[string]map[string]relayTombstone
 
 	nextReq atomic.Int64
 	// nextSubID stamps each browser subscriber with a stable id so the
@@ -407,10 +473,10 @@ type Hub struct {
 	// where the drop happens; these exist so GET /api/stats can show
 	// whether the "gap-pull will repair it" claim is holding.
 	feStats feDropStats
-	// lateRelayChunks counts chunked `respond` frames whose reqId has no
-	// pending entry — normally a chunk that arrived after the browser gave
-	// up. Harmless by design, but a rising count means large answers are
-	// outliving their request.
+	// lateRelayChunks counts `respond` frames whose reqId has no pending
+	// entry — normally a chunk that arrived after the browser gave up or a
+	// duplicate of an answer already delivered. Harmless by design, but a
+	// rising count means large answers are outliving their request.
 	lateRelayChunks atomic.Uint64
 	// startedAt stamps process start for the uptime in GET /api/stats.
 	startedAt time.Time
@@ -456,12 +522,13 @@ func NewWithDir(dir string) *Hub {
 		log.Printf("[capri-hub] 无法生成随机 hubBoot（%v），使用时间戳 %d", err, boot)
 	}
 	h := &Hub{
-		tokens:    make(map[string]string),
-		hosts:     make(map[string]*hostState),
-		pending:   make(map[string]map[string]*pendingReq),
-		prefs:     BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
-		startedAt: time.Now(),
-		hubBoot:   boot,
+		tokens:          make(map[string]string),
+		hosts:           make(map[string]*hostState),
+		pending:         make(map[string]map[string]*pendingReq),
+		relayTombstones: make(map[string]map[string]relayTombstone),
+		prefs:           BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
+		startedAt:       time.Now(),
+		hubBoot:         boot,
 	}
 	h.subs.Store(&emptySubs)
 	if dir != "" {
@@ -940,6 +1007,7 @@ func (h *Hub) Unpair(hostID string) error {
 		hs.session = nil
 	}
 	delete(h.hosts, hostID)
+	delete(h.relayTombstones, hostID)
 	hs.mu.Lock()
 	hs.evBuf = nil
 	hs.evBufBytes = 0
@@ -1048,12 +1116,19 @@ func (h *Hub) attach(hostID string, epoch, resumeUp, resumeDown uint64, deflate 
 		// the retired epoch that are still queued are dropped when the drain
 		// reaches them (see fanoutItemCurrent).
 		h.announceEpochReset(hs, resumeUp)
+		// Tombstones describe the retired sequence space; the new epoch
+		// starts with no relay memory on either side.
+		delete(h.relayTombstones, hostID)
 	} else if resumeDown > 0 {
 		// The host already applied everything up to resume.down; advancing the
 		// down sender's ack drops those entries instead of replaying them, and
 		// releases the requests they proved delivered. A stale or smaller
 		// value never moves the watermark backwards.
 		hs.proto.ackDown(resumeDown)
+		// A resend triggered by that ack is unnecessary: hello_ack carries the
+		// current absolute audience snapshot and the host applies it before
+		// any replayed frame.
+		_, _ = hs.proto.takeAudienceResend()
 	}
 	s = &session{
 		h:      h,
@@ -1063,6 +1138,9 @@ func (h *Hub) attach(hostID string, epoch, resumeUp, resumeDown uint64, deflate 
 		wake:   make(chan struct{}, 1),
 		stop:   make(chan struct{}),
 	}
+	// The hello handshake is itself a fresh frame; a Dispatch that races the
+	// session goroutine's start must not mistake the link for a silent one.
+	s.lastFrameAt.Store(time.Now().UnixNano())
 	hs.session = s
 	hs.info.Online = true
 	hs.info.LastSeen = time.Now()
@@ -1073,16 +1151,17 @@ func (h *Hub) attach(hostID string, epoch, resumeUp, resumeDown uint64, deflate 
 	aud, _ := h.audienceLocked(hostID)
 	liveness := SessionLiveness
 	limits := SessionLimits
-	caps := wire.Caps{Deflate: deflate}
+	caps := wire.Caps{Deflate: deflate, TransportUnits: true, RelayAck: true}
 	ack = wire.HelloAck{
-		Epoch:    epoch,
-		HubBoot:  h.hubBoot,
-		AckUp:    hs.proto.upAcked(),
-		AckDown:  hs.proto.downAcked(),
-		Audience: &aud,
-		Liveness: &liveness,
-		Limits:   &limits,
-		Caps:     &caps,
+		Epoch:     epoch,
+		HubBoot:   h.hubBoot,
+		AckUp:     hs.proto.upAcked(),
+		AckDown:   hs.proto.downAcked(),
+		Audience:  &aud,
+		Liveness:  &liveness,
+		Limits:    &limits,
+		Caps:      &caps,
+		RelayAcks: h.relayAcksLocked(hostID),
 	}
 	h.broadcast(hostsChanged())
 	return s, old, ack, nil
@@ -1147,6 +1226,17 @@ func (h *Hub) noteUpAck(s *session, ack uint64) {
 	h.mu.Unlock()
 }
 
+// touchHost refreshes the host's freshness stamp for a received frame. It is
+// deliberately silent: hosts_changed is a registry transition (attach/detach,
+// status flip), not a per-frame broadcast.
+func (h *Hub) touchHost(hostID string) {
+	h.mu.Lock()
+	if hs := h.hosts[hostID]; hs != nil {
+		hs.info.LastSeen = time.Now()
+	}
+	h.mu.Unlock()
+}
+
 // heartbeatStatus snapshots the registry view a heartbeat carries. The shared
 // envelope gives hb a status field in both directions; on the way down it is
 // informational — the host's own last report, never a command.
@@ -1170,6 +1260,9 @@ func (h *Hub) heartbeatStatus(hostID string) wire.HeartbeatStatus {
 // Caller must hold h.mu.
 func (h *Hub) failPendingLocked(hostID string) {
 	for reqID, pr := range h.pending[hostID] {
+		// The host must drop any answer it still holds for these; a reconnect
+		// in the same epoch learns it from hello_ack.relayAcks.
+		h.addAbortTombstoneLocked(hostID, reqID)
 		close(pr.done)
 		delete(h.pending[hostID], reqID)
 	}
@@ -1178,10 +1271,15 @@ func (h *Hub) failPendingLocked(hostID string) {
 
 // failRequest fails one pending relayed request with an HTTP status. It is the
 // session's per-request deadline path (a dispatch the host never acked), so
-// other requests and the session itself are untouched.
+// other requests and the session itself are untouched. The abort tombstone
+// tells the host to discard the answer if it ever runs it.
 func (h *Hub) failRequest(hostID, reqID string, status int, message string) {
 	h.mu.Lock()
 	pr := h.takePendingLocked(hostID, reqID)
+	if pr != nil {
+		h.addAbortTombstoneLocked(hostID, reqID)
+		pr.parked = nil
+	}
 	h.mu.Unlock()
 	if pr == nil {
 		return
@@ -1749,6 +1847,38 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 		h.mu.Unlock()
 		return RelayResponse{}, &RelayError{Status: 429, Message: "host 在途中继请求过多"}
 	}
+	h.mu.Unlock()
+
+	// Fast liveness preflight. "Online" only means a transport object exists;
+	// a half-open link would otherwise swallow the request frame and leave the
+	// browser waiting for the interactive ack deadline. A session that just
+	// received a frame is trusted; a silent one must answer a probe before a
+	// prompt (which is not cancellable once it starts) is sent.
+	if !sess.healthy(relayHealthWindow) {
+		if err := sess.probe(ctx, relayProbeTimeout); err != nil {
+			if ctx.Err() != nil {
+				return RelayResponse{}, &RelayError{Status: 499, Message: "客户端已取消"}
+			}
+			return RelayResponse{}, &RelayError{Status: 503, Message: "host 正在重连"}
+		}
+	}
+
+	// The probe may have taken a while: re-check that the same session is
+	// still attached and that the pending table still has room.
+	h.mu.Lock()
+	hs = h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return RelayResponse{}, &RelayError{Status: 404, Message: ErrHostUnknown.Error()}
+	}
+	if hs.session != sess {
+		h.mu.Unlock()
+		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 当前离线", hostID)}
+	}
+	if len(h.pending[hostID]) >= maxPendingRelayPerHost {
+		h.mu.Unlock()
+		return RelayResponse{}, &RelayError{Status: 429, Message: "host 在途中继请求过多"}
+	}
 	pr := &pendingReq{
 		resp: make(chan RelayResponse, 1),
 		done: make(chan struct{}),
@@ -1761,8 +1891,9 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 
 	// Delivery is the session's problem: the frame is logged and retransmitted
 	// until the host's cumulative ack covers it. A frame that stays unacked
-	// past the request ack deadline fails this request alone (see session.run).
-	if err := sess.dispatch(reqID, method, path, body); err != nil {
+	// past the interactive ack window fails this request alone (see
+	// session.run).
+	if err := sess.dispatch(reqID, method, path, body, interactiveAckWindow); err != nil {
 		h.dropPending(hostID, reqID)
 		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
 	}
@@ -1799,23 +1930,15 @@ func (h *Hub) dropPending(hostID, reqID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if m := h.pending[hostID]; m != nil {
-		delete(m, reqID)
+		if pr, ok := m[reqID]; ok {
+			delete(m, reqID)
+			h.addAbortTombstoneLocked(hostID, reqID)
+			pr.parked = nil
+		}
 		if len(m) == 0 {
 			delete(h.pending, hostID)
 		}
 	}
-}
-
-// Respond resolves a relayed request with the host's answer.
-func (h *Hub) Respond(hostID, reqID string, resp RelayResponse) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	pr := h.takePendingLocked(hostID, reqID)
-	if pr == nil {
-		return false
-	}
-	pr.resp <- resp
-	return true
 }
 
 // takePendingLocked removes one pending request and reports it, or nil when
@@ -1836,16 +1959,245 @@ func (h *Hub) takePendingLocked(hostID, reqID string) *pendingReq {
 	return pr
 }
 
+// relayAcks returns the hub's per-request acknowledgement table for hostID:
+// every pending request with its highest contiguous chunk, every recently
+// resolved request marked done, and every aborted request marked abort. It is
+// carried by hello_ack (same-epoch resume) and by every hb the session sends.
+func (h *Hub) relayAcks(hostID string) []wire.RelayAck {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.relayAcksLocked(hostID)
+}
+
+// relayAcksLocked is relayAcks with the caller holding h.mu.
+func (h *Hub) relayAcksLocked(hostID string) []wire.RelayAck {
+	now := time.Now()
+	pend := h.pending[hostID]
+	out := make([]wire.RelayAck, 0, len(pend))
+	for reqID, pr := range pend {
+		out = append(out, wire.RelayAck{ReqID: reqID, Chunk: pr.nextChunk})
+	}
+	for reqID, ts := range h.relayTombstones[hostID] {
+		if now.Sub(ts.at) > relayTombstoneTTL {
+			delete(h.relayTombstones[hostID], reqID)
+			continue
+		}
+		if _, live := pend[reqID]; live {
+			continue
+		}
+		out = append(out, ts.ack)
+	}
+	if len(h.relayTombstones[hostID]) == 0 {
+		delete(h.relayTombstones, hostID)
+	}
+	// Stable order: the host matches by reqId, but a deterministic frame is
+	// easier to assert in tests and to diff in logs.
+	sort.Slice(out, func(i, j int) bool { return out[i].ReqID < out[j].ReqID })
+	return out
+}
+
+// addRelayTombstoneLocked records how one request ended. Bounded by count
+// (oldest evicted) so a long-running hub with many short relay calls cannot
+// grow the ack table without limit. Callers hold h.mu.
+func (h *Hub) addRelayTombstoneLocked(hostID string, ack wire.RelayAck) {
+	if ack.ReqID == "" {
+		return
+	}
+	m := h.relayTombstones[hostID]
+	if m == nil {
+		m = make(map[string]relayTombstone)
+		h.relayTombstones[hostID] = m
+	}
+	m[ack.ReqID] = relayTombstone{ack: ack, at: time.Now()}
+	if len(m) <= maxRelayTombstonesPerHost {
+		return
+	}
+	oldestID := ""
+	var oldest time.Time
+	for id, ts := range m {
+		if oldestID == "" || ts.at.Before(oldest) {
+			oldestID, oldest = id, ts.at
+		}
+	}
+	delete(m, oldestID)
+}
+
+// addAbortTombstoneLocked tells the host to drop an answer. A request that
+// already completed keeps its done tombstone: a late duplicate chunk must not
+// turn a delivered answer into an aborted one.
+func (h *Hub) addAbortTombstoneLocked(hostID, reqID string) {
+	if m := h.relayTombstones[hostID]; m != nil {
+		if ts, ok := m[reqID]; ok && ts.ack.Done {
+			return
+		}
+	}
+	h.addRelayTombstoneLocked(hostID, wire.RelayAck{ReqID: reqID, Abort: true})
+}
+
+func (h *Hub) addDoneTombstoneLocked(hostID, reqID string, chunk uint64) {
+	h.addRelayTombstoneLocked(hostID, wire.RelayAck{ReqID: reqID, Chunk: chunk, Done: true})
+}
+
+// resolvePendingLocked delivers a completed answer, removes the pending entry
+// and records the done tombstone, all under one h.mu so a reconnecting host
+// sees exactly one terminal state. Callers hold h.mu.
+func (h *Hub) resolvePendingLocked(hostID, reqID string, pr *pendingReq, resp RelayResponse, finalChunk uint64) {
+	if pr == nil || h.pending[hostID][reqID] != pr {
+		return
+	}
+	h.takePendingLocked(hostID, reqID)
+	pr.parked = nil
+	h.addDoneTombstoneLocked(hostID, reqID, finalChunk)
+	pr.resp <- resp
+}
+
+// hostParkedLocked returns the out-of-order chunk count and byte weight parked
+// across every pending request for hostID.
+func (h *Hub) hostParkedLocked(hostID string) (chunks, bytes int) {
+	for _, pr := range h.pending[hostID] {
+		chunks += len(pr.parked)
+		bytes += pr.parkedBytes
+	}
+	return chunks, bytes
+}
+
+// acceptRespond applies one respond frame in the relay plane's per-request
+// chunk order. It returns known=false for a reqId with no pending entry
+// (recorded as an abort tombstone so the host drops its answer) and
+// notify=true when the per-request ack advanced or the request reached a
+// terminal state, so the session can push a fresh hb immediately.
+//
+// Out-of-order chunks are parked (bounded per host); a gap that overflows the
+// bounds fails only that request with 502 + abort, never the session.
+func (h *Hub) acceptRespond(hostID string, f wire.Frame) (known, notify bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	pr := h.pending[hostID][f.ReqID]
+	if pr == nil {
+		h.lateRelayChunks.Add(1)
+		h.addAbortTombstoneLocked(hostID, f.ReqID)
+		return false, false
+	}
+	if f.ChunkSeq <= pr.nextChunk {
+		// Duplicate: the ack table already covers it.
+		return true, false
+	}
+	if f.ChunkSeq > pr.nextChunk+1 {
+		weight := len(f.Chunk) + len(f.Body)
+		chunks, bytes := h.hostParkedLocked(hostID)
+		if chunks+1 > maxParkedRelayChunksPerHost || bytes+weight > maxParkedRelayBytesPerHost {
+			log.Printf("[capri-hub] host %s req %s: out-of-order relay chunks over budget (chunk %d, %d parked, %d bytes), failing this request only",
+				hostID, f.ReqID, f.ChunkSeq, chunks, bytes)
+			h.failRelayRequestLocked(hostID, f.ReqID, "中继响应乱序分块过多")
+			return true, true
+		}
+		if pr.parked == nil {
+			pr.parked = make(map[uint64]wire.Frame)
+		}
+		if _, dup := pr.parked[f.ChunkSeq]; !dup {
+			pr.parked[f.ChunkSeq] = f
+			pr.parkedBytes += weight
+		}
+		return true, false
+	}
+
+	resolved, applied := h.applyRespondLocked(hostID, f.ReqID, pr, f)
+	notify = applied
+	for !resolved {
+		next, ok := pr.parked[pr.nextChunk+1]
+		if !ok {
+			break
+		}
+		pr.parkedBytes -= len(next.Chunk) + len(next.Body)
+		delete(pr.parked, pr.nextChunk+1)
+		var applied bool
+		resolved, applied = h.applyRespondLocked(hostID, f.ReqID, pr, next)
+		notify = notify || applied
+	}
+	return true, notify
+}
+
+// applyRespondLocked applies one in-order chunk. resolved reports that the
+// pending entry is gone (answer delivered or request failed); applied reports
+// that the per-request ack moved or the request ended, so the caller knows to
+// push an hb. Callers hold h.mu.
+func (h *Hub) applyRespondLocked(hostID, reqID string, pr *pendingReq, f wire.Frame) (resolved, applied bool) {
+	status := f.RespondStatus()
+	if !pr.chunkStatusSet {
+		pr.chunkStatus = status
+		pr.chunkStatusSet = true
+	}
+
+	if f.Chunk != "" || f.Encoding != "" {
+		pr.chunked = true
+		// The only encoding defined today. An empty or unknown encoding with
+		// a chunk is a protocol error too: guessing would hand raw bytes to
+		// the response writer as if they were the body.
+		if f.Encoding != "base64" {
+			log.Printf("[capri-hub] host %s req %s: respond chunk encoding %q unsupported", hostID, reqID, f.Encoding)
+			h.failRelayRequestLocked(hostID, reqID, fmt.Sprintf("中继响应分块编码不受支持: %q", f.Encoding))
+			return true, true
+		}
+		decoded, err := base64.StdEncoding.DecodeString(f.Chunk)
+		if err != nil {
+			log.Printf("[capri-hub] host %s req %s: respond chunk base64 decode: %v", hostID, reqID, err)
+			h.failRelayRequestLocked(hostID, reqID, "中继响应分块无法解码")
+			return true, true
+		}
+		if len(pr.chunks)+len(decoded) > maxChunkedRelayBody {
+			log.Printf("[capri-hub] host %s req %s: chunked relay body over %d bytes, failing this request only",
+				hostID, reqID, maxChunkedRelayBody)
+			h.failRelayRequestLocked(hostID, reqID, fmt.Sprintf("中继响应超过 %dMB 上限", maxChunkedRelayBody>>20))
+			return true, true
+		}
+		pr.chunks = append(pr.chunks, decoded...)
+	} else if f.More || pr.chunked || pr.nextChunk > 0 {
+		// A raw-body fragment (no base64) is only meaningful as part of a
+		// multi-frame answer; a lone frame keeps the legacy Body path below.
+		pr.chunked = true
+		pr.chunks = append(pr.chunks, f.Body...)
+	}
+
+	pr.nextChunk = f.ChunkSeq
+	applied = true
+	if f.More {
+		return false, applied
+	}
+	pr.finalChunk = f.ChunkSeq
+
+	if !pr.chunked && f.ChunkSeq == 1 {
+		// Single-frame answer: preserve the original shape exactly, including
+		// an absent body and no JSON re-validation.
+		h.resolvePendingLocked(hostID, reqID, pr, RelayResponse{Status: status, Body: f.Body}, f.ChunkSeq)
+		return true, applied
+	}
+
+	body := pr.chunks
+	if !json.Valid(body) {
+		// The host wraps non-JSON bodies as JSON strings, so invalid bytes
+		// here are a protocol bug. A 502 is better than handing the FE
+		// bytes its JSON writer would choke on.
+		log.Printf("[capri-hub] host %s req %s: assembled relay body is not valid JSON (%d bytes)", hostID, reqID, len(body))
+		h.failRelayRequestLocked(hostID, reqID, "拼接后的中继响应不是合法 JSON")
+		return true, applied
+	}
+	h.resolvePendingLocked(hostID, reqID, pr, RelayResponse{Status: pr.chunkStatus, Body: body}, f.ChunkSeq)
+	return true, applied
+}
+
 // failRelayRequestLocked drops one pending request and answers it with a 502
 // JSON error. Unlike failPendingLocked it does not touch the host's other
 // requests or the session: one oversized or malformed answer must not fail
-// everything else in flight. Callers hold h.mu.
+// everything else in flight. The abort tombstone tells the host to stop
+// sending chunks for it. Callers hold h.mu.
 func (h *Hub) failRelayRequestLocked(hostID, reqID, reason string) {
 	pr := h.takePendingLocked(hostID, reqID)
 	if pr == nil {
 		return
 	}
+	h.addAbortTombstoneLocked(hostID, reqID)
 	pr.chunks = nil
+	pr.parked = nil
 	body, _ := json.Marshal(map[string]any{"ok": false, "error": reason})
 	pr.resp <- RelayResponse{Status: 502, Body: body}
 }
@@ -1857,68 +2209,49 @@ func (h *Hub) failRelayRequestLocked(hostID, reqID, reason string) {
 // so tests can shrink it.
 var maxChunkedRelayBody = 28 << 20
 
-// RespondChunk feeds one chunk of a chunked relay response (the host splits
-// bodies over its relay chunk size into base64 frames; see the host's
-// respondChunked). It returns true when the chunk belonged to a pending
-// request — including the case where it failed that request — and false for
-// an unknown reqId, which is logged and counted but otherwise ignored: a
-// chunk can legitimately arrive after the browser gave up and the pending
-// entry was dropped.
+// Respond resolves a relayed request with a complete answer. It is the
+// in-process API used by tests and embedders; the wire path goes through
+// acceptRespond with the frame's real ChunkSeq.
+func (h *Hub) Respond(hostID, reqID string, resp RelayResponse) bool {
+	h.mu.Lock()
+	seq := uint64(1)
+	if pr := h.pending[hostID][reqID]; pr != nil {
+		seq = pr.nextChunk + 1
+	}
+	h.mu.Unlock()
+
+	f := wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeRespond, ReqID: reqID, ChunkSeq: seq}
+	f.SetRespondStatus(resp.Status)
+	if len(resp.Body) > 0 {
+		f.Body = resp.Body
+	}
+	known, _ := h.acceptRespond(hostID, f)
+	return known
+}
+
+// RespondChunk feeds one chunk of a chunked relay response. It returns true
+// when the chunk belonged to a pending request — including the case where it
+// failed that request — and false for an unknown reqId, which is logged,
+// counted and tombstoned: a chunk can legitimately arrive after the browser
+// gave up and the pending entry was dropped.
 //
 // The assembled bytes are handed to the waiting relay caller as a normal
 // RelayResponse, so the browser and FE never see the split.
 func (h *Hub) RespondChunk(hostID, reqID string, status int, encoding, chunk string, more bool) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	pr := h.pending[hostID][reqID]
-	if pr == nil {
-		h.lateRelayChunks.Add(1)
-		return false
+	seq := uint64(1)
+	if pr := h.pending[hostID][reqID]; pr != nil {
+		seq = pr.nextChunk + 1
 	}
-	// The only encoding defined today. An empty encoding with a chunk is a
-	// protocol error too: guessing would hand raw bytes to the response
-	// writer as if they were the body.
-	if encoding != "base64" {
-		log.Printf("[capri-hub] host %s req %s: respond chunk encoding %q unsupported", hostID, reqID, encoding)
-		h.failRelayRequestLocked(hostID, reqID, fmt.Sprintf("中继响应分块编码不受支持: %q", encoding))
-		return true
+	h.mu.Unlock()
+
+	f := wire.Frame{
+		V: wire.ProtocolVersion, Type: wire.TypeRespond,
+		ReqID: reqID, ChunkSeq: seq, Encoding: encoding, Chunk: chunk, More: more,
 	}
-	decoded, err := base64.StdEncoding.DecodeString(chunk)
-	if err != nil {
-		log.Printf("[capri-hub] host %s req %s: respond chunk base64 decode: %v", hostID, reqID, err)
-		h.failRelayRequestLocked(hostID, reqID, "中继响应分块无法解码")
-		return true
-	}
-	if len(pr.chunks)+len(decoded) > maxChunkedRelayBody {
-		log.Printf("[capri-hub] host %s req %s: chunked relay body over %d bytes, failing this request only",
-			hostID, reqID, maxChunkedRelayBody)
-		h.failRelayRequestLocked(hostID, reqID, fmt.Sprintf("中继响应超过 %dMB 上限", maxChunkedRelayBody>>20))
-		return true
-	}
-	if !pr.chunkStatusSet {
-		pr.chunkStatus = status
-		pr.chunkStatusSet = true
-	}
-	pr.chunks = append(pr.chunks, decoded...)
-	if more {
-		return true
-	}
-	body := pr.chunks
-	if !json.Valid(body) {
-		// The host wraps non-JSON bodies as JSON strings, so invalid bytes
-		// here are a protocol bug. A 502 is better than handing the FE
-		// bytes its JSON writer would choke on.
-		log.Printf("[capri-hub] host %s req %s: assembled relay body is not valid JSON (%d bytes)", hostID, reqID, len(body))
-		h.failRelayRequestLocked(hostID, reqID, "拼接后的中继响应不是合法 JSON")
-		return true
-	}
-	pr = h.takePendingLocked(hostID, reqID)
-	if pr == nil {
-		return true // raced with a dropPending; the browser is gone
-	}
-	pr.chunks = body
-	pr.resp <- RelayResponse{Status: pr.chunkStatus, Body: body}
-	return true
+	f.SetRespondStatus(status)
+	known, _ := h.acceptRespond(hostID, f)
+	return known
 }
 
 // ── registry / browsers ───────────────────────────────────────────────

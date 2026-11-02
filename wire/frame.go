@@ -59,8 +59,9 @@ func knownType(frameType string) bool {
 // from the same shape.
 //
 // seq belongs to reliable frames only; respond carries its delivery proof at
-// the relay layer instead. ack is this direction's watermark for the opposite
-// direction and may be 0 only while nothing has been received.
+// the relay layer instead (ChunkSeq, echoed through RelayAcks). ack is this
+// direction's watermark for the opposite direction and may be 0 only while
+// nothing has been received.
 type Frame struct {
 	V    int    `json:"v"`
 	Type string `json:"type"`
@@ -88,7 +89,8 @@ type Frame struct {
 	All      bool     `json:"all,omitempty"`
 	Sessions []string `json:"sessions,omitempty"`
 
-	// request / respond (relay plane)
+	// request / respond (relay plane). ChunkSeq is 1-based and scoped to one
+	// reqId; it never enters the session seq space.
 	ReqID    string          `json:"reqId,omitempty"`
 	Method   string          `json:"method,omitempty"`
 	Path     string          `json:"path,omitempty"`
@@ -96,6 +98,12 @@ type Frame struct {
 	Chunk    string          `json:"chunk,omitempty"`
 	Encoding string          `json:"encoding,omitempty"`
 	More     bool            `json:"more,omitempty"`
+	ChunkSeq uint64          `json:"chunkSeq,omitempty"`
+
+	// hb / hello_ack: the relay ack table; hb: liveness probe nonces.
+	RelayAcks []RelayAck `json:"relayAcks,omitempty"`
+	Probe     uint64     `json:"probe,omitempty"`
+	ProbeAck  uint64     `json:"probeAck,omitempty"`
 
 	// Status is the one envelope key whose shape depends on the frame type: a
 	// HeartbeatStatus object on hb, the HTTP status code on respond. It stays
@@ -120,10 +128,23 @@ type Resume struct {
 	Down uint64 `json:"down"`
 }
 
-// Caps is the capability offer/echo. Deflate is only usable after the hub
-// echoes it in hello_ack.
+// Caps is the capability offer/echo. A bit is only usable after the hub echoes
+// it in hello_ack.
 type Caps struct {
-	Deflate bool `json:"deflate,omitempty"`
+	Deflate        bool `json:"deflate,omitempty"`
+	TransportUnits bool `json:"transportUnits,omitempty"`
+	RelayAck       bool `json:"relayAck,omitempty"`
+}
+
+// RelayAck is one entry of the hub's per-request acknowledgement table. Chunk
+// is the highest contiguous chunk applied, Done means the whole answer was
+// applied, and Abort means the hub discarded the request and the host must
+// stop sending chunks for it.
+type RelayAck struct {
+	ReqID string `json:"reqId"`
+	Chunk uint64 `json:"chunk,omitempty"`
+	Done  bool   `json:"done,omitempty"`
+	Abort bool   `json:"abort,omitempty"`
 }
 
 // HelloAck is the hub's answer. AckUp and AckDown are authoritative: the host
@@ -132,15 +153,19 @@ type Caps struct {
 // HubBoot identifies the hub process that minted this ack. A hub restart
 // resets its own request-id counter, so a reqId is only meaningful inside one
 // hubBoot: relay state keyed by reqId must also carry it.
+//
+// RelayAcks is the hub's relay table at handshake time: a resumed host learns
+// which chunks of an in-flight answer the hub already holds.
 type HelloAck struct {
-	Epoch    uint64    `json:"epoch"`
-	HubBoot  uint64    `json:"hubBoot"`
-	AckUp    uint64    `json:"ackUp,omitempty"`
-	AckDown  uint64    `json:"ackDown,omitempty"`
-	Audience *Audience `json:"audience,omitempty"`
-	Liveness *Liveness `json:"liveness,omitempty"`
-	Limits   *Limits   `json:"limits,omitempty"`
-	Caps     *Caps     `json:"caps,omitempty"`
+	Epoch     uint64     `json:"epoch"`
+	HubBoot   uint64     `json:"hubBoot"`
+	AckUp     uint64     `json:"ackUp,omitempty"`
+	AckDown   uint64     `json:"ackDown,omitempty"`
+	Audience  *Audience  `json:"audience,omitempty"`
+	Liveness  *Liveness  `json:"liveness,omitempty"`
+	Limits    *Limits    `json:"limits,omitempty"`
+	Caps      *Caps      `json:"caps,omitempty"`
+	RelayAcks []RelayAck `json:"relayAcks,omitempty"`
 }
 
 // Audience is the absolute viewer state for one host. Gen orders snapshots
@@ -253,6 +278,22 @@ func (f Frame) validate() error {
 	if f.Type != TypeHelloAck && f.HubBoot != 0 {
 		return fmt.Errorf("%w: %s carries hubBoot %d", ErrProtocol, f.Type, f.HubBoot)
 	}
+	// Probe nonces are hb-only. Their values are opaque: an ack with no local
+	// probe to match is harmless, and zero means absent.
+	if f.Type != TypeHeartbeat && (f.Probe != 0 || f.ProbeAck != 0) {
+		return fmt.Errorf("%w: %s carries a liveness probe", ErrProtocol, f.Type)
+	}
+	// ChunkSeq is the relay plane's per-request sequence and never enters the
+	// session seq space.
+	if f.Type != TypeRespond && f.ChunkSeq != 0 {
+		return fmt.Errorf("%w: %s carries chunkSeq %d", ErrProtocol, f.Type, f.ChunkSeq)
+	}
+	if f.Type != TypeHeartbeat && f.Type != TypeHelloAck && len(f.RelayAcks) > 0 {
+		return fmt.Errorf("%w: %s carries relayAcks", ErrProtocol, f.Type)
+	}
+	if err := validateRelayAcks(f.RelayAcks); err != nil {
+		return err
+	}
 
 	switch f.Type {
 	case TypeHello:
@@ -293,12 +334,30 @@ func (f Frame) validate() error {
 		if f.ReqID == "" {
 			return fmt.Errorf("%w: respond without reqId", ErrProtocol)
 		}
+		if f.ChunkSeq == 0 {
+			return fmt.Errorf("%w: respond without chunkSeq", ErrProtocol)
+		}
 	case TypeHeartbeat:
 		if len(f.Status) == 0 {
 			return fmt.Errorf("%w: hb without status", ErrProtocol)
 		}
 		if _, err := f.Heartbeat(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// validateRelayAcks checks the per-request table shared by hb and hello_ack.
+// An entry names exactly one request, and an answer cannot be both complete
+// and discarded.
+func validateRelayAcks(acks []RelayAck) error {
+	for i, a := range acks {
+		if a.ReqID == "" {
+			return fmt.Errorf("%w: relayAck %d without reqId", ErrProtocol, i)
+		}
+		if a.Done && a.Abort {
+			return fmt.Errorf("%w: relayAck %d is done and aborted", ErrProtocol, i)
 		}
 	}
 	return nil
@@ -357,14 +416,15 @@ func (f Frame) HelloAck() (HelloAck, error) {
 		return HelloAck{}, fmt.Errorf("wire: frame type %q is not hello_ack", f.Type)
 	}
 	return HelloAck{
-		Epoch:    f.Epoch,
-		HubBoot:  f.HubBoot,
-		AckUp:    f.AckUp,
-		AckDown:  f.AckDown,
-		Audience: f.Audience,
-		Liveness: f.Liveness,
-		Limits:   f.Limits,
-		Caps:     f.Caps,
+		Epoch:     f.Epoch,
+		HubBoot:   f.HubBoot,
+		AckUp:     f.AckUp,
+		AckDown:   f.AckDown,
+		Audience:  f.Audience,
+		Liveness:  f.Liveness,
+		Limits:    f.Limits,
+		Caps:      f.Caps,
+		RelayAcks: f.RelayAcks,
 	}, nil
 }
 
@@ -426,16 +486,17 @@ func NewHello(h Hello) Frame {
 // NewHelloAck builds a hello_ack frame.
 func NewHelloAck(a HelloAck) Frame {
 	return Frame{
-		V:        ProtocolVersion,
-		Type:     TypeHelloAck,
-		Epoch:    a.Epoch,
-		HubBoot:  a.HubBoot,
-		AckUp:    a.AckUp,
-		AckDown:  a.AckDown,
-		Audience: a.Audience,
-		Liveness: a.Liveness,
-		Limits:   a.Limits,
-		Caps:     a.Caps,
+		V:         ProtocolVersion,
+		Type:      TypeHelloAck,
+		Epoch:     a.Epoch,
+		HubBoot:   a.HubBoot,
+		AckUp:     a.AckUp,
+		AckDown:   a.AckDown,
+		Audience:  a.Audience,
+		Liveness:  a.Liveness,
+		Limits:    a.Limits,
+		Caps:      a.Caps,
+		RelayAcks: a.RelayAcks,
 	}
 }
 
@@ -451,6 +512,24 @@ func NewHeartbeat(ack uint64, st HeartbeatStatus) (Frame, error) {
 	f := Frame{V: ProtocolVersion, Type: TypeHeartbeat, Ack: ack}
 	if err := f.SetHeartbeat(st); err != nil {
 		return Frame{}, err
+	}
+	return f, nil
+}
+
+// NewHeartbeatProbe builds an hb that probes liveness or answers a probe.
+// With ackProbe false nonce is sent as probe; with it true nonce is echoed as
+// probeAck. A zero nonce writes neither field.
+func NewHeartbeatProbe(ack, nonce uint64, st HeartbeatStatus, ackProbe bool) (Frame, error) {
+	f, err := NewHeartbeat(ack, st)
+	if err != nil {
+		return Frame{}, err
+	}
+	if nonce != 0 {
+		if ackProbe {
+			f.ProbeAck = nonce
+		} else {
+			f.Probe = nonce
+		}
 	}
 	return f, nil
 }

@@ -266,6 +266,40 @@ func TestSenderElideKeepsSeq(t *testing.T) {
 	}
 }
 
+func TestSenderElideFromWalksInOrder(t *testing.T) {
+	s := NewSender(0)
+	for i := 0; i < 5; i++ {
+		s.Append([]byte("payload"))
+	}
+	start := 0
+	for _, seq := range []uint64{2, 4} {
+		idx, err := s.ElideFrom(start, seq, TrimmedEvent("s1", seq))
+		if err != nil {
+			t.Fatalf("elide %d: %v", seq, err)
+		}
+		if idx < start {
+			t.Fatalf("elide %d returned index %d before start %d", seq, idx, start)
+		}
+		start = idx + 1
+	}
+	entries := s.Entries()
+	if len(entries) != 5 || entries[1].Seq != 2 || entries[3].Seq != 4 {
+		t.Fatalf("elided log %v", entries)
+	}
+	if _, err := s.ElideFrom(3, 2, nil); err == nil {
+		t.Fatal("elide before the cursor found an entry it should have skipped")
+	}
+	if e, ok := s.EntryAt(2); !ok || e.Seq != 3 {
+		t.Fatalf("EntryAt(2) = %+v, %v", e, ok)
+	}
+	if e, ok := s.Entry(4); !ok || e.Seq != 4 {
+		t.Fatalf("Entry(4) = %+v, %v", e, ok)
+	}
+	if _, ok := s.EntryAt(5); ok {
+		t.Fatal("EntryAt past the end accepted")
+	}
+}
+
 func TestReceiverDuplicatesAndGaps(t *testing.T) {
 	r := NewReceiver(0)
 	if ready, ack, err := r.Accept(2, []byte("two")); err != nil || len(ready) != 0 || ack != 0 {

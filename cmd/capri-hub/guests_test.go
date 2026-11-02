@@ -65,11 +65,22 @@ func (f *fakeHost) serve(ctx context.Context) {
 			Type   string          `json:"type"`
 			ReqID  string          `json:"reqId"`
 			Seq    uint64          `json:"seq"`
+			Probe  uint64          `json:"probe"`
 			Path   string          `json:"path"`
 			Body   json.RawMessage `json:"body"`
 			Method string          `json:"method"`
 		}
-		if json.Unmarshal(data, &frame) != nil || frame.Type != "request" {
+		if json.Unmarshal(data, &frame) != nil {
+			continue
+		}
+		if frame.Type == "hb" && frame.Probe != 0 {
+			ack, _ := json.Marshal(map[string]any{
+				"v": 2, "type": "hb", "probeAck": frame.Probe, "status": map[string]any{},
+			})
+			_ = f.conn.Write(ctx, websocket.MessageText, ack)
+			continue
+		}
+		if frame.Type != "request" {
 			continue
 		}
 		var body map[string]any
@@ -98,7 +109,7 @@ func (f *fakeHost) serve(ctx context.Context) {
 		}
 		resp, _ := json.Marshal(map[string]any{
 			"v": 2, "type": "respond", "reqId": frame.ReqID, "seq": 0,
-			"ack": frame.Seq, "status": 200, "body": out,
+			"ack": frame.Seq, "chunkSeq": 1, "status": 200, "body": out,
 		})
 		_ = f.conn.Write(ctx, websocket.MessageText, resp)
 	}

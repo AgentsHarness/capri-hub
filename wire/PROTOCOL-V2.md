@@ -70,13 +70,25 @@ Every host↔hub JSON frame has:
 - `epoch` appears only in `hello` / `hello_ack`; every other frame belongs
   to the session's epoch implicitly. `hubBoot` appears only in `hello_ack`
   and identifies the hub process for the life of the session.
+- `probe` / `probeAck` appear only on `hb`. `probe` is a liveness nonce the
+  sender expects echoed; `probeAck` echoes a received nonce. Zero means
+  absent and the nonce value is otherwise opaque — an ack for a nonce that
+  is no longer outstanding is ignored, not an error.
+- `chunkSeq` appears only on `respond`, is 1-based and contiguous inside one
+  `reqId`, and never enters the session seq space.
+- `relayAcks` appears only on `hb` and `hello_ack`: the hub's per-request
+  acknowledgement table for `respond` chunks (§5.4).
+- `caps` is the capability offer/echo: `deflate`, `transportUnits` and
+  `relayAck`. A capability is only used after the hub echoes it in
+  `hello_ack`.
 
 Reliable in the session seq space: `events`, `audience`, `request`.
 Unreliable in that space: `hello`, `hello_ack`, `hb`, `respond`.
 
 `respond` is reliable at the relay layer (per-request, chunked) and does not
 consume the session seq space; its `seq` is 0. It still carries `ack` so it
-can acknowledge `request` frames.
+can acknowledge `request` frames. Its delivery proof is `chunkSeq` paired
+with the hub's `relayAcks` table (§5.4), not the session watermark.
 
 ## 3. Handshake
 
@@ -87,7 +99,7 @@ Both transports use one shape: the host writes `hello` as the first frame.
 ```json
 {"v":2,"type":"hello","epoch":7,"token":"...",
  "resume":{"up":41,"down":17},
- "caps":{"deflate":true}}
+ "caps":{"deflate":true,"transportUnits":true,"relayAck":true}}
 ```
 
 - `resume.up`: on a new epoch, the retired high-water mark (the last event
@@ -107,7 +119,7 @@ Both transports use one shape: the host writes `hello` as the first frame.
  "audience":{"gen":33,"watchers":2,"all":false,"sessions":["s1"]},
  "liveness":{"keepalive":5,"idle":20},
  "limits":{"maxFrame":8388608,"maxRelayBody":29360128,"resumeWindow":1500},
- "caps":{"deflate":true}}
+ "caps":{"deflate":true,"transportUnits":true,"relayAck":true}}
 ```
 
 - `hubBoot` is the hub process's incarnation id, minted once at startup. A
@@ -124,7 +136,11 @@ Both transports use one shape: the host writes `hello` as the first frame.
   the receiver's parked-frame bound in both directions: each side builds
   its receiver with the window it was told, never with a package constant.
 - `caps.deflate` echoes the host's offer. Compressed uplink frames are
-  allowed only after this echo.
+  allowed only after this echo. `caps.transportUnits` and `caps.relayAck`
+  echo the same way and gate transport-unit framing (§7.1) and the relay ack
+  table (§5.4).
+- `relayAcks` is the hub's per-request table at handshake time. It may be
+  empty; a resumed host uses it to skip chunks the hub already holds.
 
 A missing mandatory field, including a zero `hubBoot`, is `close(protocol)`.
 
@@ -218,6 +234,13 @@ is the repair path.
   children. `all:true` means the audience cannot be narrowed; the host
   filters nothing.
 - Apply when `gen >= lastGen`. Equal gen = duplicate: apply once, still ack.
+- The hub keeps at most one unacknowledged audience frame per session. A newer
+  snapshot replaces its payload in place under the same seq; if the previous
+  payload may already have been applied under that seq, the newest snapshot is
+  also sent under a fresh seq.
+- A receiver MUST apply an audience frame carrying a newer `gen` even when its
+  seq is at or below the delivered watermark: the seq can predate an in-place
+  payload update.
 - This single frame replaces `subscribers` and `viewing`, their two gens,
   their two ack paths and their two retransmit entries.
 
@@ -238,9 +261,19 @@ is the repair path.
 
 ### 5.4 `respond` (host → hub, relay plane)
 
-Keep the current shape (`body` or base64 `chunk` + `more`). `reqId` routes
-it. A `respond` frame carries:
+```json
+{"v":2,"type":"respond","ack":100,"reqId":"7","chunkSeq":3,
+ "chunk":"aGk=","encoding":"base64","more":true,"status":200}
+```
 
+Keep the current shape (`body` or base64 `chunk` + `more`). `reqId` routes
+it and `chunkSeq` orders it. A `respond` frame carries:
+
+- `chunkSeq`: 1-based and contiguous per `reqId`, incremented for every
+  chunk including the first and the final one. It is a per-request sequence,
+  not a session seq: `respond.seq` stays 0 and no other frame type may carry
+  `chunkSeq`. A retransmission repeats the same `chunkSeq` byte for byte. An
+  inline `body` answer is chunk 1.
 - `status`: the HTTP status code of the relayed call, repeated on every
   chunk.
 - `encoding`: absent for an inline `body`; `"base64"` for a `chunk`. Any
@@ -248,25 +281,52 @@ it. A `respond` frame carries:
   request with 5xx and leaves the session alone), because the field has
   exactly one defined value today.
 
-The final chunk closes the request. `respond` frames are not part of the
-session seq log; the relay deadline owns their loss.
+The chunk with `more:false` closes the answer. `respond` frames are not part
+of the session seq log; the relay deadline owns their loss.
 
-The request is acked by the session, but the answer is not. The host keeps a
-completed answer (bounded by TTL and bytes) and resends it on the next
-session that adopts a `hello_ack` with the same `hubBoot`; `respond` is
-idempotent at the hub, which ignores a reqId it already resolved. An answer
-completed while no session was live therefore still reaches the browser, and
-nothing is re-executed.
+Delivery proof is the hub's ack table, returned in `hello_ack.relayAcks` and
+refreshed in every `hb.relayAcks`:
+
+- one entry per in-flight `(hubBoot, reqId)`;
+- `chunk` is the highest contiguous chunk applied. A chunk at or below it is
+  a duplicate and is dropped; a chunk above it leaves a gap and the missing
+  range is resent;
+- `done` means the whole answer was applied and the host may forget it;
+- `abort` means the hub discarded the request (failed or cancelled) and the
+  host stops sending chunks for it;
+- `done` and `abort` are mutually exclusive, and every entry names a
+  non-empty `reqId`.
+
+An empty table is valid. The host drops entries that do not belong to the
+adopted `hubBoot`. The ack table only proves how far an answer got; it does
+not add `respond` to the session seq space.
+
+The request is acked by the session, but the answer's chunks are acked at
+the relay layer. The host keeps a completed answer (bounded by TTL and
+bytes) and resends it on the next session that adopts a `hello_ack` with the
+same `hubBoot`; `respond` is idempotent at the hub, which ignores a reqId it
+already resolved. An answer completed while no session was live therefore
+still reaches the browser, and nothing is re-executed.
 
 ### 5.5 `hb` (both directions, unreliable)
 
 ```json
-{"v":2,"type":"hb","ack":100,
+{"v":2,"type":"hb","ack":100,"probe":1201,"probeAck":1200,
+ "relayAcks":[{"reqId":"7","chunk":2}],
  "status":{"ready":true,"busy":false,"booting":false,"pendingCount":0,"port":8765}}
 ```
 
 - Sent every `liveness.keepalive` seconds, and immediately after a receive
-  gap that needs an ack.
+  gap that needs an ack. While a turn is active the cadence is
+  `BusyKeepalive` (1s), so a long tool call neither looks like an idle link
+  nor leaves the peer's watermark stale.
+- `probe`: a nonce the sender wants echoed. Send one after `ProbeAfter` (7s)
+  with no received frame; close with `liveness` if no `probeAck` arrives
+  within `ProbeTimeout` (3s).
+- `probeAck`: the same nonce echoed back. The value is opaque and a matching
+  local probe is not required to accept it; zero means absent.
+- `relayAcks`: the hub's current per-request table (§5.4). Empty or absent
+  when nothing is in flight.
 - Any received frame resets the idle timer.
 - `status` is a snapshot; a lost one is corrected by the next `hb`.
 - No other liveness or state-ack frame exists.
@@ -297,10 +357,14 @@ One time scale, advertised by the hub:
     transport one.
 - `idle` (20s): either side closes with `liveness` after this long without
   any frame.
+- Probe escalation runs ahead of `idle`: no received frame for `ProbeAfter`
+  (7s) sends `hb{probe:N}`; no `probeAck:N` within `ProbeTimeout` (3s)
+  closes with `liveness`. A busy turn keeps `hb` at `BusyKeepalive` (1s) so
+  the probe path is not entered just because tool output is quiet.
 - Hub registry: online while a session is attached; offline on session
-  close. No sweep and no separate watchdog. `lastSeen` survives only as a
-  display/ordering stamp refreshed when a session attaches or detaches; no
-  liveness decision reads it.
+  close. No sweep and no separate watchdog. `lastSeen` is refreshed on every
+  host frame and exposed through `/api/hosts`; the browser's silence probe
+  reads it for UI state, while session liveness remains the `hb`/probe clock.
 - Request deadline is RPC, not liveness: the request ack deadline is
   `3*keepalive` (one retransmit RTO of `2*keepalive` plus a heartbeat of
   margin) and `RelayTimeout` (45m).
@@ -311,20 +375,64 @@ One `Transport` interface:
 
 ```go
 type Transport interface {
-    Send([]byte) error
-    Recv() ([]byte, error)
+    Send([]byte) error          // one complete logical frame
+    SendFragment([]byte) error  // one encoded transport unit
+    Recv() ([]byte, error)      // one complete logical frame
     Close(CloseReason) error
     SetKeepalive(time.Duration)
+    SetWriteTimeout(time.Duration)
+    SetMaxFrame(int)
+    LastActivity() time.Time
 }
 ```
 
-- **WebSocket**: one frame per text message, or one raw-deflate stream per
-  binary message (same threshold/flags as today). The first frame is
-  `hello`; capability headers are gone.
-- **QUIC**: one bidirectional control stream; the first frame is `hello`.
-  Request streams carry `respond` frames as today. The hub never writes on
-  a request stream.
+- **WebSocket**: text messages carry a complete JSON frame; binary messages
+  carry one transport unit (a complete compressed frame or a fragment). The
+  first frame is `hello`; capability headers are gone.
+- **QUIC**: one bidirectional control stream for the session; every record
+  on it is one length-prefixed transport unit. Request streams carry
+  `respond` frames as complete length-prefixed frames and are not
+  unit-fragmented. The hub never writes on a request stream.
 - Deflate negotiation rides `hello.caps.deflate` / `hello_ack.caps.deflate`.
+  Compression is applied to the logical frame before unit splitting; the
+  receiver inflates after reassembly.
+
+### 7.1 Transport units
+
+When `caps.transportUnits` is echoed, a JSON frame travels in one or more
+binary units so a 32KiB slice can be written at a time and a control frame
+can overtake the rest of a large frame. Each unit is a 13-byte header
+followed by data:
+
+```
+byte 0      flags: bit0 = compressed, bit1 = fragment
+bytes 1..4  frameID uint32
+bytes 5..8  total   uint32
+bytes 9..12 offset  uint32
+bytes 13..  data
+```
+
+All integers are big-endian. `UnitSize` is 32KiB of payload.
+
+- A frame that fits in one unit is a single complete unit: fragment clear,
+  `offset` 0, `total` equal to the data length. This is the whole-frame path;
+  splitting is only for larger frames, and an empty frame is one complete
+  unit with `total` 0.
+- A larger frame is split into fragments with the same `frameID` and `total`
+  and increasing offsets. Every unit of a compressed frame sets the
+  compressed flag.
+- The receiver appends fragments in offset order. Only one fragmented frame
+  may be open per direction: a different `frameID`, an offset that is not
+  the current end, or a changed compressed flag is a protocol error.
+- Complete units are delivered immediately and leave the open fragment
+  untouched, so `hb` (and other small control frames) can interleave between
+  the units of a large frame. A complete unit that reuses the open
+  fragment's `frameID` is a protocol error.
+- `maxFrame` rejects an assembly whose `total` exceeds it, whatever unit
+  announced it.
+
+A receiver that does not negotiate units keeps the whole-frame path for
+every frame, including frames above 32KiB.
 
 ## 8. Browser-facing behaviour
 
@@ -342,3 +450,8 @@ type Transport interface {
 - Relay chunking and per-request QUIC streams.
 - Flate compression and the 256-byte floor.
 - FE-side `EventSequencer` unchanged.
+- Liveness probes ride `hb` (`probe` / `probeAck`): `ProbeAfter` 7s,
+  `ProbeTimeout` 3s, `BusyKeepalive` 1s, all in `wire/limits.go`.
+- Transport units: 32KiB payload target with a 13-byte header, negotiated
+  by `caps.transportUnits`; the relay ack table is negotiated by
+  `caps.relayAck`.

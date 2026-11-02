@@ -6,7 +6,8 @@ The host ↔ hub session protocol is specified once in
 reasons). That document is the single source of truth; this file only records
 what the hub's transports do with a frame and in what order.
 
-Reliability model and fault matrix: `docs/SESSION-V2-RELIABILITY.md`.
+Reliability model and fault matrix: see `wire/PROTOCOL-V2.md` and the protocol
+lecture page `docs/session-v2-protocol-lecture.html`.
 
 ## 1. Frame envelope
 
@@ -19,6 +20,9 @@ Every frame is one JSON object, `{"v":2,"type":...,"seq":N,"ack":M}`.
   ones must not (`hello`, `hello_ack`, `hb`, `respond`).
 - `ack` is the sender's watermark over the opposite direction and rides
   every frame that can carry it.
+- `audience` is absolute state: the hub keeps at most one unacknowledged
+  audience frame and may replace its payload under the same seq. A receiver
+  applies a newer `gen` even when the frame's seq is already delivered.
 - No capability headers exist. `hello` and `hello_ack` are the only frames
   that name an epoch; the hub also names its process in `hello_ack.hubBoot`.
 

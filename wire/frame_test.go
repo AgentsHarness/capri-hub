@@ -38,18 +38,33 @@ func TestFrameRoundTrip(t *testing.T) {
 		t.Fatalf("NewHeartbeat: %v", err)
 	}
 
-	respond := Frame{V: ProtocolVersion, Type: TypeRespond, Ack: 100, ReqID: "7", Body: json.RawMessage(`{"ok":true}`)}
+	respond := Frame{V: ProtocolVersion, Type: TypeRespond, Ack: 100, ReqID: "7", ChunkSeq: 1, Body: json.RawMessage(`{"ok":true}`)}
 	respond.SetRespondStatus(200)
 
-	chunked := Frame{V: ProtocolVersion, Type: TypeRespond, Ack: 100, ReqID: "7", Chunk: "aGk=", Encoding: "base64", More: true}
+	chunked := Frame{V: ProtocolVersion, Type: TypeRespond, Ack: 100, ReqID: "7", ChunkSeq: 2, Chunk: "aGk=", Encoding: "base64", More: true}
 	chunked.SetRespondStatus(200)
+
+	probe, err := NewHeartbeatProbe(100, 42, HeartbeatStatus{Ready: true}, false)
+	if err != nil {
+		t.Fatalf("NewHeartbeatProbe: %v", err)
+	}
+	probeAck, err := NewHeartbeatProbe(100, 42, HeartbeatStatus{Ready: true}, true)
+	if err != nil {
+		t.Fatalf("NewHeartbeatProbe: %v", err)
+	}
+	acking := hbFrame(t)
+	acking.RelayAcks = []RelayAck{
+		{ReqID: "7", Chunk: 3},
+		{ReqID: "8", Done: true},
+		{ReqID: "9", Abort: true},
+	}
 
 	cases := map[string]Frame{
 		"hello": NewHello(Hello{
 			Epoch:  7,
 			Token:  "tok",
 			Resume: &Resume{Up: 41, Down: 17},
-			Caps:   &Caps{Deflate: true},
+			Caps:   &Caps{Deflate: true, TransportUnits: true, RelayAck: true},
 		}),
 		"hello_ack": NewHelloAck(HelloAck{
 			Epoch:    7,
@@ -60,17 +75,24 @@ func TestFrameRoundTrip(t *testing.T) {
 			Liveness: &DefaultLiveness,
 			Limits:   &DefaultLimits,
 			Caps:     &Caps{Deflate: true},
+			RelayAcks: []RelayAck{
+				{ReqID: "7", Chunk: 2},
+				{ReqID: "8", Done: true},
+			},
 		}),
 		"events": {V: ProtocolVersion, Type: TypeEvents, Seq: 100, Ack: 17, Events: []json.RawMessage{
 			json.RawMessage(`{"type":"chunk","seq":100}`),
 			json.RawMessage(`{"type":"chunk","seq":101}`),
 		}},
-		"audience": NewAudience(12, 100, Audience{Gen: 34, Watchers: 2, Sessions: []string{"s1", "s2"}}),
-		"request":  {V: ProtocolVersion, Type: TypeRequest, Seq: 13, Ack: 100, ReqID: "7", Method: "POST", Path: "/api/x", Body: json.RawMessage(`{"a":1}`)},
-		"respond":  respond,
-		"chunked":  chunked,
-		"hb":       hbFrame(t),
-		"hb zero":  zero,
+		"audience":     NewAudience(12, 100, Audience{Gen: 34, Watchers: 2, Sessions: []string{"s1", "s2"}}),
+		"request":      {V: ProtocolVersion, Type: TypeRequest, Seq: 13, Ack: 100, ReqID: "7", Method: "POST", Path: "/api/x", Body: json.RawMessage(`{"a":1}`)},
+		"respond":      respond,
+		"chunked":      chunked,
+		"hb":           hbFrame(t),
+		"hb zero":      zero,
+		"probe":        probe,
+		"probeAck":     probeAck,
+		"hb relayAcks": acking,
 	}
 	for name, f := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -93,11 +115,15 @@ func TestFrameTypedViews(t *testing.T) {
 		t.Fatal("hello view of an hb frame succeeded")
 	}
 
-	ack := HelloAck{Epoch: 9, AckUp: 3, AckDown: 4, Audience: &Audience{Gen: 1}, Liveness: &DefaultLiveness, Limits: &DefaultLimits}
+	ack := HelloAck{Epoch: 9, AckUp: 3, AckDown: 4, Audience: &Audience{Gen: 1}, Liveness: &DefaultLiveness, Limits: &DefaultLimits,
+		RelayAcks: []RelayAck{{ReqID: "7", Chunk: 5}}}
 	fa := NewHelloAck(ack)
 	backAck, err := fa.HelloAck()
 	if err != nil || !reflect.DeepEqual(backAck, ack) {
 		t.Fatalf("hello_ack view %+v err %v", backAck, err)
+	}
+	if len(backAck.RelayAcks) != 1 || backAck.RelayAcks[0].Chunk != 5 {
+		t.Fatalf("hello_ack relayAcks %+v", backAck.RelayAcks)
 	}
 
 	st, err := hbFrame(t).Heartbeat()
@@ -105,7 +131,7 @@ func TestFrameTypedViews(t *testing.T) {
 		t.Fatalf("heartbeat view %+v err %v", st, err)
 	}
 
-	r := Frame{V: ProtocolVersion, Type: TypeRespond, ReqID: "1"}
+	r := Frame{V: ProtocolVersion, Type: TypeRespond, ReqID: "1", ChunkSeq: 1}
 	if r.RespondStatus() != 0 {
 		t.Fatalf("status of a bare respond is %d", r.RespondStatus())
 	}
@@ -142,7 +168,14 @@ func TestDecodeRejects(t *testing.T) {
 		{"audience gen 0", `{"v":2,"type":"audience","seq":12}`, ErrProtocol},
 		{"audience all with sessions", `{"v":2,"type":"audience","seq":12,"gen":4,"all":true,"sessions":["s1"]}`, ErrProtocol},
 		{"request without path", `{"v":2,"type":"request","seq":13,"reqId":"7","method":"POST"}`, ErrProtocol},
-		{"respond without reqId", `{"v":2,"type":"respond","body":{}}`, ErrProtocol},
+		{"respond without reqId", `{"v":2,"type":"respond","chunkSeq":1,"body":{}}`, ErrProtocol},
+		{"respond without chunkSeq", `{"v":2,"type":"respond","reqId":"7","body":{}}`, ErrProtocol},
+		{"chunkSeq on events", `{"v":2,"type":"events","seq":4,"chunkSeq":1,"events":[{"seq":4}]}`, ErrProtocol},
+		{"probe on events", `{"v":2,"type":"events","seq":4,"probe":1,"events":[{"seq":4}]}`, ErrProtocol},
+		{"probeAck on hello", `{"v":2,"type":"hello","epoch":7,"resume":{"up":0,"down":0},"probeAck":1}`, ErrProtocol},
+		{"relayAcks on events", `{"v":2,"type":"events","seq":4,"relayAcks":[{"reqId":"7"}],"events":[{"seq":4}]}`, ErrProtocol},
+		{"relayAck without reqId", `{"v":2,"type":"hb","status":{},"relayAcks":[{"chunk":2}]}`, ErrProtocol},
+		{"relayAck done and abort", `{"v":2,"type":"hb","status":{},"relayAcks":[{"reqId":"7","done":true,"abort":true}]}`, ErrProtocol},
 		{"hb without status", `{"v":2,"type":"hb"}`, ErrProtocol},
 		{"hb status not an object", `{"v":2,"type":"hb","status":3}`, ErrUnreadable},
 		{"not json", `{`, ErrUnreadable},
@@ -171,6 +204,37 @@ func TestDecodeAcceptsMinimal(t *testing.T) {
 	}
 	if !f.All || f.AudienceState().Gen != 34 {
 		t.Fatalf("frame %+v", f)
+	}
+
+	f, err = Decode([]byte(`{"v":2,"type":"hb","ack":3,"status":{"ready":true},"probe":11,"probeAck":10}`))
+	if err != nil {
+		t.Fatalf("Decode probe: %v", err)
+	}
+	if f.Probe != 11 || f.ProbeAck != 10 {
+		t.Fatalf("probe fields %+v", f)
+	}
+
+	f, err = Decode([]byte(`{"v":2,"type":"respond","ack":9,"reqId":"7","chunkSeq":4,"chunk":"aGk=","encoding":"base64","more":true}`))
+	if err != nil {
+		t.Fatalf("Decode respond: %v", err)
+	}
+	if f.ChunkSeq != 4 || f.Seq != 0 {
+		t.Fatalf("respond %+v", f)
+	}
+}
+
+func TestHeartbeatProbe(t *testing.T) {
+	f, err := NewHeartbeatProbe(7, 0, HeartbeatStatus{Ready: true}, false)
+	if err != nil || f.Probe != 0 || f.ProbeAck != 0 {
+		t.Fatalf("zero nonce: %+v err %v", f, err)
+	}
+	f, err = NewHeartbeatProbe(7, 9, HeartbeatStatus{Ready: true}, false)
+	if err != nil || f.Probe != 9 || f.ProbeAck != 0 {
+		t.Fatalf("probe: %+v err %v", f, err)
+	}
+	f, err = NewHeartbeatProbe(7, 9, HeartbeatStatus{Ready: true}, true)
+	if err != nil || f.Probe != 0 || f.ProbeAck != 9 {
+		t.Fatalf("probeAck: %+v err %v", f, err)
 	}
 }
 
@@ -230,7 +294,7 @@ func TestEpochAndHubBootAreHandshakeOnly(t *testing.T) {
 		`{"v":2,"type":"events","seq":1,"epoch":7,"events":[{"seq":1}]}`,
 		`{"v":2,"type":"audience","seq":1,"gen":2,"epoch":7}`,
 		`{"v":2,"type":"request","seq":1,"reqId":"7","method":"GET","path":"/x","epoch":7}`,
-		`{"v":2,"type":"respond","reqId":"7","epoch":7}`,
+		`{"v":2,"type":"respond","reqId":"7","chunkSeq":1,"epoch":7}`,
 		`{"v":2,"type":"hb","hubBoot":9,"status":{}}`,
 		`{"v":2,"type":"hello","epoch":7,"hubBoot":9,"resume":{"up":0,"down":0}}`,
 		`{"v":2,"type":"events","seq":1,"hubBoot":9,"events":[{"seq":1}]}`,

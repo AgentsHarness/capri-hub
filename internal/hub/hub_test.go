@@ -269,7 +269,7 @@ func TestSessionSupersedeFailsPendingOnEpochChange(t *testing.T) {
 		t.Fatalf("replayed request = %q, want %q", replay.ReqID, req.ReqID)
 	}
 	resumed.send(wire.Frame{
-		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: replay.Seq,
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: replay.Seq, ChunkSeq: 1,
 		ReqID: replay.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
 	})
 	select {

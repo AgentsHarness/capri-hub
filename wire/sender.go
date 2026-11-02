@@ -13,8 +13,10 @@ type Entry struct {
 // the remaining entries in the log are replayed.
 //
 // A Sender is owned by the session loop — one goroutine, no mutex. A seq is
-// assigned exactly once and is never renumbered, so a retransmission is always
-// byte-identical to the original.
+// assigned exactly once and is never renumbered. A retransmission is normally
+// byte-identical to the original; the exception is an absolute-state frame
+// (audience) whose payload may be replaced while it is unacknowledged, with
+// the sequence kept as the ordering key.
 type Sender struct {
 	next  uint64 // next seq to assign
 	acked uint64 // every seq <= acked is confirmed
@@ -83,16 +85,49 @@ func (s *Sender) Ack(n uint64) {
 }
 
 // Elide replaces the payload logged for seq, keeping the seq. Compaction uses it
-// to turn a droppable event into a trimmed placeholder without opening a hole.
+// to turn a droppable event into a trimmed placeholder without opening a hole;
+// the hub also uses it to fold a newer absolute-state snapshot into the single
+// unacknowledged audience entry.
 func (s *Sender) Elide(seq uint64, replacement []byte) error {
-	for i := range s.log {
+	_, err := s.ElideFrom(0, seq, replacement)
+	return err
+}
+
+// ElideFrom replaces the payload logged for seq, keeping the seq, and returns
+// the index of the replaced entry. The scan starts at start, so a caller that
+// compacts the log in seq order can pass the previous result plus one and walk
+// the whole log once instead of rescanning from its head for every entry.
+func (s *Sender) ElideFrom(start int, seq uint64, replacement []byte) (int, error) {
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(s.log); i++ {
 		if s.log[i].Seq == seq {
 			s.bytes += len(replacement) - len(s.log[i].Payload)
 			s.log[i].Payload = replacement
-			return nil
+			return i, nil
 		}
 	}
-	return fmt.Errorf("wire: seq %d is not in the unacked log", seq)
+	return -1, fmt.Errorf("wire: seq %d is not in the unacked log", seq)
+}
+
+// EntryAt returns the entry at index i in seq order. The payload shares its
+// backing array with the log; the caller must treat it as read-only.
+func (s *Sender) EntryAt(i int) (Entry, bool) {
+	if i < 0 || i >= len(s.log) {
+		return Entry{}, false
+	}
+	return s.log[i], true
+}
+
+// Entry returns the logged entry for seq, if it is still unacked.
+func (s *Sender) Entry(seq uint64) (Entry, bool) {
+	for i := range s.log {
+		if s.log[i].Seq == seq {
+			return s.log[i], true
+		}
+	}
+	return Entry{}, false
 }
 
 // Entries returns a copy of the unacked log, in seq order.
