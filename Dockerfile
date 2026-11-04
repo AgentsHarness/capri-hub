@@ -28,7 +28,10 @@ ARG GOPROXY=https://proxy.golang.org,direct
 ENV GOPROXY=${GOPROXY}
 
 # Dependencies first so this layer survives every source-only change.
+# wire is a local module (replace in go.mod), so its go.mod must exist
+# before go mod download resolves the module graph.
 COPY go.mod go.sum ./
+COPY wire/go.mod ./wire/go.mod
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
