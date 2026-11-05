@@ -52,7 +52,8 @@ services:
       - "8788:8788/udp"
 
     volumes:
-      # hub.json（host token）和 prefs.json 都在这里。备份就备份这个目录。
+      # hub.json（host token）、users.json（用户 token 哈希）、prefs*.json
+      # 和 guests.json 都在这里。备份就备份这个目录。
       - ./data:/data
 
     # healthcheck 由镜像自带（会跟随 PORT 覆盖值），此处不再重复定义。

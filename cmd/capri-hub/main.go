@@ -7,6 +7,8 @@
 //	  - 浏览器 WebSocket（GET /ws/fe）：聚合 live 事件；/api/* 按 ?host= 中转给对应 Host。
 //	  - 可选 FE_TOKEN：部署时设置后，浏览器侧接口必须带同一 token（Bearer / 头）。
 //	    WebSocket 优先用短期 ?ticket=（POST /api/ws-ticket）；仍兼容 ?token=。
+//	  - 多用户：users.json 保存用户 token 的 SHA-256 哈希；用户用自己的 token
+//	    登录后只看到自己配对的 host。admin 创建用户、重置 token、删除用户。
 //	  - 可靠性：事件带 seq（host 分配，会话按事件推进水位），hub 缓冲每 host
 //	    最近的 gap-pull 环，GET /api/events?host=X&after=SEQ 供缺口补拉。
 package main
@@ -168,26 +170,37 @@ func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairL
 	if lim == nil {
 		lim = newPairLimiter()
 	}
-	auth := feAuth{token: feToken, tickets: tickets, hub: h}
+	auth := feAuth{token: feToken, tickets: tickets, hub: h, limiter: newAuthLimiter()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /api/info", handleInfo)
-	// Admin pairing endpoints: require FE token when configured.
-	mux.HandleFunc("GET /api/pairing", auth.requireAdmin(handlePairing(h)))
-	mux.HandleFunc("POST /api/pairing/rotate", auth.requireAdmin(handleRotate(h)))
+	// Pairing codes are per identity: admin gets the deployment code, a
+	// user gets a private code that binds paired hosts to that account.
+	mux.HandleFunc("GET /api/pairing", auth.requireMember(handlePairing(h)))
+	mux.HandleFunc("POST /api/pairing/rotate", auth.requireMember(handleRotate(h)))
 	// Host-facing: authenticate with host pairing token (not FE_TOKEN).
 	mux.HandleFunc("POST /api/pair", handlePair(h, lim))
 	mux.HandleFunc("GET /ws/host", handleHostWS(h))
-	// Browser-facing: FE token gate when FE_TOKEN is set.
+	// Browser-facing: FE token / user token gate when configured.
 	mux.HandleFunc("GET /api/hosts", auth.requireIdentified(handleHosts(h)))
-	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.requireAdmin(handleUnpair(h)))
-	mux.HandleFunc("POST /api/hosts/{hostId}/rename", auth.requireAdmin(handleRenameHost(h)))
+	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.requireMember(handleUnpair(h)))
+	mux.HandleFunc("POST /api/hosts/{hostId}/rename", auth.requireMember(handleRenameHost(h)))
 	// Guests do not do sequence gap-pulls: the hub filters their stream by
-	// session, so the per-host seq watermark is meaningless to them.
-	mux.HandleFunc("GET /api/events", auth.requireAdmin(handleEvents(h)))
-	mux.HandleFunc("GET /api/prefs", auth.requireAdmin(handlePrefsGet(h)))
-	mux.HandleFunc("PUT /api/prefs", auth.requireAdmin(handlePrefsPut(h)))
+	// session, so the per-host seq watermark is meaningless to them. Users
+	// may gap-pull their own hosts.
+	mux.HandleFunc("GET /api/events", auth.requireMember(handleEvents(h)))
+	mux.HandleFunc("GET /api/prefs", auth.requireMember(handlePrefsGet(h)))
+	mux.HandleFunc("PUT /api/prefs", auth.requireMember(handlePrefsPut(h)))
+	// User accounts: admin creates users and can reset/delete them. The
+	// plaintext token is returned once, on create/reset; listing never
+	// contains it.
+	mux.HandleFunc("GET /api/users", auth.requireAdmin(handleUserList(h)))
+	mux.HandleFunc("POST /api/users/create", auth.requireAdmin(handleUserCreate(h)))
+	mux.HandleFunc("POST /api/users/reset", auth.requireAdmin(handleUserReset(h)))
+	mux.HandleFunc("POST /api/users/delete", auth.requireAdmin(handleUserDelete(h)))
+	// A user changes their own token; admin tokens live in deployment env.
+	mux.HandleFunc("POST /api/me/token", auth.requireIdentified(handleMyToken(h)))
 	mux.HandleFunc("POST /api/ws-ticket", auth.requireAny(handleWSTicket(h, tickets)))
 	mux.HandleFunc("GET /ws/fe", handleFeWS(h, auth))
 
@@ -263,6 +276,11 @@ func handleEvents(h *hub.Hub) http.HandlerFunc {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 host 参数"})
 			return
 		}
+		ident, _ := identityOf(r)
+		if !ident.allowsHost(h, hostID) {
+			writeJSON(w, 403, map[string]any{"ok": false, "error": "无权访问该 Host"})
+			return
+		}
 		after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
 		evs := h.EventsAfter(hostID, after)
 		// Buffered events may carry pre-encoded wire bytes (hub.MarshalEvent
@@ -300,10 +318,13 @@ func handleStats(h *hub.Hub) http.HandlerFunc {
 	}
 }
 
-// handlePairing: GET /api/pairing — the current pairing code (admin only).
+// handlePairing: GET /api/pairing — the caller's own pairing code. Admin
+// gets the deployment-wide code; a user gets a private code that binds any
+// host it pairs to that user.
 func handlePairing(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		code, exp := h.PairingCode()
+		ident, _ := identityOf(r)
+		code, exp := h.UserPairingCode(ident.prefsOwner())
 		writeJSON(w, 200, map[string]any{
 			"code":      code,
 			"expiresAt": exp,
@@ -314,7 +335,8 @@ func handlePairing(h *hub.Hub) http.HandlerFunc {
 
 func handleRotate(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		code, exp := h.RotatePairingCode()
+		ident, _ := identityOf(r)
+		code, exp := h.RotateUserPairingCode(ident.prefsOwner())
 		writeJSON(w, 200, map[string]any{"code": code, "expiresAt": exp})
 	}
 }
@@ -332,16 +354,14 @@ const (
 	pairRateWindow = time.Minute // sliding window
 )
 
-// pairLimiter is a per-IP sliding-window rate limiter for /api/pair.
+// pairLimiter is a per-client-IP sliding-window rate limiter for /api/pair.
 //
-// Deployment caveat: in production the hub listens on 127.0.0.1 behind
-// nginx, and clientIP deliberately ignores forwarding headers, so every
-// pairing request arrives as RemoteAddr 127.0.0.1. The 10/minute budget is
-// therefore ONE hub-wide quota, not a per-client one: a burst of hosts
-// behind that proxy can exhaust it and see 429s until the window slides.
-// That is accepted because pairing is rare (once per host at startup);
-// making the key trustworthy would mean trusting a forwarded header, which
-// is exactly what keeps the limit unspoofable.
+// In production the hub listens on 127.0.0.1 behind nginx, so RemoteAddr is
+// always the proxy address. rateLimitIP uses the proxy-provided real client
+// address when (and only when) the peer is loopback; direct connections keep
+// using RemoteAddr. Without this distinction every request behind nginx
+// shares one hub-wide quota and one host's retry loop can lock out all new
+// pairings.
 type pairLimiter struct {
 	mu   sync.Mutex
 	hits map[string][]time.Time
@@ -425,10 +445,10 @@ func clientIP(r *http.Request) string {
 }
 
 // requestIP is the address to DISPLAY for a browser (the subscriber panel).
-// Unlike clientIP — which feeds the pair rate limiter and therefore must not
-// be spoofable — this one prefers forwarding headers when the peer is
-// loopback: the deployed hub listens on 127.0.0.1 behind nginx, so every row
-// would otherwise read 127.0.0.1.
+// It prefers forwarding headers when the peer is loopback: the deployed hub
+// listens on 127.0.0.1 behind nginx, so every row would otherwise read
+// 127.0.0.1. rateLimitIP applies the same trusted-proxy policy to rate
+// limiting.
 //
 // Order matters on the deployed site: Cloudflare sits in front of nginx, so
 // nginx's X-Real-IP is a CF edge address, while CF-Connecting-IP and the
@@ -451,6 +471,116 @@ func requestIP(r *http.Request) string {
 	return peer
 }
 
+// rateLimitIP is the address used for authentication and pairing rate
+// limits. It deliberately mirrors requestIP's trusted-proxy policy but only
+// accepts values that parse as IP addresses: the deployed hub sits behind
+// nginx on loopback, where RemoteAddr cannot identify the client, while a
+// direct (non-loopback) peer can never spoof its identity through headers.
+func rateLimitIP(r *http.Request) string {
+	peer := clientIP(r)
+	if !isLoopbackHost(peer) {
+		return peer
+	}
+	for _, candidate := range []string{
+		r.Header.Get("CF-Connecting-IP"),
+		r.Header.Get("X-Real-IP"),
+	} {
+		if ip := net.ParseIP(strings.TrimSpace(candidate)); ip != nil {
+			return ip.String()
+		}
+	}
+	if fwd := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); fwd != "" {
+		first, _, _ := strings.Cut(fwd, ",")
+		if ip := net.ParseIP(strings.TrimSpace(first)); ip != nil {
+			return ip.String()
+		}
+	}
+	return peer
+}
+
+// authLimiter throttles failed authentication attempts per client IP. A
+// correct token clears the bucket; failures accumulate in a sliding window
+// and then impose a short block. This keeps online token guessing expensive
+// without penalising a browser that makes normal successful requests.
+type authLimiter struct {
+	mu     sync.Mutex
+	failed map[string][]time.Time
+	block  map[string]time.Time
+}
+
+const (
+	authFailureLimit  = 10
+	authFailureWindow = time.Minute
+	authBlockDuration = time.Minute
+)
+
+func newAuthLimiter() *authLimiter {
+	return &authLimiter{failed: make(map[string][]time.Time), block: make(map[string]time.Time)}
+}
+
+// allow reports whether an authentication attempt from ip may be evaluated.
+func (l *authLimiter) allow(ip string) bool {
+	if l == nil || ip == "" {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if until, ok := l.block[ip]; ok {
+		if now.Before(until) {
+			return false
+		}
+		delete(l.block, ip)
+		delete(l.failed, ip)
+	}
+	l.pruneLocked(now.Add(-authFailureWindow))
+	return true
+}
+
+func (l *authLimiter) fail(ip string) {
+	if l == nil || ip == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-authFailureWindow)
+	hs := l.failed[ip]
+	i := 0
+	for i < len(hs) && hs[i].Before(cutoff) {
+		i++
+	}
+	hs = append(hs[i:], now)
+	l.failed[ip] = hs
+	if len(hs) >= authFailureLimit {
+		l.block[ip] = now.Add(authBlockDuration)
+	}
+}
+
+func (l *authLimiter) reset(ip string) {
+	if l == nil || ip == "" {
+		return
+	}
+	l.mu.Lock()
+	delete(l.failed, ip)
+	delete(l.block, ip)
+	l.mu.Unlock()
+}
+
+func (l *authLimiter) pruneLocked(cutoff time.Time) {
+	for ip, hs := range l.failed {
+		i := 0
+		for i < len(hs) && hs[i].Before(cutoff) {
+			i++
+		}
+		if i == len(hs) {
+			delete(l.failed, ip)
+		} else {
+			l.failed[ip] = hs[i:]
+		}
+	}
+}
+
 // isLoopbackHost is a string test (the panel never dials back, so a parse
 // failure simply means "not a proxy we trust").
 func isLoopbackHost(host string) bool {
@@ -462,7 +592,7 @@ func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Rate-limit before parsing the body: a flood of malformed
 		// attempts must cost the same as valid ones.
-		if !lim.allow(clientIP(r)) {
+		if !lim.allow(rateLimitIP(r)) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(pairRateWindow/time.Second)))
 			writeJSON(w, 429, map[string]any{"ok": false, "error": "尝试过于频繁，请稍后再试"})
 			return
@@ -477,7 +607,12 @@ func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 code 和 hostId"})
 			return
 		}
-		token, err := h.Pair(body.Code, body.HostID, body.HostName, body.Port)
+		ownerID, ok := h.OwnerForPairCode(body.Code)
+		if !ok {
+			writeJSON(w, 401, map[string]any{"ok": false, "error": hub.ErrCodeInvalid.Error()})
+			return
+		}
+		token, actualHostID, err := h.PairAs(ownerID, body.Code, body.HostID, body.HostName, body.Port)
 		if err != nil {
 			status := 401
 			if errors.Is(err, hub.ErrHostLimit) {
@@ -488,7 +623,7 @@ func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 			writeJSON(w, status, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"ok": true, "token": token, "hostId": body.HostID})
+		writeJSON(w, 200, map[string]any{"ok": true, "token": token, "hostId": actualHostID})
 	}
 }
 
@@ -501,6 +636,8 @@ const feTicketTTL = 2 * time.Minute
 // for, so the WS can rebuild that identity without re-reading the header.
 type feTicket struct {
 	expires time.Time
+	role    string
+	userID  string
 	guestID string
 }
 
@@ -538,35 +675,60 @@ func (s *feTicketStore) StartCleanup(ctx context.Context) {
 	}()
 }
 
-// issue mints a ticket; guestID != "" marks it as a guest identity.
+// issue mints a legacy guest ticket. Empty guestID means admin; non-empty
+// means a guest record. identity-based callers use issueIdentity.
 func (s *feTicketStore) issue(guestID string) (ticket string, expires time.Time) {
+	role := "admin"
+	if guestID != "" {
+		role = "guest"
+	}
+	return s.issueTicket(feTicket{role: role, guestID: guestID})
+}
+
+// issueIdentity mints a ticket for any authenticated identity.
+func (s *feTicketStore) issueIdentity(id identity) (ticket string, expires time.Time) {
+	return s.issueTicket(feTicket{role: id.Role, userID: id.UserID, guestID: id.TokenID})
+}
+
+func (s *feTicketStore) issueTicket(rec feTicket) (ticket string, expires time.Time) {
 	var b [24]byte
 	_, _ = rand.Read(b[:])
 	ticket = hex.EncodeToString(b[:])
-	expires = time.Now().Add(feTicketTTL)
+	rec.expires = time.Now().Add(feTicketTTL)
+	expires = rec.expires
 	s.mu.Lock()
-	s.tickets[ticket] = feTicket{expires: expires, guestID: guestID}
+	s.tickets[ticket] = rec
 	s.mu.Unlock()
 	return ticket, expires
 }
 
-// consume validates and burns a ticket (single-use), returning the identity
-// it was minted for (guest id, or "" for admin).
+// consume validates and burns a legacy ticket, returning the guest id (empty
+// for admin).
 func (s *feTicketStore) consume(ticket string) (guestID string, ok bool) {
-	if ticket == "" {
+	rec, ok := s.consumeIdentity(ticket)
+	if !ok {
 		return "", false
+	}
+	return rec.guestID, true
+}
+
+// consumeIdentity validates and burns a ticket, returning its full identity
+// record.
+func (s *feTicketStore) consumeIdentity(ticket string) (feTicket, bool) {
+	if ticket == "" {
+		return feTicket{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, found := s.tickets[ticket]
 	if !found {
-		return "", false
+		return feTicket{}, false
 	}
 	delete(s.tickets, ticket)
 	if !rec.expires.After(time.Now()) {
-		return "", false
+		return feTicket{}, false
 	}
-	return rec.guestID, true
+	return rec, true
 }
 
 func handleWSTicket(h *hub.Hub, tickets *feTicketStore) http.HandlerFunc {
@@ -579,7 +741,7 @@ func handleWSTicket(h *hub.Hub, tickets *feTicketStore) http.HandlerFunc {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
 		}
-		ticket, exp := tickets.issue(ident.TokenID)
+		ticket, exp := tickets.issueIdentity(ident)
 		writeJSON(w, 200, map[string]any{
 			"ok":        true,
 			"ticket":    ticket,
@@ -590,13 +752,14 @@ func handleWSTicket(h *hub.Hub, tickets *feTicketStore) http.HandlerFunc {
 	}
 }
 
-// handlePrefsGet: GET /api/prefs — the browser prefs document (pinned
-// workspaces / sessions + per-session todo status), persisted by the hub in
-// prefs.json. One shared document for all browsers; the FE merges it with its
-// localStorage cache on boot. Carries the doc's version for diagnostics.
+// handlePrefsGet: GET /api/prefs — the calling identity's prefs document
+// (pinned workspaces / sessions + per-session todo status). Admin uses the
+// root prefs.json, ordinary users use their own prefs-users.json entry, so
+// pins and todos never leak across accounts.
 func handlePrefsGet(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		doc, version := h.Prefs()
+		ident, _ := identityOf(r)
+		doc, version := h.PrefsFor(ident.prefsOwner())
 		writeJSON(w, 200, map[string]any{"ok": true, "prefs": doc, "version": version})
 	}
 }
@@ -617,14 +780,15 @@ func handlePrefsPut(h *hub.Hub) http.HandlerFunc {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 prefs 字段"})
 			return
 		}
-		if _, err := h.SetPrefs(*body.Prefs); err != nil {
+		ident, _ := identityOf(r)
+		if _, err := h.SetPrefsFor(ident.prefsOwner(), *body.Prefs); err != nil {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
 		// Read the doc+version as one pair: a concurrent writer may have
 		// advanced past our SetPrefs, and returning that newer authoritative
 		// state is still correct for the client's merge.
-		doc, version := h.Prefs()
+		doc, version := h.PrefsFor(ident.prefsOwner())
 		writeJSON(w, 200, map[string]any{"ok": true, "version": version, "prefs": doc})
 	}
 }
@@ -635,6 +799,10 @@ func handleUnpair(h *hub.Hub) http.HandlerFunc {
 		hostID := strings.TrimSpace(r.PathValue("hostId"))
 		if hostID == "" {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 hostId"})
+			return
+		}
+		if !identityMayManageHost(h, r, hostID) {
+			writeJSON(w, 403, map[string]any{"ok": false, "error": "无权管理该 Host"})
 			return
 		}
 		if err := h.Unpair(hostID); err != nil {
@@ -656,6 +824,10 @@ func handleRenameHost(h *hub.Hub) http.HandlerFunc {
 		hostID := strings.TrimSpace(r.PathValue("hostId"))
 		if hostID == "" {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 hostId"})
+			return
+		}
+		if !identityMayManageHost(h, r, hostID) {
+			writeJSON(w, 403, map[string]any{"ok": false, "error": "无权管理该 Host"})
 			return
 		}
 		var body struct {
@@ -694,6 +866,12 @@ const defaultHostWriteTimeout = 15 * time.Second
 // relayed respond carries up to 28MB of body, so a tighter cap would kill the
 // link on a large history read.
 const hostFrameLimit = 32 << 20
+
+// quicPreAuthFrameLimit bounds the control-stream frame a QUIC peer may send
+// before hello/token validation. A hello is tiny; keeping this far below the
+// post-auth frame limit prevents unauth connections from parking large
+// buffers in the reassembler.
+const quicPreAuthFrameLimit = 1 << 20
 
 // ── WebSocket ─────────────────────────────────────────────────────────
 
@@ -958,24 +1136,27 @@ var (
 //     accepts Bearer / X-Access-Token / ?token= for the long-lived FE_TOKEN.
 func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ident, ok := auth.identify(r)
+		ident, ok := auth.identifyWithLimit(r)
 		if !ok {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
 		}
 		compress := r.URL.Query().Get("c") == "1"
 		hostID := strings.TrimSpace(r.URL.Query().Get("host"))
-		if ident.isGuest() {
-			// Pin the initial filter to a whitelisted host (the first one
-			// when the FE names none) — the guest's ?host= is never trusted
-			// verbatim.
-			if hostID == "" || !ident.allowsHost(hostID) {
-				hostID = ident.defaultHost()
-			}
-			if hostID == "" {
-				writeJSON(w, 403, map[string]any{"ok": false, "error": "访客令牌没有可用会话"})
-				return
-			}
+		// Pin the initial filter to a host this identity may see. Admin and
+		// user ?host= values are checked against live ownership; a guest's
+		// against the session whitelist. Out-of-scope values fall back to
+		// the identity's default host.
+		if hostID == "" || !ident.allowsHost(h, hostID) {
+			hostID = ident.defaultHost(h)
+		}
+		// A user or admin with no hosts still gets a valid empty event
+		// socket: the FE has to stay connected to receive hosts_changed
+		// after its first host is paired. A guest with no whitelisted
+		// session has nothing to render, so it keeps the 403.
+		if hostID == "" && ident.isGuest() {
+			writeJSON(w, 403, map[string]any{"ok": false, "error": "访客令牌没有可用会话"})
+			return
 		}
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -999,10 +1180,15 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 		var unsub func()
 		var subKicked <-chan struct{}
 		info := subscriberInfoFor(ident, requestIP(r), r.UserAgent())
-		if ident.isGuest() {
+		switch {
+		case ident.isGuest():
 			ch, unsub, subKicked, ok = h.TrySubscribeGuestInfo(maxFESubscribers, hostID, ident.asGuestToken(), info)
-		} else {
-			ch, unsub, ok = h.TrySubscribeHostInfo(maxFESubscribers, hostID, info)
+		default:
+			// Admin and ordinary users both receive only their own host
+			// events. Admin's extra reach is the management API, not the
+			// event stream.
+			ch, unsub, subKicked, ok = h.TrySubscribeScopedInfo(maxFESubscribers, hostID,
+				ident.hostScope(), ident.Role, h.HostIDsForUser(ident.hostScope()), info)
 		}
 		if !ok {
 			_ = conn.Close(websocket.StatusTryAgainLater, "too many subscribers")
@@ -1128,10 +1314,9 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 			"subscriberId": subID,
 		}
 		// Live browser /ws/fe clients, this connection included — the admin
-		// top bar shows it beside the host block. Changes arrive as
-		// hub-level `subscribers_changed` frames, which guests never receive
-		// (hub-level fan-out is admin-only), so their hello stays without it.
-		if !ident.isGuest() {
+		// top bar shows it beside the host block. Users and guests stay
+		// without this figure; their pages do not render the admin panel.
+		if ident.isAdmin() {
 			hello["feSubscribers"] = h.SubscriberCount()
 		}
 		if err := writeJSONFrame(hello); err != nil {
@@ -1179,6 +1364,25 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 		liveness := time.NewTicker(livenessInterval)
 		defer liveness.Stop()
 
+		// A guest token's expiry must terminate an already-established
+		// socket. Authentication rejects expired tokens at connect time,
+		// but without this timer a page opened while valid would keep
+		// receiving events forever.
+		var expiryC <-chan time.Time
+		var expiryTimer *time.Timer
+		if ident.isGuest() && ident.ExpiresAt > 0 {
+			if d := time.Until(time.Unix(ident.ExpiresAt, 0)); d <= 0 {
+				_ = conn.Close(websocket.StatusPolicyViolation, "guest token expired")
+				return
+			} else {
+				expiryTimer = time.NewTimer(d)
+				expiryC = expiryTimer.C
+			}
+		}
+		if expiryTimer != nil {
+			defer expiryTimer.Stop()
+		}
+
 		ctx := r.Context()
 		// readDone closes when the browser socket goes away. Without it a
 		// closed tab stays in the subscriber set (and in the count the other
@@ -1210,10 +1414,10 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 					continue
 				}
 				if ctl.Type == "viewing" {
-					// 管理员页面单独声明「正在看哪个会话」：这是唯一会
-					// 打开 host 上行过滤的帧（见 PROTOCOL.md §6.4）。不改
-					// 事件过滤，故不回执。
-					// 访客的会话走下面的 subscribe 帧，要过白名单校验。
+					// Admin and user pages may declare which session they
+					// display; this opens the host uplink filter (see
+					// PROTOCOL.md §6.4). Guests use the subscribe frame and
+					// the session whitelist instead.
 					if ident.isGuest() {
 						continue
 					}
@@ -1225,17 +1429,22 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 				}
 				target := strings.TrimSpace(ctl.Host)
 				session := strings.TrimSpace(ctl.Session)
-				if ident.isGuest() {
-					// A guest may only retarget within its whitelist. An
-					// out-of-scope frame is ignored and the previous
+				if !ident.isAdmin() {
+					// A user or guest may only retarget within its scope.
+					// An out-of-scope frame is ignored and the previous
 					// subscription stays as it was — no ack, no state
 					// change (the FE never learns about other hosts).
-					if !ident.allowsHost(target) {
+					if target == "" || !ident.allowsHost(h, target) {
 						continue
 					}
-					if session != "" && !hub.GuestAllowsSession(ident.asGuestToken(), target, session) {
+					if ident.isGuest() && session != "" && !hub.GuestAllowsSession(ident.asGuestToken(), target, session) {
 						continue
 					}
+				}
+				if ident.isUser() {
+					// A user may have paired a new host since this socket
+					// opened; refresh the fan-out whitelist before moving.
+					h.SetSubscriberUserHosts(ch, h.HostIDsForUser(ident.UserID))
 				}
 				if !h.SetSubscriberHost(ch, target) {
 					continue
@@ -1275,9 +1484,15 @@ func handleFeWS(h *hub.Hub, auth feAuth) http.HandlerFunc {
 				_ = flush()
 				return
 			case <-subKicked:
-				// Guest token revoked / deleted: close the socket now.
+				// Credential revoked/deleted, or the subscriber was kicked
+				// because its host was unpaired: close the socket now.
 				_ = flush()
-				_ = conn.Close(websocket.StatusPolicyViolation, "guest token revoked")
+				_ = conn.Close(websocket.StatusPolicyViolation, "credential revoked")
+				return
+			case <-expiryC:
+				_ = flush()
+				h.DropGuestSubscribers(ident.TokenID)
+				_ = conn.Close(websocket.StatusPolicyViolation, "guest token expired")
 				return
 			case <-ping.C:
 				if err := flush(); err != nil {
@@ -1450,7 +1665,7 @@ func enforceGuestRelay(h *hub.Hub, ident identity, hostID, path string, body []b
 	if !guestRelayPaths[path] {
 		return nil, false
 	}
-	if !ident.allowsHost(hostID) {
+	if !ident.allowsHost(h, hostID) {
 		return nil, false
 	}
 	if !guestSessionPaths[path] {
@@ -1618,21 +1833,20 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ident, _ := identityOf(r)
 		hostID := r.URL.Query().Get("host")
-		if ident.isGuest() {
-			if hostID == "" {
-				hostID = ident.defaultHost()
-			}
-			if hostID == "" || !ident.allowsHost(hostID) {
-				writeJSON(w, 403, map[string]any{"ok": false, "error": "访客无权访问该 Host"})
-				return
-			}
-		}
 		if hostID == "" {
-			hostID = h.DefaultHostID()
+			hostID = ident.defaultHost(h)
+		}
+		if hostID == "" || !ident.allowsHost(h, hostID) {
 			if hostID == "" {
 				writeJSON(w, 503, map[string]any{"ok": false, "error": hub.ErrNoHost.Error()})
 				return
 			}
+			msg := "无权访问该 Host"
+			if ident.isGuest() {
+				msg = "访客无权访问该 Host"
+			}
+			writeJSON(w, 403, map[string]any{"ok": false, "error": msg})
+			return
 		}
 		const maxRelayBody = 5 << 20
 		var body json.RawMessage
@@ -1867,19 +2081,36 @@ type quicTransport struct {
 	maxFrameVal  atomic.Int64
 	writeTimeout atomic.Int64
 	frameID      atomic.Uint32
+	// requestStart runs at most once, after ServeHost has validated hello's
+	// token. Request streams are the host's relay-response plane; accepting
+	// them before authentication let an unauthenticated peer queue 64 ×
+	// 32MB frames per connection.
+	requestStart sync.Once
 }
 
 func newQUICTransport(conn *quic.Conn, control *quic.Stream) *quicTransport {
 	t := &quicTransport{
 		conn:    conn,
 		control: control,
-		frames:  make(chan []byte, 64),
-		term:    make(chan struct{}),
-		stop:    make(chan struct{}),
+		// Small queue: before auth the frame limit is 1MiB, and after auth
+		// every queued frame can be an 8MiB event. Eight slots still absorb
+		// a normal relay burst without letting one connection pin hundreds
+		// of megabytes.
+		frames: make(chan []byte, 8),
+		term:   make(chan struct{}),
+		stop:   make(chan struct{}),
 	}
+	// Until hello is validated, only a small handshake frame is possible.
+	t.maxFrameVal.Store(quicPreAuthFrameLimit)
 	go t.readControl()
-	go t.acceptRequests()
 	return t
+}
+
+// StartRequestStreams begins accepting the host's per-request response
+// streams. hub.ServeHost calls it after the hello token has been verified;
+// it is a no-op for every transport that does not implement it (WebSocket).
+func (t *quicTransport) StartRequestStreams() {
+	t.requestStart.Do(func() { go t.acceptRequests() })
 }
 
 // fail records the terminal transport error once. Recv drains frames that
@@ -2110,7 +2341,9 @@ func readQUICUnit(stream *quic.Stream) ([]byte, error) {
 		return nil, err
 	}
 	n := binary.BigEndian.Uint32(lenBuf[:])
-	if n > hostFrameLimit {
+	// The control stream carries complete logical frames, whose protocol cap
+	// is the negotiated maxFrame (8MiB by default), never a relay response.
+	if n > uint32(wire.DefaultLimits.MaxFrame) {
 		return nil, fmt.Errorf("%w: unit too large: %d", wire.ErrUnreadable, n)
 	}
 	buf := make([]byte, n)
@@ -2157,39 +2390,66 @@ func readQUICFrame(stream *quic.Stream, readTimeout time.Duration) ([]byte, erro
 // deployment's FE_TOKEN. Guest = one record from guests.json, restricted
 // to that record's session whitelist.
 type identity struct {
-	Role      string // "admin" | "guest"
+	Role      string // "admin" | "user" | "guest"
+	UserID    string // users.json id (user only; "root" for admin)
 	TokenID   string // guests.json id (guest only)
 	Label     string
 	ExpiresAt int64
 	Sessions  []hub.GuestSession
 }
 
+func (id identity) isAdmin() bool { return id.Role == "" || id.Role == "admin" }
+func (id identity) isUser() bool  { return id.Role == "user" }
 func (id identity) isGuest() bool { return id.Role == "guest" }
 
-// allowsHost reports whether this identity may address hostID. Admins may
-// address every paired host; guests only hosts named by their whitelist.
-func (id identity) allowsHost(hostID string) bool {
-	if !id.isGuest() {
-		return true
+// prefsOwner returns the prefs document this identity owns. Admin and user
+// both have one; guests have no prefs surface.
+func (id identity) prefsOwner() string {
+	if id.isUser() {
+		return id.UserID
 	}
-	for _, s := range id.Sessions {
-		if s.HostID == hostID {
-			return true
-		}
-	}
-	return false
+	return "root"
 }
 
-// defaultHost is the host a guest falls back to when the request names
-// none: the first whitelisted session's host. Empty for admins (the hub's
-// registry default applies).
-func (id identity) defaultHost() string {
-	for _, s := range id.Sessions {
-		if s.HostID != "" {
-			return s.HostID
-		}
+// hostScope is the owner id whose hosts this identity may use. The admin
+// account behaves as a normal user for host access: it only sees hosts
+// paired under root. Its extra capability is the user-management view.
+func (id identity) hostScope() string {
+	if id.isUser() {
+		return id.UserID
 	}
-	return ""
+	return "root"
+}
+
+// allowsHost reports whether this identity may address hostID. Admin and
+// ordinary users can only use hosts they paired themselves; guests only
+// hosts named by their whitelist.
+func (id identity) allowsHost(h *hub.Hub, hostID string) bool {
+	if id.isGuest() {
+		for _, s := range id.Sessions {
+			if s.HostID == hostID {
+				return true
+			}
+		}
+		return false
+	}
+	owner, ok := h.HostOwner(hostID)
+	return ok && owner == id.hostScope()
+}
+
+// defaultHost is the host an identity falls back to when the request names
+// none. Admin and users pick from their own host set; guests pick the first
+// whitelisted session's host.
+func (id identity) defaultHost(h *hub.Hub) string {
+	if id.isGuest() {
+		for _, s := range id.Sessions {
+			if s.HostID != "" {
+				return s.HostID
+			}
+		}
+		return ""
+	}
+	return h.DefaultHostIDFor(id.hostScope())
 }
 
 // sessionFor resolves the (sessionId, cwd) a guest request must be
@@ -2243,14 +2503,44 @@ type feAuth struct {
 	// hub resolves guest tokens and (for tickets) the identity behind a
 	// guest id. Nil in tests that only exercise the admin path.
 	hub *hub.Hub
+	// limiter throttles failed token attempts per client IP. Nil in tests
+	// that construct feAuth directly; production buildHandler supplies one.
+	limiter *authLimiter
+}
+
+// identifyWithLimit is the production authentication entry point. It checks
+// the failure throttle before looking at credentials and records only failed
+// attempts that actually carried a credential, so the FE's token-less boot
+// probes do not consume a user's failure budget.
+func (a feAuth) identifyWithLimit(r *http.Request) (identity, bool) {
+	ip := rateLimitIP(r)
+	if a.limiter != nil && !a.limiter.allow(ip) {
+		return identity{}, false
+	}
+	id, ok := a.identify(r)
+	if a.limiter != nil {
+		if ok {
+			a.limiter.reset(ip)
+		} else if credentialPresent(r) {
+			a.limiter.fail(ip)
+		}
+	}
+	return id, ok
+}
+
+func credentialPresent(r *http.Request) bool {
+	return bearerToken(r.Header.Get("Authorization")) != "" ||
+		strings.TrimSpace(r.Header.Get("X-Access-Token")) != "" ||
+		strings.TrimSpace(r.URL.Query().Get("ticket")) != ""
 }
 
 // identify resolves the identity behind r, in this order:
 //  1. admin Bearer / X-Access-Token (FE_TOKEN),
-//  2. a guest token in Bearer / X-Access-Token,
-//  3. a single-use ?ticket= (guest or admin identity).
+//  2. a user token in Bearer / X-Access-Token,
+//  3. a guest token in Bearer / X-Access-Token,
+//  4. a single-use ?ticket= (admin, user or guest identity).
 //
-// A guest lookup also rejects revoked / expired records.
+// User and guest lookups reject revoked / expired records.
 func (a feAuth) identify(r *http.Request) (identity, bool) {
 	if a.token != "" {
 		for _, tok := range []string{
@@ -2258,23 +2548,25 @@ func (a feAuth) identify(r *http.Request) (identity, bool) {
 			strings.TrimSpace(r.Header.Get("X-Access-Token")),
 		} {
 			if tokenEqual(tok, a.token) {
-				return identity{Role: "admin"}, true
+				return identity{Role: "admin", UserID: "root"}, true
 			}
 		}
 	} else if strings.TrimSpace(r.Header.Get("Authorization")) == "" &&
 		strings.TrimSpace(r.Header.Get("X-Access-Token")) == "" {
 		// Open dev hub with no FE_TOKEN: anonymous = admin, as before.
 		if r.URL.Query().Get("ticket") == "" {
-			return identity{Role: "admin"}, true
+			return identity{Role: "admin", UserID: "root"}, true
 		}
 	}
 
-	// Guest bearer / header token.
 	if a.hub != nil {
 		for _, tok := range []string{
 			bearerToken(r.Header.Get("Authorization")),
 			strings.TrimSpace(r.Header.Get("X-Access-Token")),
 		} {
+			if u, ok := a.hub.UserByToken(tok); ok {
+				return userIdentity(u), true
+			}
 			if g, ok := a.hub.LookupGuestToken(tok); ok {
 				return guestIdentity(g), true
 			}
@@ -2284,24 +2576,61 @@ func (a feAuth) identify(r *http.Request) (identity, bool) {
 	// Short-lived ticket (preferred for WebSocket).
 	if a.tickets != nil {
 		if t := strings.TrimSpace(r.URL.Query().Get("ticket")); t != "" {
-			guestID, ok := a.tickets.consume(t)
+			rec, ok := a.tickets.consumeIdentity(t)
 			if !ok {
 				return identity{}, false
 			}
-			if guestID == "" {
-				return identity{Role: "admin"}, true
+			switch rec.role {
+			case "admin":
+				return identity{Role: "admin", UserID: "root"}, true
+			case "user":
+				if a.hub == nil {
+					return identity{}, false
+				}
+				u, found := a.hub.UserByID(rec.userID)
+				if !found {
+					return identity{}, false
+				}
+				return userIdentity(u), true
+			case "guest":
+				if a.hub == nil {
+					return identity{}, false
+				}
+				g, found := a.hub.GuestByID(rec.guestID)
+				if !found || !g.Active(time.Now()) {
+					return identity{}, false
+				}
+				return guestIdentity(g), true
 			}
-			if a.hub == nil {
-				return identity{}, false
-			}
-			g, found := a.hub.GuestByID(guestID)
-			if !found || !g.Active(time.Now()) {
-				return identity{}, false
-			}
-			return guestIdentity(g), true
 		}
 	}
 	return identity{}, false
+}
+
+// identityMayManageHost reports whether r's identity may unpair or rename
+// hostID. Direct handler tests carry no identity and keep admin behaviour.
+// A missing host is left to the handler's normal 404 path.
+func identityMayManageHost(h *hub.Hub, r *http.Request, hostID string) bool {
+	id, identified := identityOf(r)
+	if !identified {
+		return true
+	}
+	if id.isGuest() {
+		return false
+	}
+	owner, exists := h.HostOwner(hostID)
+	if !exists {
+		return true
+	}
+	return owner == id.hostScope()
+}
+
+func userIdentity(u hub.User) identity {
+	return identity{
+		Role:   "user",
+		UserID: u.ID,
+		Label:  u.Label,
+	}
 }
 
 func guestIdentity(g hub.GuestToken) identity {
@@ -2325,7 +2654,7 @@ func (a feAuth) check(r *http.Request) bool {
 // never re-resolve (a ?ticket= is single-use — a second lookup would fail).
 func (a feAuth) requireAny(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := a.identify(r)
+		id, ok := a.identifyWithLimit(r)
 		if !ok {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
@@ -2334,11 +2663,30 @@ func (a feAuth) requireAny(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// requireAdmin allows only the admin identity; guests get 403 so the FE can
-// tell "you are not allowed to manage tokens" from "your token is dead".
+// requireAdmin allows only the admin identity; users and guests get 403 so
+// the FE can tell "you are not allowed to manage accounts" from "your token
+// is dead".
 func (a feAuth) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := a.identify(r)
+		id, ok := a.identifyWithLimit(r)
+		if !ok {
+			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
+			return
+		}
+		if !id.isAdmin() {
+			writeJSON(w, 403, map[string]any{"ok": false, "error": "仅管理员可执行该操作"})
+			return
+		}
+		next(w, r.WithContext(withIdentity(r.Context(), id)))
+	}
+}
+
+// requireMember allows admin and ordinary user identities. Guests are
+// read-only and get 403 for host management, pairing codes, events and
+// prefs endpoints.
+func (a feAuth) requireMember(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := a.identifyWithLimit(r)
 		if !ok {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
@@ -2355,7 +2703,7 @@ func (a feAuth) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 // so the relay can enforce host/session scope without resolving twice.
 func (a feAuth) requireIdentified(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := a.identify(r)
+		id, ok := a.identifyWithLimit(r)
 		if !ok {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return

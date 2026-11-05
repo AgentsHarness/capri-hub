@@ -148,12 +148,13 @@ type FePrefs map[string]any
 // BrowserPrefs is the durable UI preferences for host conversations:
 // pinned workspaces (cwd paths), pinned sessions, per-session todo
 // status ('todo' / 'completed'; absence = no record) and FE-side
-// appearance prefs (fePrefs). The hub keeps ONE such document
-// (prefs.json) for all browsers; the FE mirrors it in localStorage
-// (offline cache) and writes it here (debounced) so pins/todos survive
-// browser data clearing. Records are keyed by sessionId/cwd only — session
-// ids are host-assigned UUIDs, so a doc is effectively per host
-// conversation without an explicit hostId scope.
+// appearance prefs (fePrefs). The deployment admin keeps root's document in
+// prefs.json; every ordinary user has a separate document in
+// prefs-users.json. The FE mirrors its document in localStorage (offline
+// cache) and writes it here (debounced) so pins/todos survive browser data
+// clearing. Records are keyed by sessionId/cwd only — session ids are
+// host-assigned UUIDs, so a doc is effectively per host conversation
+// without an explicit hostId scope.
 type BrowserPrefs struct {
 	// Entries is the source of truth: one last-write-wins record per
 	// preference item, deletions included (as tombstones). See prefs.go.
@@ -191,8 +192,13 @@ type Event map[string]any
 type HostInfo struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
-	Online   bool   `json:"online"`
-	Ready    bool   `json:"ready"`
+	// OwnerID is the user record that paired this host ("root" for the
+	// deployment admin). The browser-facing handlers filter on it; the
+	// field itself is harmless to expose because callers only ever see
+	// hosts they own.
+	OwnerID string `json:"ownerId,omitempty"`
+	Online  bool   `json:"online"`
+	Ready   bool   `json:"ready"`
 	// Busy: any session has a turn in flight (thinking / working).
 	Busy bool `json:"busy,omitempty"`
 	// Booting: agent process has not finished booting.
@@ -250,8 +256,9 @@ type relayTombstone struct {
 // hostState is one paired host. Lock order is always h.mu → hs.mu; nothing
 // takes them the other way.
 type hostState struct {
-	info  HostInfo
-	token string
+	info    HostInfo
+	ownerID string // "root" or a users.json id
+	token   string
 
 	// Attachment, guarded by h.mu. online is derived: a host is online while
 	// a session is attached. proto is the (hostId, epoch) protocol state; it
@@ -417,6 +424,12 @@ type Hub struct {
 
 	pairingCode string
 	codeExpires time.Time
+	// userPairCodes holds the per-user pairing codes. Unlike the root code
+	// above, these are lazily created when a logged-in user opens the pair
+	// dialog. Keyed by the upper-case six-character code; userPairCodeByOwner
+	// indexes the live code for each owner.
+	userPairCodes       map[string]userPairCode
+	userPairCodeByOwner map[string]string
 
 	tokens map[string]string // token → hostId
 	hosts  map[string]*hostState
@@ -452,9 +465,16 @@ type Hub struct {
 
 	dataFile string
 	// prefsFile holds the browser prefs document (prefs.json, sibling of
-	// hub.json). Written on SetPrefs only.
+	// hub.json). Written on SetPrefs only. It is the root admin's document;
+	// ordinary users get their own entries in userPrefsFile.
 	prefsFile string
 	prefs     BrowserPrefs
+	// userPrefsFile holds per-user prefs documents (prefs-users.json).
+	// Keyed by users.json id so users never see each other's pinned
+	// sessions, todos, or appearance flags.
+	userPrefsFile      string
+	userPrefs          map[string]userPrefsState
+	userPrefsPersistMu sync.Mutex
 	// guestsFile holds the guest-token table (guests.json, sibling of
 	// hub.json, 0600). guests is the in-memory copy; every write persists
 	// it atomically. guestPersistedAt throttles lastUsedAt rewrites.
@@ -465,6 +485,14 @@ type Hub struct {
 	// cannot rename an older table over a newer one (lock order:
 	// guestPersistMu → h.mu, never the reverse).
 	guestPersistMu sync.Mutex
+	// usersFile holds the user-token table (users.json, sibling of
+	// hub.json, 0600). Only SHA-256 hashes are persisted.
+	usersFile       string
+	users           []User
+	userPersistedAt time.Time
+	// userPersistMu serializes users.json snapshots (lock order:
+	// userPersistMu → h.mu, never the reverse).
+	userPersistMu sync.Mutex
 	// persistMu is the hub.json counterpart of guestPersistMu: it
 	// serializes "snapshot + write" so a slow writer cannot rename an
 	// older registry snapshot over a newer one (a lost pairing or port
@@ -525,13 +553,16 @@ func NewWithDir(dir string) *Hub {
 		log.Printf("[capri-hub] 无法生成随机 hubBoot（%v），使用时间戳 %d", err, boot)
 	}
 	h := &Hub{
-		tokens:          make(map[string]string),
-		hosts:           make(map[string]*hostState),
-		pending:         make(map[string]map[string]*pendingReq),
-		relayTombstones: make(map[string]map[string]relayTombstone),
-		prefs:           BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
-		startedAt:       time.Now(),
-		hubBoot:         boot,
+		userPairCodes:       make(map[string]userPairCode),
+		userPairCodeByOwner: make(map[string]string),
+		tokens:              make(map[string]string),
+		hosts:               make(map[string]*hostState),
+		pending:             make(map[string]map[string]*pendingReq),
+		relayTombstones:     make(map[string]map[string]relayTombstone),
+		prefs:               BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
+		userPrefs:           make(map[string]userPrefsState),
+		startedAt:           time.Now(),
+		hubBoot:             boot,
 	}
 	h.subs.Store(&emptySubs)
 	if dir != "" {
@@ -539,8 +570,12 @@ func NewWithDir(dir string) *Hub {
 		h.load()
 		h.prefsFile = filepath.Join(dir, "prefs.json")
 		h.loadPrefs()
+		h.userPrefsFile = filepath.Join(dir, "prefs-users.json")
+		h.loadUserPrefs()
 		h.guestsFile = filepath.Join(dir, "guests.json")
 		h.loadGuests()
+		h.usersFile = filepath.Join(dir, "users.json")
+		h.loadUsers()
 	}
 	h.rotateCode()
 	return h
@@ -573,8 +608,18 @@ type persistFile struct {
 type persistHost struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
+	OwnerID  string `json:"ownerId,omitempty"`
 	Ready    bool   `json:"ready"`
 	Port     int    `json:"port,omitempty"`
+}
+
+// hostOwnerOrDefault normalizes an old hub.json entry (no ownerId) to the
+// deployment admin. Every host created before multi-user belongs to root.
+func hostOwnerOrDefault(ownerID string) string {
+	if strings.TrimSpace(ownerID) == "" {
+		return "root"
+	}
+	return ownerID
 }
 
 func (h *Hub) load() {
@@ -591,8 +636,10 @@ func (h *Hub) load() {
 		if id == "" {
 			id = hid
 		}
+		ownerID := hostOwnerOrDefault(ph.OwnerID)
 		h.hosts[id] = &hostState{
-			info: HostInfo{HostID: id, HostName: ph.HostName, Ready: ph.Ready, Port: ph.Port},
+			info:    HostInfo{HostID: id, HostName: ph.HostName, OwnerID: ownerID, Ready: ph.Ready, Port: ph.Port},
+			ownerID: ownerID,
 		}
 	}
 	// Restore tokens and hostState.token so re-pair after restart can
@@ -610,8 +657,9 @@ func (h *Hub) load() {
 			// Orphan token without a hosts entry — synthesize a minimal host
 			// so the token remains usable and re-pair can still revoke it.
 			h.hosts[hid] = &hostState{
-				info:  HostInfo{HostID: hid},
-				token: tok,
+				info:    HostInfo{HostID: hid, OwnerID: "root"},
+				ownerID: "root",
+				token:   tok,
 			}
 		}
 	}
@@ -629,7 +677,13 @@ func (h *Hub) snapshotLocked() persistFile {
 		pf.Tokens[tok] = hid
 	}
 	for hid, hs := range h.hosts {
-		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Ready: hs.info.Ready, Port: hs.info.Port}
+		pf.Hosts[hid] = persistHost{
+			HostID:   hid,
+			HostName: hs.info.HostName,
+			OwnerID:  hostOwnerOrDefault(hs.ownerID),
+			Ready:    hs.info.Ready,
+			Port:     hs.info.Port,
+		}
 	}
 	return pf
 }
@@ -818,36 +872,27 @@ func (h *Hub) Prefs() (BrowserPrefs, uint64) {
 // otherwise every reconnect would churn the doc.
 func (h *Hub) SetPrefs(prefs BrowserPrefs) (uint64, error) {
 	cp := clonePrefs(prefs) // clonePrefs already sanitizes
-	now := time.Now()
 
 	h.mu.Lock()
-	next := PrefsEntries{}
-	mergePrefsEntries(next, h.prefs.Entries)
-	mergePrefsEntries(next, cp.Entries)
-	prunePrefsTombstones(next, now)
-	if samePrefsEntries(h.prefs.Entries, next) {
+	doc, newVersion, changed := mergePrefsDoc(h.prefs, h.prefsVersion, cp)
+	if !changed {
 		// Nothing moved: keep the version, don't write, don't broadcast.
-		v := h.prefsVersion
 		h.mu.Unlock()
-		return v, nil
+		return newVersion, nil
 	}
-	doc := cp
-	doc.Entries = next
-	applyPrefsProjection(&doc)
 	persist := h.prefsFile != ""
 	var payload []byte
 	if persist {
-		b, err := json.Marshal(prefsFileDoc{BrowserPrefs: doc, Version: h.prefsVersion + 1})
+		b, err := json.Marshal(prefsFileDoc{BrowserPrefs: doc, Version: newVersion})
 		if err != nil {
 			h.mu.Unlock()
 			return 0, fmt.Errorf("marshal prefs: %w", err)
 		}
 		payload = b
 	}
-	h.prefsVersion++
-	newVersion := h.prefsVersion
+	h.prefsVersion = newVersion
 	h.prefs = doc
-	h.broadcast(prefsChanged(clonePrefs(doc), newVersion))
+	h.broadcastToUser("root", prefsChanged(clonePrefs(doc), newVersion))
 	h.mu.Unlock()
 
 	if persist {
@@ -856,6 +901,24 @@ func (h *Hub) SetPrefs(prefs BrowserPrefs) (uint64, error) {
 		}
 	}
 	return newVersion, nil
+}
+
+// mergePrefsDoc folds incoming into current and returns the merged document,
+// its new version and whether anything changed. Callers hold h.mu when the
+// current document is shared state.
+func mergePrefsDoc(current BrowserPrefs, currentVersion uint64, incoming BrowserPrefs) (BrowserPrefs, uint64, bool) {
+	cp := clonePrefs(incoming)
+	next := PrefsEntries{}
+	mergePrefsEntries(next, current.Entries)
+	mergePrefsEntries(next, cp.Entries)
+	prunePrefsTombstones(next, time.Now())
+	if samePrefsEntries(current.Entries, next) {
+		return clonePrefs(current), currentVersion, false
+	}
+	doc := cp
+	doc.Entries = next
+	applyPrefsProjection(&doc)
+	return doc, currentVersion + 1, true
 }
 
 // prefsChanged builds the prefs broadcast event (hub-level, no hostId —
@@ -875,8 +938,19 @@ func (h *Hub) PairingCode() (code string, expiresAt time.Time) {
 }
 
 func (h *Hub) rotateCode() {
-	h.pairingCode = randomString(codeAlphabet, 6)
-	h.codeExpires = time.Now().Add(PairingCodeTTL)
+	for {
+		code := randomString(codeAlphabet, 6)
+		// Root and user codes share one alphabet and Pair resolves the root
+		// code first, so a collision would silently steal a user's code.
+		if h.userPairCodes != nil {
+			if _, exists := h.userPairCodes[code]; exists {
+				continue
+			}
+		}
+		h.pairingCode = code
+		h.codeExpires = time.Now().Add(PairingCodeTTL)
+		return
+	}
 }
 
 // ensureFreshPairingCode rotates when expired; returns the live code.
@@ -927,42 +1001,64 @@ func (h *Hub) StartPairingCodeMaintainer(ctx context.Context) {
 // stored as HostInfo.Port (local HTTP listen port for FE localhost probe).
 // Omitted or out of range leaves any existing Port untouched on re-pair.
 func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
+	token, _, err := h.PairAs("root", code, hostID, hostName, port...)
+	return token, err
+}
+
+// PairAs is Pair for a user-owned host. ownerID is "root" for the deployment
+// admin or a users.json id. The code must be either the root pairing code
+// (for root) or that user's own live pairing code. The returned hostID is
+// the actual registry key: if another owner already uses the requested
+// hostId, the hub derives a unique suffixed id instead of hijacking it.
+func (h *Hub) PairAs(ownerID, code, hostID, hostName string, port ...int) (string, string, error) {
+	ownerID = hostOwnerOrDefault(strings.TrimSpace(ownerID))
 	listenPort := 0
 	if len(port) > 0 {
 		listenPort = port[0]
 	}
 	h.mu.Lock()
-	// Constant-time compare: the pairing code is a short-lived secret and
-	// POST /api/pair is internet-reachable, so the comparison must not
-	// leak how many leading bytes matched. (subtle.ConstantTimeCompare
-	// still returns 0 immediately for differing lengths — the code length
-	// is fixed public knowledge, so that leak is harmless.)
-	if subtle.ConstantTimeCompare([]byte(strings.ToUpper(strings.TrimSpace(code))), []byte(h.pairingCode)) != 1 {
-		h.mu.Unlock()
-		return "", ErrCodeInvalid
-	}
-	if time.Now().After(h.codeExpires) {
-		h.mu.Unlock()
-		return "", ErrCodeInvalid
+	if ownerID == "root" {
+		// Constant-time compare: the pairing code is a short-lived secret and
+		// POST /api/pair is internet-reachable, so the comparison must not
+		// leak how many leading bytes matched. (subtle.ConstantTimeCompare
+		// still returns 0 immediately for differing lengths — the code length
+		// is fixed public knowledge, so that leak is harmless.)
+		if subtle.ConstantTimeCompare([]byte(strings.ToUpper(strings.TrimSpace(code))), []byte(h.pairingCode)) != 1 {
+			h.mu.Unlock()
+			return "", "", ErrCodeInvalid
+		}
+		if time.Now().After(h.codeExpires) {
+			h.mu.Unlock()
+			return "", "", ErrCodeInvalid
+		}
+	} else {
+		entry, ok := h.userPairCodes[strings.ToUpper(strings.TrimSpace(code))]
+		if !ok || entry.ownerID != ownerID || time.Now().After(entry.expires) || !h.userExistsLocked(ownerID) {
+			h.mu.Unlock()
+			return "", "", ErrCodeInvalid
+		}
 	}
 	hostID = strings.TrimSpace(hostID)
 	hostName = strings.TrimSpace(hostName)
 	if hostID == "" {
 		h.mu.Unlock()
-		return "", errors.New("hostId 不能为空")
+		return "", "", errors.New("hostId 不能为空")
 	}
 	if len(hostID) > maxHostIDLen {
 		h.mu.Unlock()
-		return "", fmt.Errorf("hostId 过长（上限 %d）", maxHostIDLen)
+		return "", "", fmt.Errorf("hostId 过长（上限 %d）", maxHostIDLen)
 	}
 	if len(hostName) > maxHostNameLen {
 		h.mu.Unlock()
-		return "", fmt.Errorf("hostName 过长（上限 %d）", maxHostNameLen)
+		return "", "", fmt.Errorf("hostName 过长（上限 %d）", maxHostNameLen)
 	}
-	if hs, ok := h.hosts[hostID]; ok {
-		// Revoke every token for this hostId (covers multi-token legacy
-		// after a pre-fix restart load).
-		h.revokeTokensForHostLocked(hostID)
+	actualID := h.resolveHostIDLocked(ownerID, hostID)
+	if hs, ok := h.hosts[actualID]; ok {
+		// Same owner re-pairing its host: revoke every token for this
+		// hostId (covers multi-token legacy after a pre-fix restart load).
+		h.revokeTokensForHostLocked(actualID)
+		hs.ownerID = ownerID
+		hs.info.OwnerID = ownerID
 		hs.info.HostName = hostName
 		hs.info.LastSeen = time.Now()
 		if listenPort > 0 && listenPort <= 65535 {
@@ -971,22 +1067,141 @@ func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
 	} else {
 		if len(h.hosts) >= MaxHosts {
 			h.mu.Unlock()
-			return "", ErrHostLimit
+			return "", "", ErrHostLimit
 		}
-		info := HostInfo{HostID: hostID, HostName: hostName, LastSeen: time.Now()}
+		info := HostInfo{HostID: actualID, HostName: hostName, OwnerID: ownerID, LastSeen: time.Now()}
 		if listenPort > 0 && listenPort <= 65535 {
 			info.Port = listenPort
 		}
-		h.hosts[hostID] = &hostState{info: info}
+		h.hosts[actualID] = &hostState{info: info, ownerID: ownerID}
 	}
 	token := randomToken()
-	h.tokens[token] = hostID
-	h.hosts[hostID].token = token
+	h.tokens[token] = actualID
+	h.hosts[actualID].token = token
+	// A pairing code is a one-shot credential. Consume it only after the
+	// host was created/re-paired successfully, so a failed validation does
+	// not burn the operator's code. Root rotates to a fresh deployment-wide
+	// code; a user's code is removed until they request a new one.
+	if ownerID == "root" {
+		h.rotateCode()
+	} else {
+		codeKey := strings.ToUpper(strings.TrimSpace(code))
+		delete(h.userPairCodes, codeKey)
+		delete(h.userPairCodeByOwner, ownerID)
+	}
 	h.mu.Unlock()
 
 	h.persistNow()
-	log.Printf("[capri-hub] host paired: %s (%s)", hostID, hostName)
-	return token, nil
+	log.Printf("[capri-hub] host paired: %s (%s, owner %s)", actualID, hostName, ownerID)
+	return token, actualID, nil
+}
+
+// resolveHostIDLocked returns requested when it is free or already belongs
+// to ownerID. A hostId owned by another account gets a stable suffix based
+// on that account id, so two default "local" installations never collide.
+// Caller holds h.mu.
+func (h *Hub) resolveHostIDLocked(ownerID, requested string) string {
+	hs, taken := h.hosts[requested]
+	if !taken || hostOwnerOrDefault(hs.ownerID) == ownerID {
+		return requested
+	}
+	suffix := strings.TrimPrefix(ownerID, "u_")
+	if suffix == "" {
+		suffix = "root"
+	}
+	base := requested
+	if len(base)+len(suffix)+2 > maxHostIDLen {
+		base = base[:maxHostIDLen-len(suffix)-2]
+	}
+	candidate := base + "-" + suffix
+	for i := 2; ; i++ {
+		if _, exists := h.hosts[candidate]; !exists {
+			return candidate
+		}
+		suffix = fmt.Sprintf("%s-%d", strings.TrimPrefix(ownerID, "u_"), i)
+		if suffix == "" || suffix == "-" {
+			suffix = fmt.Sprintf("root-%d", i)
+		}
+		if len(base)+len(suffix)+2 > maxHostIDLen {
+			base = requested[:maxHostIDLen-len(suffix)-2]
+		}
+		candidate = base + "-" + suffix
+	}
+}
+
+// UserPairingCode returns the live six-character pairing code for a user,
+// creating or rotating it when absent or expired. The root owner uses the
+// deployment-wide code printed at startup; users get their own code from the
+// FE pair dialog.
+func (h *Hub) UserPairingCode(ownerID string) (code string, expiresAt time.Time) {
+	ownerID = hostOwnerOrDefault(strings.TrimSpace(ownerID))
+	if ownerID == "root" {
+		return h.PairingCode()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now()
+	if cur := h.userPairCodeByOwner[ownerID]; cur != "" {
+		if entry, ok := h.userPairCodes[cur]; ok && entry.ownerID == ownerID && now.Before(entry.expires) {
+			return cur, entry.expires
+		}
+	}
+	code = h.newUniquePairCodeLocked()
+	expiresAt = now.Add(PairingCodeTTL)
+	h.userPairCodes[code] = userPairCode{ownerID: ownerID, expires: expiresAt}
+	h.userPairCodeByOwner[ownerID] = code
+	return code, expiresAt
+}
+
+// RotateUserPairingCode invalidates a user's current code and returns a new
+// one. Root keeps the existing RotatePairingCode path.
+func (h *Hub) RotateUserPairingCode(ownerID string) (code string, expiresAt time.Time) {
+	ownerID = hostOwnerOrDefault(strings.TrimSpace(ownerID))
+	if ownerID == "root" {
+		return h.RotatePairingCode()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if cur := h.userPairCodeByOwner[ownerID]; cur != "" {
+		delete(h.userPairCodes, cur)
+		delete(h.userPairCodeByOwner, ownerID)
+	}
+	code = h.newUniquePairCodeLocked()
+	expiresAt = time.Now().Add(PairingCodeTTL)
+	h.userPairCodes[code] = userPairCode{ownerID: ownerID, expires: expiresAt}
+	h.userPairCodeByOwner[ownerID] = code
+	return code, expiresAt
+}
+
+// newUniquePairCodeLocked returns a code not used by root or any user.
+func (h *Hub) newUniquePairCodeLocked() string {
+	for {
+		code := randomString(codeAlphabet, 6)
+		if code == h.pairingCode {
+			continue
+		}
+		if _, exists := h.userPairCodes[code]; exists {
+			continue
+		}
+		return code
+	}
+}
+
+// OwnerForPairCode resolves a six-character code to its owner without
+// consuming it. Expired entries are rejected.
+func (h *Hub) OwnerForPairCode(code string) (string, bool) {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now()
+	if code == h.pairingCode && now.Before(h.codeExpires) {
+		return "root", true
+	}
+	entry, ok := h.userPairCodes[code]
+	if !ok || now.After(entry.expires) {
+		return "", false
+	}
+	return entry.ownerID, true
 }
 
 // Unpair removes a host from the registry: revokes all its tokens, fails
@@ -1018,6 +1233,7 @@ func (h *Hub) Unpair(hostID string) error {
 	h.broadcast(hostsChanged())
 	h.mu.Unlock()
 
+	h.dropSubscribersForHost(hostID)
 	h.persistNow()
 	log.Printf("[capri-hub] host unpaired: %s", hostID)
 	return nil
@@ -1778,10 +1994,22 @@ func (h *Hub) LastSeq(hostID string) uint64 {
 // SeqByHost returns the per-host delivery watermark (see LastSeq) for the FE
 // hello frame, so a browser works on the same gapless coordinate as the hub.
 func (h *Hub) SeqByHost() map[string]uint64 {
+	return h.seqByHostLocked("")
+}
+
+// SeqByHostFor returns seq watermarks for one user's hosts.
+func (h *Hub) SeqByHostFor(ownerID string) map[string]uint64 {
+	return h.seqByHostLocked(hostOwnerOrDefault(ownerID))
+}
+
+func (h *Hub) seqByHostLocked(ownerID string) map[string]uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := make(map[string]uint64, len(h.hosts))
 	for id, hs := range h.hosts {
+		if ownerID != "" && hostOwnerOrDefault(hs.ownerID) != ownerID {
+			continue
+		}
 		out[id] = hs.upAcked.Load()
 	}
 	return out
@@ -2262,11 +2490,25 @@ func (h *Hub) RespondChunk(hostID, reqID string, status int, encoding, chunk str
 // ListHosts returns the registry, online hosts first, most recently seen
 // first.
 func (h *Hub) ListHosts() []HostInfo {
+	return h.listHostsLocked("")
+}
+
+// ListHostsFor returns only the hosts owned by ownerID. The deployment admin
+// ("root") sees every host through ListHosts; this is the user-scoped view.
+func (h *Hub) ListHostsFor(ownerID string) []HostInfo {
+	return h.listHostsLocked(hostOwnerOrDefault(ownerID))
+}
+
+func (h *Hub) listHostsLocked(ownerID string) []HostInfo {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := make([]HostInfo, 0, len(h.hosts))
 	for _, hs := range h.hosts {
+		if ownerID != "" && hostOwnerOrDefault(hs.ownerID) != ownerID {
+			continue
+		}
 		info := hs.info
+		info.OwnerID = hostOwnerOrDefault(info.OwnerID)
 		// Age is computed here, not in the browser: LastSeen comes from this
 		// process's clock and is meaningless against a client's clock.
 		if !info.LastSeen.IsZero() {
@@ -2288,13 +2530,66 @@ func (h *Hub) ListHosts() []HostInfo {
 	return out
 }
 
+// HostOwner returns the user id that paired hostID.
+func (h *Hub) HostOwner(hostID string) (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		return "", false
+	}
+	return hostOwnerOrDefault(hs.ownerID), true
+}
+
+// HostIDsForUser returns every host id owned by ownerID.
+func (h *Hub) HostIDsForUser(ownerID string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0)
+	for id, hs := range h.hosts {
+		if hostOwnerOrDefault(hs.ownerID) == ownerID {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HostCountForUser counts hosts owned by ownerID.
+func (h *Hub) HostCountForUser(ownerID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, hs := range h.hosts {
+		if hostOwnerOrDefault(hs.ownerID) == ownerID {
+			n++
+		}
+	}
+	return n
+}
+
 // DefaultHostID picks the host for requests that don't name one: the most
 // recently seen online host, else the most recently seen one overall.
 func (h *Hub) DefaultHostID() string {
+	return h.defaultHostIDLocked("")
+}
+
+// DefaultHostIDFor is DefaultHostID within one user's host set.
+func (h *Hub) DefaultHostIDFor(ownerID string) string {
+	return h.defaultHostIDLocked(hostOwnerOrDefault(ownerID))
+}
+
+func (h *Hub) defaultHostIDLocked(ownerID string) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	eligible := func(hs *hostState) bool {
+		return ownerID == "" || hostOwnerOrDefault(hs.ownerID) == ownerID
+	}
 	var best string
 	for _, hs := range h.hosts {
+		if !eligible(hs) {
+			continue
+		}
 		if hs.info.Online {
 			if best == "" || hs.info.LastSeen.After(h.hosts[best].info.LastSeen) {
 				best = hs.info.HostID
@@ -2305,6 +2600,9 @@ func (h *Hub) DefaultHostID() string {
 		return best
 	}
 	for _, hs := range h.hosts {
+		if !eligible(hs) {
+			continue
+		}
 		if best == "" || hs.info.LastSeen.After(h.hosts[best].info.LastSeen) {
 			best = hs.info.HostID
 		}
@@ -2378,14 +2676,19 @@ type feSubscriber struct {
 	// filter at all). The `subscribe` frame deliberately does not set it.
 	viewDeclared atomic.Bool
 
-	// Guest subscribers (a browser authenticated with a guest token) are
-	// additionally scoped to a whitelist: hub-level events, hosts outside
-	// allowedHosts and events whose top-level sessionId is outside
-	// allowedSessions never reach them. The maps are built once at
-	// subscribe time and never mutated, so the fan-out path reads them
-	// without a lock.
-	guest           bool
-	guestTokenID    string
+	// role is "admin", "user" or "guest". userID is the users.json id for a
+	// user subscriber. Ordinary users are scoped to their owned hosts;
+	// guests are additionally scoped to a session whitelist. The maps are
+	// built once at subscribe time and never mutated, so the fan-out path
+	// reads them without a lock.
+	role         string
+	userID       string
+	guest        bool
+	guestTokenID string
+	// userHosts is the live host set for an ordinary user. It is stored
+	// behind an atomic pointer so SetSubscriberUserHosts can refresh it
+	// without mutating a map the fan-out path is reading.
+	userHosts       atomic.Pointer[map[string]bool]
 	allowedHosts    map[string]bool
 	allowedSessions map[string]bool
 	// guestParentOf resolves a subagent child session to the parent that
@@ -2394,9 +2697,10 @@ type feSubscriber struct {
 	// Nil for admin subscribers.
 	guestParentOf func(hostID, sessionID string) string
 
-	// kicked is closed when the guest token behind this subscriber is
-	// revoked or deleted, so /ws/fe can close the socket immediately
-	// instead of waiting for the next request to be rejected.
+	// kicked is closed when the credential behind this subscriber is
+	// revoked/deleted, its guest session whitelist changes, or its host is
+	// unpaired, so /ws/fe can close the socket immediately instead of
+	// waiting for the next request to be rejected.
 	kicked   chan struct{}
 	kickOnce sync.Once
 
@@ -2606,9 +2910,24 @@ func (s *feSubscriber) hostFilter() string {
 // events — their shell renders from /api/access-role instead.
 func (s *feSubscriber) watches(evHost string) bool {
 	if evHost == "" {
-		return !s.guest
+		// Hub-level events: admin pages need all of them. Users only need
+		// hosts_changed (it carries no data; their next GET is filtered).
+		// Guests render from their access-role snapshot and get none.
+		if s.role == "guest" {
+			return false
+		}
+		if s.role == "user" {
+			return false
+		}
+		return true
 	}
-	if s.guest && !s.allowedHosts[evHost] {
+	if s.role == "guest" && !s.allowedHosts[evHost] {
+		return false
+	}
+	// Admin and user subscribers created through TrySubscribeScopedInfo
+	// carry an explicit host set. A generic admin subscriber (tests,
+	// compatibility) has none and remains unrestricted.
+	if hosts := s.userHosts.Load(); hosts != nil && !(*hosts)[evHost] {
 		return false
 	}
 	f := s.hostFilter()
@@ -2623,10 +2942,20 @@ func (s *feSubscriber) watches(evHost string) bool {
 // subagent metadata keeps reaching guests through /api/subagent/get).
 func (s *feSubscriber) watchesEvent(ev Event) bool {
 	evHost, _ := ev["hostId"].(string)
+	if evHost == "" && s.role == "user" {
+		// A user page still needs hosts_changed / prefs_changed to refresh
+		// its own registry and prefs. hosts_changed carries no payload;
+		// prefs_changed is delivered explicitly by broadcastToUser.
+		switch ev["type"] {
+		case "hosts_changed":
+			return true
+		}
+		return false
+	}
 	if !s.watches(evHost) {
 		return false
 	}
-	if !s.guest {
+	if s.role != "guest" {
 		return true
 	}
 	sid := eventSessionID(ev)
@@ -2644,7 +2973,22 @@ func (s *feSubscriber) watchesEvent(ev Event) bool {
 }
 
 // kick ends a guest subscriber's socket (token revoked or deleted).
+// setUserHosts replaces the user's allowed host set. The map is never
+// mutated after publication, so fan-out readers stay lock-free.
+func (s *feSubscriber) setUserHosts(hosts []string) {
+	next := make(map[string]bool, len(hosts))
+	for _, id := range hosts {
+		if id != "" {
+			next[id] = true
+		}
+	}
+	s.userHosts.Store(&next)
+}
+
 func (s *feSubscriber) kick() {
+	if s.kicked == nil {
+		return
+	}
 	s.kickOnce.Do(func() { close(s.kicked) })
 }
 
@@ -2774,8 +3118,35 @@ func (h *Hub) TrySubscribeHost(max int, hostID string) (ch chan Event, unsubscri
 func (h *Hub) TrySubscribeHostInfo(max int, hostID string, info SubscriberInfo) (
 	ch chan Event, unsubscribe func(), ok bool,
 ) {
-	ch, unsub, _, ok := h.trySubscribe(max, hostID, nil, info)
+	ch, unsub, _, ok := h.trySubscribe(max, hostID, nil, nil, nil, info)
 	return ch, unsub, ok
+}
+
+// TrySubscribeUserInfo is TrySubscribeHost for an ordinary user. allowedHosts
+// is a snapshot of the hosts owned by that user at registration; the fan-out
+// path uses it to reject events from any other host without taking h.mu.
+func (h *Hub) TrySubscribeUserInfo(max int, hostID string, user User, allowedHosts []string, info SubscriberInfo) (
+	ch chan Event, unsubscribe func(), kicked <-chan struct{}, ok bool,
+) {
+	return h.TrySubscribeScopedInfo(max, hostID, user.ID, "user", allowedHosts, info)
+}
+
+// TrySubscribeScopedInfo registers a browser subscriber scoped to one
+// owner's hosts. Both the admin (scope "root", role "admin") and ordinary
+// users use this path; role only affects display/telemetry.
+func (h *Hub) TrySubscribeScopedInfo(max int, hostID, scopeID, role string, allowedHosts []string, info SubscriberInfo) (
+	ch chan Event, unsubscribe func(), kicked <-chan struct{}, ok bool,
+) {
+	if role == "" {
+		role = "user"
+	}
+	info.Role = role
+	user := User{ID: scopeID}
+	ch, unsub, sock, ok := h.trySubscribe(max, hostID, nil, &user, allowedHosts, info)
+	if !ok || sock == nil {
+		return ch, unsub, nil, ok
+	}
+	return ch, unsub, sock.kicked, true
 }
 
 // TrySubscribeGuest is TrySubscribeHost for a guest token's browser: the
@@ -2793,14 +3164,14 @@ func (h *Hub) TrySubscribeGuest(max int, hostID string, guest GuestToken) (
 func (h *Hub) TrySubscribeGuestInfo(max int, hostID string, guest GuestToken, info SubscriberInfo) (
 	ch chan Event, unsubscribe func(), kicked <-chan struct{}, ok bool,
 ) {
-	ch, unsubscribe, sock, ok := h.trySubscribe(max, hostID, &guest, info)
+	ch, unsubscribe, sock, ok := h.trySubscribe(max, hostID, &guest, nil, nil, info)
 	if !ok || sock == nil {
 		return ch, unsubscribe, nil, ok
 	}
 	return ch, unsubscribe, sock.kicked, true
 }
 
-func (h *Hub) trySubscribe(max int, hostID string, guest *GuestToken, info SubscriberInfo) (
+func (h *Hub) trySubscribe(max int, hostID string, guest *GuestToken, user *User, allowedHosts []string, info SubscriberInfo) (
 	ch chan Event, unsubscribe func(), sub *feSubscriber, ok bool,
 ) {
 	// 512 absorbs short FE write stalls; the subscriber's own pump (see
@@ -2810,13 +3181,26 @@ func (h *Hub) trySubscribe(max int, hostID string, guest *GuestToken, info Subsc
 	s.stats = &h.feStats
 	s.connectedAt = nowStamp()
 	s.info = info
+	s.role = info.Role
+	if s.role == "" {
+		s.role = "admin"
+	}
+	// Every subscriber gets a kick channel: role revocation, host
+	// reassignment, and guest-session edits all need to close live sockets.
+	s.kicked = make(chan struct{})
 	if hostID != "" {
 		s.host.Store(hostID)
 	}
-	if guest != nil {
+	if user != nil {
+		if s.role == "" {
+			s.role = "user"
+		}
+		s.userID = user.ID
+		s.setUserHosts(allowedHosts)
+	} else if guest != nil {
+		s.role = "guest"
 		s.guest = true
 		s.guestTokenID = guest.ID
-		s.kicked = make(chan struct{})
 		s.allowedHosts = make(map[string]bool, len(guest.Sessions))
 		s.allowedSessions = make(map[string]bool, len(guest.Sessions))
 		for _, gs := range guest.Sessions {
@@ -2853,6 +3237,24 @@ func (h *Hub) trySubscribe(max int, hostID string, guest *GuestToken, info Subsc
 		h.notifyAudience()
 		h.notifySubscribersCount(nil)
 	}, s, true
+}
+
+// SetSubscriberUserHosts refreshes the host set an ordinary user subscriber
+// may receive. The FE calls this implicitly through a subscribe frame; the
+// snapshot keeps the fan-out path lock-free while still letting a user pair
+// its first host without reloading the page.
+func (h *Hub) SetSubscriberUserHosts(ch chan Event, hosts []string) bool {
+	cur := h.subs.Load()
+	if cur == nil {
+		return false
+	}
+	for _, s := range *cur {
+		if s.ch == ch && s.role == "user" {
+			s.setUserHosts(hosts)
+			return true
+		}
+	}
+	return false
 }
 
 // SetSubscriberHost retargets a live subscriber's host filter, identifying
@@ -3259,6 +3661,12 @@ func (h *Hub) notifySubscribersCount(except *feSubscriber) {
 		"count": count,
 	}
 	for _, s := range cur {
+		// The global browser count is admin telemetry. User pages have no
+		// `feSubscribers` in their hello and guests never receive
+		// hub-level events.
+		if s.role == "user" || s.role == "guest" {
+			continue
+		}
 		if s == except || !s.watchesEvent(ev) {
 			continue
 		}
@@ -3297,6 +3705,28 @@ func (h *Hub) broadcast(ev Event) {
 // full guest filter; a control frame without one — the epoch-reset
 // `subscribed` — goes to every subscriber watching that host, guests included,
 // because it carries no session to whitelist.
+// broadcastToUser delivers a hub-level event to exactly one account's live
+// pages. It is used for prefs_changed, whose payload is the user's own prefs
+// document and must never reach another user.
+func (h *Hub) broadcastToUser(userID string, ev Event) {
+	cur := h.subs.Load()
+	if cur == nil {
+		return
+	}
+	root := hostOwnerOrDefault(userID) == "root"
+	for _, s := range *cur {
+		if root {
+			if s.role == "admin" || s.role == "" {
+				s.deliver(ev)
+			}
+			continue
+		}
+		if s.role == "user" && s.userID == userID {
+			s.deliver(ev)
+		}
+	}
+}
+
 func (h *Hub) broadcastHost(hostID string, ev Event) {
 	cur := h.subs.Load()
 	if cur == nil {
@@ -3315,8 +3745,8 @@ func (h *Hub) broadcastHost(hostID string, ev Event) {
 }
 
 // DropGuestSubscribers kicks every live subscriber authenticated with the
-// given guest token (revoked / deleted). Closing the socket is what makes
-// a revocation take effect on an already-open tab; the client's next
+// given guest token. Closing the socket is what makes revocation, expiry or a
+// whitelist change take effect on an already-open tab; the client's next
 // request would be rejected anyway, but a read-only page makes none.
 func (h *Hub) DropGuestSubscribers(tokenID string) {
 	cur := h.subs.Load()
@@ -3325,6 +3755,41 @@ func (h *Hub) DropGuestSubscribers(tokenID string) {
 	}
 	for _, s := range *cur {
 		if s.guest && s.guestTokenID == tokenID {
+			s.kick()
+		}
+	}
+}
+
+// DropUserSubscribers kicks every live browser authenticated as userID.
+// Token reset and account deletion use it so an already-open page stops
+// receiving events immediately instead of waiting for its next request.
+func (h *Hub) DropUserSubscribers(userID string) {
+	cur := h.subs.Load()
+	if cur == nil || userID == "" {
+		return
+	}
+	for _, s := range *cur {
+		if s.role == "user" && s.userID == userID {
+			s.kick()
+		}
+	}
+}
+
+// dropSubscribersForHost closes live pages whose filter or ownership snapshot
+// includes hostID. Unpair must use it: a later owner can reuse the same hostId
+// (the registry key is free after deletion), and a stale userHosts/session
+// snapshot would otherwise deliver the new owner's events to the old page.
+func (h *Hub) dropSubscribersForHost(hostID string) {
+	cur := h.subs.Load()
+	if cur == nil || hostID == "" {
+		return
+	}
+	for _, s := range *cur {
+		stale := s.hostFilter() == hostID || s.allowedHosts[hostID]
+		if hosts := s.userHosts.Load(); hosts != nil && (*hosts)[hostID] {
+			stale = true
+		}
+		if stale {
 			s.kick()
 		}
 	}

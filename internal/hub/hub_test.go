@@ -51,8 +51,10 @@ func TestPairingFlow(t *testing.T) {
 		t.Error("bogus token should not resolve")
 	}
 
-	// Re-pairing revokes the old token.
-	tok2, err := h.Pair(code, "h1", "H1-renamed")
+	// Re-pairing revokes the old token. The first successful pair consumed
+	// the code, so take the freshly rotated one.
+	code2, _ := h.PairingCode()
+	tok2, err := h.Pair(code2, "h1", "H1-renamed")
 	if err != nil {
 		t.Fatalf("re-pair: %v", err)
 	}
@@ -61,6 +63,24 @@ func TestPairingFlow(t *testing.T) {
 	}
 	if _, ok := h.HostIDForToken(tok2); !ok {
 		t.Error("new token should resolve")
+	}
+}
+
+func TestPairCodeIsSingleUse(t *testing.T) {
+	h := NewWithDir("")
+	code, _ := h.PairingCode()
+	if _, err := h.Pair(code, "h1", "H1"); err != nil {
+		t.Fatalf("first pair: %v", err)
+	}
+	if _, err := h.Pair(code, "h2", "H2"); !errors.Is(err, ErrCodeInvalid) {
+		t.Fatalf("reused pairing code err = %v, want ErrCodeInvalid", err)
+	}
+	fresh, _ := h.PairingCode()
+	if fresh == code {
+		t.Fatal("pairing code did not rotate after success")
+	}
+	if _, err := h.Pair(fresh, "h2", "H2"); err != nil {
+		t.Fatalf("fresh code must pair: %v", err)
 	}
 }
 
@@ -197,14 +217,21 @@ func TestPersistFileMode(t *testing.T) {
 func TestConcurrentPairPersist(t *testing.T) {
 	dir := t.TempDir()
 	h := NewWithDir(dir)
-	code, _ := h.PairingCode()
 
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = h.Pair(code, fmt.Sprintf("h%d", i), "H")
+			// Codes are single-use and rotate after success. A concurrent
+			// peer may take the code we just read; retry with the current
+			// one instead of reusing a burned code.
+			for attempt := 0; attempt < 8; attempt++ {
+				code, _ := h.PairingCode()
+				if _, err := h.Pair(code, fmt.Sprintf("h%d", i), "H"); err == nil {
+					return
+				}
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -313,20 +340,39 @@ func TestUnpair(t *testing.T) {
 	}
 }
 
+func TestUnpairKicksLiveSubscribers(t *testing.T) {
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	_, unsub, kicked, ok := h.TrySubscribeScopedInfo(0, "", "root", "admin", []string{"h1"}, SubscriberInfo{Role: "admin"})
+	if !ok {
+		t.Fatal("subscribe refused")
+	}
+	defer unsub()
+	if err := h.Unpair("h1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-kicked:
+	case <-time.After(time.Second):
+		t.Fatal("live subscriber survived host unpair")
+	}
+}
+
 func TestMaxHosts(t *testing.T) {
 	h := NewWithDir("")
-	code, _ := h.PairingCode()
-	// Fill to the cap without going through full MaxHosts if huge —
-	// temporarily not possible; exercise the limit by filling MaxHosts.
+	// Codes are single-use; each successful pair rotates the deployment code.
 	for i := 0; i < MaxHosts; i++ {
+		code, _ := h.PairingCode()
 		if _, err := h.Pair(code, fmt.Sprintf("host-%d", i), "H"); err != nil {
 			t.Fatalf("pair %d: %v", i, err)
 		}
 	}
+	code, _ := h.PairingCode()
 	if _, err := h.Pair(code, "overflow", "H"); !errors.Is(err, ErrHostLimit) {
 		t.Errorf("pair beyond cap err = %v, want ErrHostLimit", err)
 	}
 	// Re-pair of an existing host must still work.
+	code, _ = h.PairingCode()
 	if _, err := h.Pair(code, "host-0", "renamed"); err != nil {
 		t.Errorf("re-pair within cap: %v", err)
 	}

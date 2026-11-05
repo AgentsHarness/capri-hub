@@ -206,6 +206,49 @@ func TestGuestSessionWhitelistOps(t *testing.T) {
 	}
 }
 
+func TestRemoveGuestSessionsKicksLiveSubscriber(t *testing.T) {
+	h := NewWithDir("")
+	g, err := h.CreateGuestToken("t", 0, []GuestSession{{HostID: "h1", SessionID: "s1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, unsub, kicked, ok := h.TrySubscribeGuestInfo(0, "h1", g, SubscriberInfo{Role: "guest"})
+	if !ok {
+		t.Fatal("guest subscribe refused")
+	}
+	defer unsub()
+	if _, err := h.RemoveGuestSessions(g.ID, []GuestSessionRef{{HostID: "h1", SessionID: "s1"}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-kicked:
+	case <-time.After(time.Second):
+		t.Fatal("live guest subscriber was not kicked after session removal")
+	}
+}
+
+func TestGuestExpiryKicksLiveSubscriber(t *testing.T) {
+	h := NewWithDir("")
+	g, err := h.CreateGuestToken("t", time.Now().Add(time.Hour).Unix(), []GuestSession{{HostID: "h1", SessionID: "s1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, unsub, kicked, ok := h.TrySubscribeGuestInfo(0, "h1", g, SubscriberInfo{Role: "guest"})
+	if !ok {
+		t.Fatal("guest subscribe refused")
+	}
+	defer unsub()
+	past := time.Now().Add(-time.Second).Unix()
+	if _, err := h.UpdateGuestToken(g.ID, nil, &past, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-kicked:
+	case <-time.After(time.Second):
+		t.Fatal("live guest subscriber was not kicked after expiry")
+	}
+}
+
 // TestGuestSessionFor: the request's session when whitelisted, else the
 // host's first whitelisted session; ("","") when the host has none.
 func TestGuestSessionFor(t *testing.T) {

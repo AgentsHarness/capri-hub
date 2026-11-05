@@ -273,6 +273,10 @@ func subscriberInfoFor(ident identity, remoteIP, userAgent string) hub.Subscribe
 	if info.Role == "" {
 		info.Role = "admin"
 	}
+	if ident.isUser() {
+		info.UserID = ident.UserID
+		info.UserLabel = ident.Label
+	}
 	if ident.isGuest() {
 		info.GuestID = ident.TokenID
 		info.GuestLabel = ident.Label
@@ -298,10 +302,10 @@ func truncateUA(ua string) string {
 // Guests only learn the hosts their token's sessions live on; hub-level
 // hosts_changed never reaches them (they render from /api/access-role).
 func helloHosts(h *hub.Hub, ident identity) []hub.HostInfo {
-	all := h.ListHosts()
 	if !ident.isGuest() {
-		return all
+		return h.ListHostsFor(ident.hostScope())
 	}
+	all := h.ListHosts()
 	allowed := map[string]bool{}
 	for _, s := range ident.Sessions {
 		allowed[s.HostID] = true
@@ -318,20 +322,17 @@ func helloHosts(h *hub.Hub, ident identity) []hub.HostInfo {
 // helloDefaultHost is the ?host= the FE should start on. Guests always
 // start on a whitelisted host.
 func helloDefaultHost(h *hub.Hub, ident identity) string {
-	if ident.isGuest() {
-		return ident.defaultHost()
-	}
-	return h.DefaultHostID()
+	return ident.defaultHost(h)
 }
 
 // helloSeqs carries per-host seq watermarks for gap-pull. Guests never
 // gap-pull (their stream is filtered per session, so seqs would not line
 // up), so the map is empty for them.
 func helloSeqs(h *hub.Hub, ident identity) map[string]uint64 {
-	if ident.isGuest() {
-		return map[string]uint64{}
+	if !ident.isGuest() {
+		return h.SeqByHostFor(ident.hostScope())
 	}
-	return h.SeqByHost()
+	return map[string]uint64{}
 }
 
 // handleAccessRole: GET /api/access-role — the FE's role probe. Admin gets
@@ -343,8 +344,19 @@ func handleAccessRole(h *hub.Hub) http.HandlerFunc {
 			writeJSON(w, 401, map[string]any{"ok": false, "error": "需要有效的访问 token"})
 			return
 		}
-		if !id.isGuest() {
+		if id.isAdmin() {
 			writeJSON(w, 200, map[string]any{"ok": true, "role": "admin"})
+			return
+		}
+		if id.isUser() {
+			writeJSON(w, 200, map[string]any{
+				"ok":   true,
+				"role": "user",
+				"user": map[string]any{
+					"id":    id.UserID,
+					"label": id.Label,
+				},
+			})
 			return
 		}
 		writeJSON(w, 200, map[string]any{
@@ -412,16 +424,29 @@ func handleGuestSessions(h *hub.Hub) http.HandlerFunc {
 	}
 }
 
-// handleHosts is the registry listing. Guests only see the hosts their
-// token's sessions live on; admin behaviour is unchanged.
+// handleHosts is the registry listing. The admin account behaves as a
+// normal user here: it sees only hosts paired under root. Ordinary users
+// see only hosts they paired; guests see the hosts their session whitelist
+// names. Admin-only cross-user host inventory lives in GET /api/users.
 func handleHosts(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, identified := identityOf(r)
-		if !identified || !id.isGuest() {
+		if !identified {
 			writeJSON(w, 200, map[string]any{
-				"hosts":         h.ListHosts(),
-				"defaultHostId": h.DefaultHostID(),
+				"hosts":         h.ListHostsFor("root"),
+				"defaultHostId": h.DefaultHostIDFor("root"),
 			})
+			return
+		}
+		if !id.isGuest() {
+			payload := map[string]any{
+				"hosts":         h.ListHostsFor(id.hostScope()),
+				"defaultHostId": h.DefaultHostIDFor(id.hostScope()),
+			}
+			if id.isUser() {
+				payload["role"] = "user"
+			}
+			writeJSON(w, 200, payload)
 			return
 		}
 		allowed := map[string]bool{}
@@ -439,7 +464,7 @@ func handleHosts(h *hub.Hub) http.HandlerFunc {
 		sort.SliceStable(hosts, func(i, j int) bool { return hosts[i].HostID < hosts[j].HostID })
 		writeJSON(w, 200, map[string]any{
 			"hosts":         hosts,
-			"defaultHostId": id.defaultHost(),
+			"defaultHostId": id.defaultHost(h),
 			"role":          "guest",
 		})
 	}

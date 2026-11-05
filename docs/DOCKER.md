@@ -205,6 +205,9 @@ docker compose down                    # 或 docker stop <旧容器>
 mkdir -p data
 cp /opt/capri-hub/data/hub.json   data/     # ← 换成你的实际路径
 cp /opt/capri-hub/data/prefs.json data/ 2>/dev/null || true
+cp /opt/capri-hub/data/users.json data/ 2>/dev/null || true
+cp /opt/capri-hub/data/prefs-users.json data/ 2>/dev/null || true
+cp /opt/capri-hub/data/guests.json data/ 2>/dev/null || true
 
 # 这一步不能省。
 sudo chown -R 10001:10001 data

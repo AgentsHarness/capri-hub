@@ -195,6 +195,26 @@ func TestPairLimiter(t *testing.T) {
 	}
 }
 
+func TestAuthLimiterBlocksThenResets(t *testing.T) {
+	l := newAuthLimiter()
+	for i := 0; i < authFailureLimit; i++ {
+		if !l.allow("203.0.113.1") {
+			t.Fatalf("attempt %d should be allowed", i+1)
+		}
+		l.fail("203.0.113.1")
+	}
+	if l.allow("203.0.113.1") {
+		t.Fatal("IP should be blocked after failure limit")
+	}
+	l.reset("203.0.113.1")
+	if !l.allow("203.0.113.1") {
+		t.Fatal("successful authentication must clear the bucket")
+	}
+	if !l.allow("203.0.113.2") {
+		t.Fatal("other IPs must not be affected")
+	}
+}
+
 // TestHandleRelayRejectsOversizeBody: a relay body over the 5MB cap must
 // be rejected with 413, not silently truncated and forwarded to the host
 // as broken JSON.

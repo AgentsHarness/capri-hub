@@ -313,20 +313,22 @@ func (h *Hub) UpdateGuestToken(id string, label *string, expiresAt *int64, revok
 			hit.Label = "访客令牌"
 		}
 	}
+	expiryChanged := expiresAt != nil && *expiresAt != hit.ExpiresAt
+	wasActive := hit.Active(time.Now())
 	if expiresAt != nil {
 		hit.ExpiresAt = *expiresAt
 	}
-	wasActive := !hit.Revoked
 	if revoked != nil {
 		hit.Revoked = *revoked
 	}
 	out := cloneGuestToken(*hit)
-	drop := wasActive && out.Revoked
+	// Any revocation or expiry change invalidates the live page's snapshot.
+	// Dropping the socket forces re-authentication and a fresh whitelist
+	// instead of leaving an expired/revoked token reading events.
+	drop := wasActive && (out.Revoked || expiryChanged || out.Expired(time.Now()))
 	h.mu.Unlock()
 	h.persistGuestsNow()
 	if drop {
-		// 吊销立即生效：把这条令牌名下的 live WS 订阅者踢掉，而不是等它
-		// 重连时才在认证处被拒。
 		h.DropGuestSubscribers(id)
 	}
 	return out, nil
@@ -443,6 +445,10 @@ func (h *Hub) RemoveGuestSessions(id string, refs []GuestSessionRef) (GuestToken
 	out := cloneGuestToken(*hit)
 	h.mu.Unlock()
 	h.persistGuestsNow()
+	// A live guest subscriber copied this whitelist at registration time.
+	// Close it so a removed session cannot keep streaming until the tab
+	// happens to reconnect and fetch a new access-role snapshot.
+	h.DropGuestSubscribers(id)
 	return out, nil
 }
 

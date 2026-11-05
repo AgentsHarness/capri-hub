@@ -1093,6 +1093,32 @@ func TestRequestIP(t *testing.T) {
 	}
 }
 
+func TestRateLimitIP(t *testing.T) {
+	req := func(remote string, hdr map[string]string) *http.Request {
+		r := &http.Request{RemoteAddr: remote, Header: http.Header{}}
+		for k, v := range hdr {
+			r.Header.Set(k, v)
+		}
+		return r
+	}
+	// A loopback peer is the nginx hop; the real client comes from the
+	// proxy-set header. This is what keeps the pair quota per-client.
+	if got := rateLimitIP(req("127.0.0.1:5555", map[string]string{"CF-Connecting-IP": "203.0.113.20"})); got != "203.0.113.20" {
+		t.Errorf("CF client rate-limit IP = %q", got)
+	}
+	if got := rateLimitIP(req("127.0.0.1:5555", map[string]string{"X-Real-IP": "198.51.100.8"})); got != "198.51.100.8" {
+		t.Errorf("X-Real-IP rate-limit IP = %q", got)
+	}
+	// Direct peers cannot spoof the key.
+	if got := rateLimitIP(req("203.0.113.9:5555", map[string]string{"X-Real-IP": "1.2.3.4"})); got != "203.0.113.9" {
+		t.Errorf("direct peer rate-limit IP = %q", got)
+	}
+	// A malformed forwarding value must not create a fresh bucket key.
+	if got := rateLimitIP(req("127.0.0.1:5555", map[string]string{"CF-Connecting-IP": "not-an-ip"})); got != "127.0.0.1" {
+		t.Errorf("malformed forwarded IP = %q", got)
+	}
+}
+
 // TestSubscribersViewingFrame: an admin page declares the session it reads
 // with a `viewing` control frame (no ack), and the roster follows it —
 // including a clear when the page returns to no session.

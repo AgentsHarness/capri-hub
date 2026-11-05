@@ -24,8 +24,12 @@ type SubscriberInfo struct {
 	IP string
 	// UA is the browser User-Agent, truncated by the caller.
 	UA string
-	// Role is "admin" or "guest".
+	// Role is "admin", "user" or "guest".
 	Role string
+	// UserID / UserLabel name the users.json record behind an ordinary
+	// user socket. Empty for admin and guest sockets.
+	UserID    string
+	UserLabel string
 	// GuestID / GuestLabel name the guests.json record behind a guest
 	// socket. Both empty for admin sockets (the FE_TOKEN is the identity,
 	// and it is not echoed back).
@@ -41,6 +45,8 @@ type SubscriberRow struct {
 	IP          string `json:"ip,omitempty"`
 	UserAgent   string `json:"userAgent,omitempty"`
 	Role        string `json:"role"`
+	UserID      string `json:"userId,omitempty"`
+	UserLabel   string `json:"userLabel,omitempty"`
 	GuestID     string `json:"guestId,omitempty"`
 	GuestLabel  string `json:"guestLabel,omitempty"`
 	HostID      string `json:"hostId,omitempty"`
@@ -68,6 +74,8 @@ func (h *Hub) Subscribers() []SubscriberRow {
 			IP:          s.info.IP,
 			UserAgent:   s.info.UA,
 			Role:        s.info.Role,
+			UserID:      s.info.UserID,
+			UserLabel:   s.info.UserLabel,
 			GuestID:     s.info.GuestID,
 			GuestLabel:  s.info.GuestLabel,
 			HostID:      hostID,

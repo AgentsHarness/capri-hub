@@ -17,7 +17,6 @@ import (
 func TestPersistSerializesConcurrentWrites(t *testing.T) {
 	dir := t.TempDir()
 	h := NewWithDir(dir)
-	code, _ := h.PairingCode()
 
 	const hosts = 48
 	var wg sync.WaitGroup
@@ -26,9 +25,15 @@ func TestPersistSerializesConcurrentWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			id := fmt.Sprintf("h%02d", i)
-			if _, err := h.Pair(code, id, "name-"+id); err != nil {
-				t.Errorf("Pair(%s): %v", id, err)
+			// Codes are single-use; concurrent peers may consume the one we
+			// just read, so retry with the current code.
+			for attempt := 0; attempt < 8; attempt++ {
+				code, _ := h.PairingCode()
+				if _, err := h.Pair(code, id, "name-"+id); err == nil {
+					return
+				}
 			}
+			t.Errorf("Pair(%s): exhausted code retries", id)
 		}(i)
 	}
 	wg.Wait()

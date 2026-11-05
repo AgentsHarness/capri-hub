@@ -740,6 +740,13 @@ func (h *Hub) serveHost(expected string, t Transport) wire.CloseReason {
 	// socket write open.
 	t.SetWriteTimeout(idle * 3 / 4)
 	t.SetMaxFrame(SessionLimits.MaxFrame)
+	// QUIC request streams are accepted only now that hello's token has been
+	// verified. Starting them in newQUICTransport allowed an unauthenticated
+	// peer to fill the 64-slot frame queue with 32MB request frames before
+	// authentication. Other transports do not implement this hook.
+	if starter, ok := t.(interface{ StartRequestStreams() }); ok {
+		starter.StartRequestStreams()
+	}
 
 	s, old, ack, err := h.attach(hostID, hello.Epoch, hello.Resume.Up, hello.Resume.Down, deflate)
 	if err != nil {

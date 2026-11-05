@@ -104,15 +104,30 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 
 配对一次即可，token 记在那台机器的 `~/.capri-host/hub.json`。然后用浏览器打开 `https://<hub>`，输入刚才的 `FE_TOKEN`，从左上角切换 Host。
 
+## 多用户
+
+Hub 支持在一台实例上接入多个互相隔离的用户：
+
+- `FE_TOKEN` 是 root 管理员令牌，管理员在「设置 → 访问与分享 → 用户」里创建用户。
+- 创建用户时只展示一次明文 token；hub 只保存 SHA-256 哈希，之后管理员看不到它，只能重置 token 或删除用户。
+- 用户用自己的 token 登录后，打开「添加 Host」拿到的配对码属于该用户；用这个码配对的 host 只出现在该用户的 host 列表里。
+- 普通用户只能访问自己名下 host 的 `/api/*`、事件流和偏好设置。
+- 管理员在 host 列表里也只能看到自己配对的 host，无法访问其他用户的 host；管理员权限只体现在「用户」管理页，可查看每个用户配对的 host、创建用户、重置 token 和删除用户。管理员看不到用户 token。
+- 用户可以在「设置 → 账号」里自行更换 token，旧 token 立即失效。
+- 同一用户接多台 host 时请给每台设置不同的 `HOST_ID`；`HOST_ID` 默认是 `local`，复用同一个 id 会把上一台顶掉。
+
+用户数据保存在 `HUB_DATA_DIR/users.json`，每个用户的偏好保存在
+`prefs-users.json`。备份 Hub 时把这几个文件一起备份即可。
+
 ## 常用变量
 
 | 变量               | 默认   | 说明                                    |
 | ------------------ | ------ | --------------------------------------- |
 | `PORT`             | `8787` | HTTP 端口                               |
 | `QUIC_PORT`        | `8788` | Host 主通道（UDP）                      |
-| `FE_TOKEN`         | —      | 浏览器访问密钥。生产必设。与各台 Host 自己的 `FE_TOKEN` 相互独立，不要求同值 |
+| `FE_TOKEN`         | —      | root 管理员浏览器密钥；普通用户使用 `users.json` 中的用户 token。生产必设。与各台 Host 自己的 `FE_TOKEN` 相互独立，不要求同值 |
 | `REQUIRE_FE_TOKEN` | —      | 设为 `1` 时，没配 `FE_TOKEN` 会拒绝启动 |
-| `HUB_DATA_DIR`     | `~/.capri-hub` | 状态目录（`hub.json` / `prefs.json`）。容器部署设为 `/data` |
+| `HUB_DATA_DIR`     | `~/.capri-hub` | 状态目录（`hub.json` / `prefs.json` / `users.json` / `prefs-users.json` / `guests.json`）。容器部署设为 `/data` |
 | `QUIC_ALLOW_SELF_SIGNED` | — | 设了 `FE_TOKEN` 又没有真证书时，必须设为 `1`，否则 QUIC 关闭、Host 退回 WebSocket |
 | `CORS_ORIGINS`     | `*`    | 生产写成前端真实源                      |
 | `CAPRI_LOG_LEVEL`    | `info` | 设为 `debug` 才打印每条被拒事件的逐条明细（seq 回退、非对象事件跳过）；非法值回落 `info` |
