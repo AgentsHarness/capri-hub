@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,6 +108,7 @@ func main() {
 	if len(corsOrigins) > 0 {
 		log.Printf("[capri-hub] CORS origins: %s", strings.Join(corsOrigins, ", "))
 	}
+	log.Printf("[capri-hub] version %s", effectiveVersion())
 	log.Printf("[capri-hub] listening on http://localhost:%d", port)
 	log.Printf("[capri-hub] log level: %s (per-event detail: CAPRI_LOG_LEVEL=debug)", logLevel)
 
@@ -255,14 +257,43 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // version is stamped at build time via
-// go build -ldflags "-X main.version=<git-sha>-<timestamp>".
-// Fallback below is used for plain `go run` / `go build`.
+// go build -ldflags "-X main.version=<tag>".
+// Plain `go build` leaves it "dev"; effectiveVersion then falls back to the
+// VCS metadata Go embeds, so a local binary still identifies its revision.
 var version = "dev"
+
+// effectiveVersion is what /api/info and the startup log report.
+func effectiveVersion() string {
+	info, _ := debug.ReadBuildInfo()
+	return resolveVersion(version, info)
+}
+
+// resolveVersion keeps a stamped release version untouched. For "dev" it
+// derives dev-<shortsha> from the build's VCS settings; without VCS metadata
+// (module zip, -buildvcs=false) it stays the plain "dev" fallback.
+func resolveVersion(stamped string, info *debug.BuildInfo) string {
+	if stamped != "dev" || info == nil {
+		return stamped
+	}
+	var rev string
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" {
+			rev = s.Value
+		}
+	}
+	if rev == "" {
+		return stamped
+	}
+	if len(rev) > 7 {
+		rev = rev[:7]
+	}
+	return "dev-" + rev
+}
 
 func handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"service": "capri-hub",
-		"version": version,
+		"version": effectiveVersion(),
 		"modes":   []string{"pair", "host-ws", "host-quic", "relay", "fe-ws"},
 	})
 }

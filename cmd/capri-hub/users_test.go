@@ -168,6 +168,38 @@ func TestUserLifecycleAndTokenSelfService(t *testing.T) {
 	}
 }
 
+func TestUserListExposesHostVersion(t *testing.T) {
+	h, srv := newUsersTestServer(t, t.TempDir())
+	aliceID, alice := createUser(t, srv, "Alice")
+	code := pairingCodeFor(t, srv, alice)
+	_, hostID := pairHost(t, srv, code, "mac", "Alice Mac")
+
+	version := "v0.5.0"
+	if !h.UpdateHostStatus(hostID, hub.HostStatusPatch{Version: &version}) {
+		t.Fatal("UpdateHostStatus failed")
+	}
+
+	status, out, raw := callJSON(t, srv, "admin-secret", http.MethodGet, "/api/users", nil)
+	if status != 200 {
+		t.Fatalf("list status=%d body=%s", status, raw)
+	}
+	for _, rawUser := range out["users"].([]any) {
+		u := rawUser.(map[string]any)
+		if u["id"] != aliceID {
+			continue
+		}
+		hosts, _ := u["hosts"].([]any)
+		if len(hosts) != 1 {
+			t.Fatalf("alice hosts = %v", hosts)
+		}
+		if got := hosts[0].(map[string]any)["version"]; got != version {
+			t.Fatalf("host version = %v, want %q (body %s)", got, version, raw)
+		}
+		return
+	}
+	t.Fatalf("alice missing from user list: %s", raw)
+}
+
 func TestUserHostIsolationPairingAndForwarding(t *testing.T) {
 	_, srv := newUsersTestServer(t, t.TempDir())
 	aliceID, alice := createUser(t, srv, "Alice")

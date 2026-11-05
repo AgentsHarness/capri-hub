@@ -1223,7 +1223,7 @@ func TestSessionHeartbeatStatus(t *testing.T) {
 	fh := dialFakeHost(t, h, "h1", 1)
 
 	busy, ready := true, true
-	st := wire.HeartbeatStatus{Ready: ready, Busy: busy, PendingCount: 2, Port: 8765}
+	st := wire.HeartbeatStatus{Ready: ready, Busy: busy, PendingCount: 2, Port: 8765, Version: "v0.5.0"}
 	frame, err := wire.NewHeartbeat(0, st)
 	if err != nil {
 		t.Fatal(err)
@@ -1231,7 +1231,8 @@ func TestSessionHeartbeatStatus(t *testing.T) {
 	fh.send(frame)
 	waitFor(t, func() bool {
 		hosts := h.ListHosts()
-		return hosts[0].Busy && hosts[0].PendingCount == 2 && hosts[0].Port == 8765
+		return hosts[0].Busy && hosts[0].PendingCount == 2 && hosts[0].Port == 8765 &&
+			hosts[0].Version == "v0.5.0"
 	}, 2*time.Second)
 }
 

@@ -1078,6 +1078,7 @@ func (s *session) handleHeartbeat(f wire.Frame) wire.CloseReason {
 		Booting:      &st.Booting,
 		PendingCount: &st.PendingCount,
 		Port:         &st.Port,
+		Version:      &st.Version,
 	})
 	return 0
 }

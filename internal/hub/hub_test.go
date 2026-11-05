@@ -904,6 +904,7 @@ func TestUpdateHostStatus(t *testing.T) {
 
 	boolPtr := func(b bool) *bool { return &b }
 	intPtr := func(n int) *int { return &n }
+	strPtr := func(s string) *string { return &s }
 
 	ch, unsub := h.Subscribe()
 	defer unsub()
@@ -1003,6 +1004,29 @@ func TestUpdateHostStatus(t *testing.T) {
 		t.Errorf("invalid port must leave registry untouched, got %+v", hosts[0])
 	}
 
+	// Version flip updates the registry and broadcasts; an empty version
+	// from an older host must not erase the last known one.
+	if !h.UpdateHostStatus("h1", HostStatusPatch{Version: strPtr("v0.5.0")}) {
+		t.Fatal("UpdateHostStatus version flip failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Version != "v0.5.0" {
+		t.Errorf("registry version = %+v, want v0.5.0", hosts[0])
+	}
+	select {
+	case ev := <-ch:
+		if ev["type"] != "hosts_changed" {
+			t.Errorf("event = %v, want hosts_changed", ev["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no hosts_changed on version flip")
+	}
+	if !h.UpdateHostStatus("h1", HostStatusPatch{Version: strPtr("")}) {
+		t.Fatal("UpdateHostStatus empty version failed")
+	}
+	if hosts := h.ListHosts(); len(hosts) != 1 || hosts[0].Version != "v0.5.0" {
+		t.Errorf("empty version must leave registry untouched, got %+v", hosts[0])
+	}
+
 	if h.UpdateHostStatus("nope", HostStatusPatch{Ready: boolPtr(true)}) {
 		t.Error("UpdateHostStatus for unknown host should fail")
 	}
@@ -1022,6 +1046,22 @@ func TestPairPortAndPersist(t *testing.T) {
 	h2 := NewWithDir(dir)
 	if hosts := h2.ListHosts(); len(hosts) != 1 || hosts[0].Port != 8765 {
 		t.Fatalf("after restart port = %+v, want 8765", hosts)
+	}
+}
+
+// TestHostVersionPersists: the last version reported by a host survives a hub
+// restart, so an offline host still shows what it was running.
+func TestHostVersionPersists(t *testing.T) {
+	dir := t.TempDir()
+	h1 := NewWithDir(dir)
+	testPair(t, h1, "h1", "H1")
+	version := "v0.5.0"
+	if !h1.UpdateHostStatus("h1", HostStatusPatch{Version: &version}) {
+		t.Fatal("UpdateHostStatus failed")
+	}
+	h2 := NewWithDir(dir)
+	if hosts := h2.ListHosts(); len(hosts) != 1 || hosts[0].Version != "v0.5.0" {
+		t.Fatalf("after restart version = %+v, want v0.5.0", hosts)
 	}
 }
 

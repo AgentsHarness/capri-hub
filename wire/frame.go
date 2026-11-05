@@ -225,6 +225,9 @@ type HeartbeatStatus struct {
 	Booting      bool `json:"booting,omitempty"`
 	PendingCount int  `json:"pendingCount,omitempty"`
 	Port         int  `json:"port,omitempty"`
+	// Version is the host binary's build stamp (acp.Version host-side).
+	// Static per process; older hosts omit it and the field stays absent.
+	Version string `json:"version,omitempty"`
 }
 
 // Encode marshals f after validating it. It never assigns a seq: that is the

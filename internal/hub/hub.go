@@ -207,7 +207,11 @@ type HostInfo struct {
 	PendingCount int `json:"pendingCount,omitempty"`
 	// Port: host's local HTTP listen port (e.g. 8765). FE probes
 	// http://127.0.0.1:<port> for a same-machine shortcut.
-	Port          int       `json:"port,omitempty"`
+	Port int `json:"port,omitempty"`
+	// Version: host binary build stamp (acp.Version), learned from its
+	// heartbeat. Persisted so an offline host still shows its last known
+	// version; empty for hosts that predate the field.
+	Version       string    `json:"version,omitempty"`
 	LastSeen      time.Time `json:"lastSeen"`
 	LastSeenAgeMs int64     `json:"lastSeenAgeMs"`
 	Local         bool      `json:"local,omitempty"`
@@ -611,6 +615,7 @@ type persistHost struct {
 	OwnerID  string `json:"ownerId,omitempty"`
 	Ready    bool   `json:"ready"`
 	Port     int    `json:"port,omitempty"`
+	Version  string `json:"version,omitempty"`
 }
 
 // hostOwnerOrDefault normalizes an old hub.json entry (no ownerId) to the
@@ -638,7 +643,10 @@ func (h *Hub) load() {
 		}
 		ownerID := hostOwnerOrDefault(ph.OwnerID)
 		h.hosts[id] = &hostState{
-			info:    HostInfo{HostID: id, HostName: ph.HostName, OwnerID: ownerID, Ready: ph.Ready, Port: ph.Port},
+			info: HostInfo{
+				HostID: id, HostName: ph.HostName, OwnerID: ownerID,
+				Ready: ph.Ready, Port: ph.Port, Version: ph.Version,
+			},
 			ownerID: ownerID,
 		}
 	}
@@ -683,6 +691,7 @@ func (h *Hub) snapshotLocked() persistFile {
 			OwnerID:  hostOwnerOrDefault(hs.ownerID),
 			Ready:    hs.info.Ready,
 			Port:     hs.info.Port,
+			Version:  hs.info.Version,
 		}
 	}
 	return pf
@@ -1535,13 +1544,14 @@ type HostStatusPatch struct {
 	Booting      *bool
 	PendingCount *int
 	Port         *int
+	Version      *string
 }
 
 // UpdateHostStatus applies the status snapshot carried by a host heartbeat.
 // On any visible-field flip it updates the registry entry and broadcasts
 // hosts_changed. Returns false for unknown hosts. Does not touch the
-// transcript buffer. Port flips are also persisted (the FE may need the port
-// after a hub restart before the next heartbeat).
+// transcript buffer. Port and version flips are also persisted (the FE may
+// need them after a hub restart before the next heartbeat).
 func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 	h.mu.Lock()
 	hs := h.hosts[hostID]
@@ -1550,7 +1560,7 @@ func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 		return false
 	}
 	changed := false
-	portChanged := false
+	persistChanged := false
 	if p.Ready != nil && *p.Ready != hs.info.Ready {
 		hs.info.Ready = *p.Ready
 		changed = true
@@ -1572,10 +1582,17 @@ func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
 		if port > 0 && port <= 65535 && port != hs.info.Port {
 			hs.info.Port = port
 			changed = true
-			portChanged = true
+			persistChanged = true
 		}
 	}
-	persist := portChanged && h.dataFile != ""
+	// An empty version means an old host that predates the field; keep the
+	// last known value instead of erasing it on every heartbeat.
+	if p.Version != nil && *p.Version != "" && *p.Version != hs.info.Version {
+		hs.info.Version = *p.Version
+		changed = true
+		persistChanged = true
+	}
+	persist := persistChanged && h.dataFile != ""
 	if changed {
 		h.broadcast(hostsChanged())
 	}

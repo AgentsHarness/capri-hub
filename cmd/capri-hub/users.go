@@ -19,6 +19,7 @@ type userHostView struct {
 	HostName      string `json:"hostName"`
 	Online        bool   `json:"online"`
 	LastSeenAgeMs int64  `json:"lastSeenAgeMs,omitempty"`
+	Version       string `json:"version,omitempty"`
 }
 
 type userView struct {
@@ -39,6 +40,7 @@ func userViewFor(h *hub.Hub, u hub.User) userView {
 			HostName:      hi.HostName,
 			Online:        hi.Online,
 			LastSeenAgeMs: hi.LastSeenAgeMs,
+			Version:       hi.Version,
 		})
 	}
 	return userView{

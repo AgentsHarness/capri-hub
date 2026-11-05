@@ -313,7 +313,7 @@ still reaches the browser, and nothing is re-executed.
 ```json
 {"v":2,"type":"hb","ack":100,"probe":1201,"probeAck":1200,
  "relayAcks":[{"reqId":"7","chunk":2}],
- "status":{"ready":true,"busy":false,"booting":false,"pendingCount":0,"port":8765}}
+ "status":{"ready":true,"busy":false,"booting":false,"pendingCount":0,"port":8765,"version":"v0.5.0"}}
 ```
 
 - Sent every `liveness.keepalive` seconds, and immediately after a receive
@@ -329,6 +329,9 @@ still reaches the browser, and nothing is re-executed.
   when nothing is in flight.
 - Any received frame resets the idle timer.
 - `status` is a snapshot; a lost one is corrected by the next `hb`.
+- `status.version` is the host binary's build stamp (optional; older hosts
+  omit it). The hub keeps the last non-empty value and exposes it through
+  the registry.
 - No other liveness or state-ack frame exists.
 
 ### 5.6 Close
