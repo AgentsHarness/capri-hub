@@ -87,10 +87,11 @@ var errRelayProbe = errors.New("hub: relay preflight probe failed")
 // heartbeat later. Three keepalives are one RTO plus one heartbeat of margin;
 // a shorter deadline would fail requests whose frame a single loss delayed.
 //
-// Dispatch overrides this with the shorter interactiveAckWindow: a browser
-// request prefers a fast 503 over waiting out a retransmit, and the preflight
-// probe has already checked the link before the frame is written. Other
-// callers get this window.
+// Dispatch uses this window for every request that can have side effects.
+// Only RelayFastRead (an explicit idempotent-read allowlist) overrides it
+// with fastReadAckWindow; a fast read may fail on a single loss because the
+// browser can retry it. A non-idempotent request must outlive the RTO,
+// otherwise the hub could answer 503 while the host still executes it.
 func requestAckDeadline() time.Duration {
 	return 3 * time.Duration(SessionLiveness.Keepalive) * time.Second
 }
@@ -120,6 +121,14 @@ type reqAck struct {
 	reqID    string
 	window   time.Duration
 	deadline time.Time
+}
+
+// expiredRequest is one request whose ack deadline passed, with the budget
+// that actually fired. The window is captured here because the session's
+// general deadline is not necessarily the one used by a fast read.
+type expiredRequest struct {
+	reqID  string
+	window time.Duration
 }
 
 // sessionProto is the protocol state of one (hostId, epoch). It outlives a
@@ -379,16 +388,21 @@ func (p *sessionProto) nextRequestDeadline() (time.Time, bool) {
 }
 
 // expireRequests drops requests whose frame was never acked by now and reports
-// their reqIds, so the session can fail them without holding proto.mu.
-func (p *sessionProto) expireRequests(now time.Time) []string {
+// the reqId and the window that fired, so the session can fail them and log
+// the actual budget without holding proto.mu.
+func (p *sessionProto) expireRequests(now time.Time) []expiredRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var out []string
+	var out []expiredRequest
 	for seq, ra := range p.reqAcks {
 		if ra.deadline.IsZero() || now.Before(ra.deadline) {
 			continue
 		}
-		out = append(out, ra.reqID)
+		window := ra.window
+		if window <= 0 {
+			window = p.reqAckDeadline
+		}
+		out = append(out, expiredRequest{reqID: ra.reqID, window: window})
 		delete(p.reqAcks, seq)
 	}
 	return out
@@ -432,8 +446,9 @@ type session struct {
 	// deflate is the downlink compression capability echoed at handshake.
 	deflate bool
 
-	wake chan struct{}
-	stop chan struct{}
+	wake   chan struct{}
+	notify chan struct{}
+	stop   chan struct{}
 	// stopReason is the reason requestStop was called with; 0 means the loop
 	// is still deciding for itself.
 	stopReason atomic.Uint32
@@ -578,6 +593,17 @@ func (s *session) closeReason() wire.CloseReason {
 func (s *session) signal() {
 	select {
 	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// notifyAckTable asks the session loop to push a heartbeat now. Relay aborts
+// live in the ack table, so failing a request must not wait for the next
+// periodic heartbeat: the host may otherwise execute a prompt the browser has
+// already been told failed.
+func (s *session) notifyAckTable() {
+	select {
+	case s.notify <- struct{}{}:
 	default:
 	}
 }
@@ -877,6 +903,13 @@ func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReaso
 				return reason
 			}
 
+		case <-s.notify:
+			// Push a fresh ack table immediately (relay abort/done) instead
+			// of waiting for the next periodic heartbeat.
+			if reason := s.sendHeartbeat(); reason != 0 {
+				return reason
+			}
+
 		case <-w.progress:
 			// A completed write means bytes are moving again; restart the
 			// retransmit clock instead of replaying a frame that just left.
@@ -914,9 +947,9 @@ func (s *session) run(reader <-chan readResult, helloAck []byte) wire.CloseReaso
 					rtoAt = now.Add(rto)
 				}
 			}
-			for _, reqID := range s.proto.expireRequests(now) {
-				log.Printf("[capri-hub] host %s: request %s not acked within %s", s.hostID, reqID, s.proto.reqAckDeadline)
-				s.h.failRequest(s.hostID, reqID, 503, "host 未确认中继请求")
+			for _, expired := range s.proto.expireRequests(now) {
+				log.Printf("[capri-hub] host %s: request %s not acked within %s", s.hostID, expired.reqID, expired.window)
+				s.h.failRequest(s.hostID, expired.reqID, 503, "host 未确认中继请求")
 			}
 			frameClock := lastRecv
 			if a := s.transport.LastActivity(); a.After(frameClock) {

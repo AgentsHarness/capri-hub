@@ -26,12 +26,12 @@ func respondFrame(reqID string, seq uint64, status int, chunk []byte, more bool)
 	return f
 }
 
-// shortInteractiveAck shrinks the browser-facing ack window for one test.
-func shortInteractiveAck(t *testing.T, d time.Duration) {
+// shortFastReadAck shrinks the idempotent-read ack window for one test.
+func shortFastReadAck(t *testing.T, d time.Duration) {
 	t.Helper()
-	prev := interactiveAckWindow
-	interactiveAckWindow = d
-	t.Cleanup(func() { interactiveAckWindow = prev })
+	prev := fastReadAckWindow
+	fastReadAckWindow = d
+	t.Cleanup(func() { fastReadAckWindow = prev })
 }
 
 func findRelayAck(acks []wire.RelayAck, reqID string) (wire.RelayAck, bool) {
@@ -513,12 +513,10 @@ func TestSessionProbeCoalesces(t *testing.T) {
 	}
 }
 
-// An interactive request that is never acked fails alone with 503 + abort;
-// the session and other traffic keep working.
-func TestInteractiveAckDeadlineFailsOneRequest(t *testing.T) {
-	prev := interactiveAckWindow
-	interactiveAckWindow = 300 * time.Millisecond
-	t.Cleanup(func() { interactiveAckWindow = prev })
+// A fast read that is never acked fails alone with 503 + abort; the session
+// and other traffic keep working.
+func TestFastReadAckDeadlineFailsOneRequest(t *testing.T) {
+	shortFastReadAck(t, 300*time.Millisecond)
 	shortLiveness(t, 1, 10)
 
 	h := NewWithDir("")
@@ -526,7 +524,7 @@ func TestInteractiveAckDeadlineFailsOneRequest(t *testing.T) {
 	fh := dialFakeHost(t, h, "h1", 1)
 
 	start := time.Now()
-	resp, err := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
+	resp, err := h.DispatchFastRead(context.Background(), "h1", "GET", "/api/status", nil)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
@@ -534,12 +532,27 @@ func TestInteractiveAckDeadlineFailsOneRequest(t *testing.T) {
 	if resp.Status != 503 {
 		t.Fatalf("status = %d, want 503", resp.Status)
 	}
-	if elapsed < interactiveAckWindow {
-		t.Fatalf("failed after %s, before the %s window", elapsed, interactiveAckWindow)
+	if elapsed < fastReadAckWindow {
+		t.Fatalf("failed after %s, before the %s window", elapsed, fastReadAckWindow)
 	}
 	req := fh.recvType(wire.TypeRequest, 2*time.Second)
 	if a, ok := findRelayAck(h.relayAcks("h1"), req.ReqID); !ok || !a.Abort {
 		t.Fatalf("expired request tombstone = %+v (found %v), want abort", a, ok)
+	}
+
+	// The abort must reach the host on the wire immediately, not on the next
+	// 1s keepalive: the host could otherwise start executing the request
+	// after the browser already received 503.
+	abortDeadline := time.Now().Add(500 * time.Millisecond)
+	sawAbort := false
+	for !sawAbort {
+		f := fh.recv(time.Until(abortDeadline))
+		if f.Type != wire.TypeHeartbeat {
+			continue
+		}
+		if a, ok := findRelayAck(f.RelayAcks, req.ReqID); ok && a.Abort {
+			sawAbort = true
+		}
 	}
 
 	// The session survives: a later event is still applied.
@@ -575,6 +588,19 @@ func TestDispatchCancelAddsAbortTombstone(t *testing.T) {
 	}
 	if a, ok := findRelayAck(h.relayAcks("h1"), req.ReqID); !ok || !a.Abort {
 		t.Fatalf("cancel tombstone = %+v (found %v), want abort", a, ok)
+	}
+	// Cancellation must push the abort immediately too, so a prompt that
+	// arrives after the tab closed is not executed.
+	abortDeadline := time.Now().Add(500 * time.Millisecond)
+	sawAbort := false
+	for !sawAbort {
+		f := fh.recv(time.Until(abortDeadline))
+		if f.Type != wire.TypeHeartbeat {
+			continue
+		}
+		if a, ok := findRelayAck(f.RelayAcks, req.ReqID); ok && a.Abort {
+			sawAbort = true
+		}
 	}
 	// The host may still finish; the session itself remains healthy.
 	fh.events(1, 0, chunkEvent(1, "alive"))

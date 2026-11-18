@@ -2124,3 +2124,65 @@ func hubRaw(h *Hub, hostID string, ev Event) bool {
 	}
 	return testIngest(h, hostID, []json.RawMessage{b})
 }
+
+// TestRelayPolicyFor: only the explicit read-only allowlist gets the fast
+// budget. Every mutating or unknown route keeps the reliability deadline.
+func TestRelayPolicyFor(t *testing.T) {
+	cases := []struct {
+		method, path string
+		want         RelayPolicy
+	}{
+		{"GET", "/api/status", RelayFastRead},
+		{"POST", "/api/session-updates", RelayReliable},
+		{"POST", "/api/sessions", RelayFastRead},
+		{"GET", "/api/settings", RelayFastRead},
+		{"POST", "/api/settings", RelayReliable},
+		{"POST", "/api/prompt", RelayReliable},
+		{"POST", "/api/host/quit", RelayReliable},
+		{"POST", "/api/session-delete", RelayReliable},
+		{"POST", "/api/unknown", RelayReliable},
+	}
+	for _, tc := range cases {
+		if got := RelayPolicyFor(tc.method, tc.path); got != tc.want {
+			t.Errorf("RelayPolicyFor(%s %s) = %v, want %v", tc.method, tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestDispatchDefaultKeepsReliableWindow: Dispatch (the default used by
+// non-read callers) must not inherit the short fast-read budget. A prompt
+// whose request frame is briefly unacked has to survive one RTO.
+func TestDispatchDefaultKeepsReliableWindow(t *testing.T) {
+	shortFastReadAck(t, 100*time.Millisecond)
+	shortLiveness(t, 1, 10) // reliable deadline = 3s
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	start := time.Now()
+	done := make(chan RelayResponse, 1)
+	go func() {
+		resp, _ := h.Dispatch(context.Background(), "h1", "POST", "/api/prompt", nil)
+		done <- resp
+	}()
+	req := fh.recvType(wire.TypeRequest, 2*time.Second)
+	select {
+	case resp := <-done:
+		t.Fatalf("default dispatch failed after %s: %+v", time.Since(start), resp)
+	case <-time.After(400 * time.Millisecond):
+		// Still waiting: the fast-read window did not apply.
+	}
+	fh.send(wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeHeartbeat, Ack: req.Seq, Status: json.RawMessage(`{}`)})
+	fh.send(wire.Frame{
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: req.Seq, ChunkSeq: 1,
+		ReqID: req.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
+	})
+	select {
+	case resp := <-done:
+		if resp.Status != 200 {
+			t.Fatalf("status = %d, want 200", resp.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("dispatch did not resolve after the request was answered")
+	}
+}

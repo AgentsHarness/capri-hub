@@ -16,6 +16,12 @@ const (
 	BusyKeepalive = 1 * time.Second // hb cadence while a turn is active
 )
 
+// AckDelay bounds how long a host may hold a newly advanced down ack before
+// emitting it. Acks still piggyback on any outbound frame; this is the
+// delayed-ACK timer for the quiet-link case, where the periodic heartbeat is
+// otherwise the only carrier and its interval would become the ack latency.
+const AckDelay = 20 * time.Millisecond
+
 // Defaults. Liveness and Limits are advertised by the hub in hello_ack; these
 // are what a fresh peer assumes and what the hub itself uses. Treat them as
 // read-only.

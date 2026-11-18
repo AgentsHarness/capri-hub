@@ -66,7 +66,10 @@ Every host↔hub JSON frame has:
 
 - `seq` is present on reliable frames and absent (or 0) on unreliable ones.
 - `ack` is present on every frame that can carry it. It acknowledges the
-  opposite direction's reliable frames.
+  opposite direction's reliable frames. A peer that has advanced its receive
+  watermark MUST put the new `ack` on an outbound frame within `AckDelay`
+  (20ms) even when it has no application data to send; the periodic
+  heartbeat is a liveness clock, not the maximum ack latency.
 - `epoch` appears only in `hello` / `hello_ack`; every other frame belongs
   to the session's epoch implicitly. `hubBoot` appears only in `hello_ack`
   and identifies the hub process for the life of the session.
@@ -252,11 +255,15 @@ is the repair path.
 ```
 
 - Delivery is proven by the host's cumulative `ack`. The hub fails a
-  request if its frame is not acked within the request ack deadline, which
-  is `3*keepalive` (one RTO of `2*keepalive` to retransmit a lost frame plus
-  one heartbeat of margin, so a single loss never fails a request the
-  session repaired). It fails a request if no response arrives within
+  request if its frame is not acked within the request ack deadline. The
+  default is `3*keepalive` (one RTO of `2*keepalive` to retransmit a lost
+  frame plus one heartbeat of margin, so a single loss never fails a request
+  the session repaired). It fails a request if no response arrives within
   `RelayTimeout` (45m).
+- An explicit allowlist of health probes and small idempotent reads MAY use
+  a shorter fast-read deadline (5s). Those requests are safe to retry and
+  may fail on a single lost frame; data-bearing reads, mutating requests and
+  every non-idempotent request MUST use the `3*keepalive` deadline.
 - No "host sent any uplink frame since dispatch" heuristic.
 
 ### 5.4 `respond` (host → hub, relay plane)

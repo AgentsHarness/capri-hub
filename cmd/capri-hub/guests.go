@@ -175,7 +175,8 @@ func handleGuestTokenRefresh(h *hub.Hub) http.HandlerFunc {
 		for _, hostID := range hosts {
 			scan := hostScan{titles: map[string]string{}, cwds: map[string]string{}, ok: false}
 			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-			resp, err := h.Dispatch(ctx, hostID, http.MethodPost, "/api/sessions", json.RawMessage(`{}`))
+			resp, err := h.DispatchPolicy(ctx, hostID, http.MethodPost, "/api/sessions", json.RawMessage(`{}`),
+				hub.RelayPolicyFor(http.MethodPost, "/api/sessions"))
 			cancel()
 			if err != nil || resp.Status < 200 || resp.Status > 299 {
 				scans[hostID] = scan

@@ -927,14 +927,15 @@ func TestSessionRequestAckDeadline(t *testing.T) {
 	if want := 3 * time.Duration(SessionLiveness.Keepalive) * time.Second; derived != want {
 		t.Fatalf("general request ack deadline = %s, want 3*keepalive = %s", derived, want)
 	}
-	// Dispatch uses the short interactive window; shrink it so this test does
-	// not wait the production 5s.
-	shortInteractiveAck(t, 3*time.Second)
-	deadline := interactiveAckWindow
+	// A fast read uses the short window; shrink it so this test does not
+	// wait the production 5s.
+	shortFastReadAck(t, 3*time.Second)
+	deadline := fastReadAckWindow
 
-	// The fake host never acks, so the dispatch must fail on its deadline.
+	// The fake host never acks, so the fast-read dispatch must fail on its
+	// deadline.
 	start := time.Now()
-	resp, err := h.Dispatch(t.Context(), "h1", "GET", "/api/status", nil)
+	resp, err := h.DispatchFastRead(t.Context(), "h1", "GET", "/api/status", nil)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
@@ -961,7 +962,12 @@ func TestSessionRequestAckDeadline(t *testing.T) {
 // request the session already repaired; it is 3*keepalive for exactly that
 // reason.
 func TestSessionRequestSurvivesOneLostFrame(t *testing.T) {
-	shortLiveness(t, 1, 5)
+	// Production liveness: keepalive 5s -> RTO 10s -> deadline 15s. The old
+	// 5s interactive window fails this test, which is exactly the regression
+	// this test now guards. The fake host does not answer probes, so push
+	// the probe horizon past this test's 10s retransmit.
+	shortLiveness(t, 5, 20)
+	shortProbe(t, 30*time.Second, 3*time.Second)
 	h := NewWithDir("")
 	testPair(t, h, "h1", "H1")
 	fh := dialFakeHost(t, h, "h1", 1)
@@ -972,9 +978,6 @@ func TestSessionRequestSurvivesOneLostFrame(t *testing.T) {
 	h.mu.Unlock()
 	if general <= rto {
 		t.Fatalf("general request ack deadline %s does not outlive the %s retransmit timer", general, rto)
-	}
-	if interactiveAckWindow <= rto {
-		t.Fatalf("interactive ack window %s does not outlive the %s retransmit timer", interactiveAckWindow, rto)
 	}
 
 	done := make(chan RelayResponse, 1)
@@ -1649,14 +1652,14 @@ func TestRequestAckDeadlineStartsAtWriteCompletion(t *testing.T) {
 	testPair(t, h, "h1", "H1")
 	fh := dialFakeHost(t, h, "h1", 1)
 
-	shortInteractiveAck(t, time.Second)
-	deadline := interactiveAckWindow
+	shortFastReadAck(t, time.Second)
+	deadline := fastReadAckWindow
 
 	release := make(chan struct{})
 	fh.ft.setBlock(release)
 	done := make(chan RelayResponse, 1)
 	go func() {
-		resp, _ := h.Dispatch(context.Background(), "h1", "GET", "/api/status", nil)
+		resp, _ := h.DispatchFastRead(context.Background(), "h1", "GET", "/api/status", nil)
 		done <- resp
 	}()
 	waitWriterBusy(t, h, "h1")
@@ -1680,6 +1683,58 @@ func TestRequestAckDeadlineStartsAtWriteCompletion(t *testing.T) {
 		}
 	case <-time.After(deadline + 3*time.Second):
 		t.Fatal("request did not fail after the write deadline")
+	}
+}
+
+// TestSessionUpdatesSurvivesFiveSecondAck: the observed production failure
+// was an ack arriving at 5.0012s against a 5.000s window. session-updates is
+// a data-bearing read, so it must use the reliable 15s deadline and return
+// the answer instead of 503 at the old boundary.
+func TestSessionUpdatesSurvivesFiveSecondAck(t *testing.T) {
+	shortLiveness(t, 5, 20)
+	shortProbe(t, 30*time.Second, 3*time.Second)
+	h := NewWithDir("")
+	testPair(t, h, "h1", "H1")
+	fh := dialFakeHost(t, h, "h1", 1)
+
+	done := make(chan RelayResponse, 1)
+	go func() {
+		resp, _ := h.DispatchPolicy(context.Background(), "h1", "POST", "/api/session-updates", nil,
+			RelayPolicyFor("POST", "/api/session-updates"))
+		done <- resp
+	}()
+	req := fh.recvType(wire.TypeRequest, 2*time.Second)
+	time.Sleep(5100 * time.Millisecond)
+	fh.send(wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeHeartbeat, Ack: req.Seq, Status: json.RawMessage(`{}`)})
+	fh.send(wire.Frame{
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: req.Seq, ChunkSeq: 1,
+		ReqID: req.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
+	})
+	select {
+	case resp := <-done:
+		if resp.Status != 200 {
+			t.Fatalf("status = %d, want 200; the reliable deadline should survive a 5.1s ack", resp.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("dispatch did not resolve after the 5.1s ack")
+	}
+}
+
+// TestProductionLivenessAckDeadline: with the production time scale the
+// general deadline is 15s and always outlives the 10s retransmit timer. This
+// is the invariant the old fixed 5s interactive window violated.
+func TestProductionLivenessAckDeadline(t *testing.T) {
+	prev := SessionLiveness
+	SessionLiveness = wire.DefaultLiveness
+	t.Cleanup(func() { SessionLiveness = prev })
+
+	p := newSessionProto(1, 0, 8)
+	rto := 2 * time.Duration(SessionLiveness.Keepalive) * time.Second
+	if want := 3 * time.Duration(SessionLiveness.Keepalive) * time.Second; p.reqAckDeadline != want {
+		t.Fatalf("production request ack deadline = %s, want %s", p.reqAckDeadline, want)
+	}
+	if p.reqAckDeadline <= rto {
+		t.Fatalf("production request ack deadline %s does not outlive the %s retransmit timer", p.reqAckDeadline, rto)
 	}
 }
 

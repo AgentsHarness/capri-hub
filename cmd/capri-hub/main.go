@@ -1904,7 +1904,7 @@ func handleRelay(h *hub.Hub) http.HandlerFunc {
 			}
 			body = next
 		}
-		resp, err := h.Dispatch(r.Context(), hostID, r.Method, r.URL.Path, body)
+		resp, err := h.DispatchPolicy(r.Context(), hostID, r.Method, r.URL.Path, body, hub.RelayPolicyFor(r.Method, r.URL.Path))
 		if err != nil {
 			var re *hub.RelayError
 			if errors.As(err, &re) {

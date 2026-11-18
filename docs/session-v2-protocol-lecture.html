@@ -409,7 +409,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <tr><td>没人观看的会话只传“页码”，不传正文</td><td><code>audience{watchers,sessions,all}</code> + <code>trimmed</code> 占位</td><td class="mono">watchers == 0 → 暂停上行</td></tr>
           <tr><td>正常断开，页面立刻变灰</td><td>传输层 FIN/RST → <code>detach</code> → <code>hosts_changed</code></td><td class="mono">1 个网络往返</td></tr>
           <tr><td>输出中突然没声，几秒内出现“连接中断”</td><td>busy 心跳 1s + FE 静默探针 2s / stale 3.5s + 协议 probe 7s/3s</td><td class="mono">约 10s 判死</td></tr>
-          <tr><td>没输出时发请求，失败也能马上知道</td><td>2s 新鲜窗 + 1.5s preflight + 5s 交互 ack 期限</td><td class="mono">失败即 503，不发 request</td></tr>
+          <tr><td>没输出时发请求，失败也能马上知道</td><td>2s 新鲜窗 + 1.5s preflight + 5s 只读 ack 期限</td><td class="mono">失败即 503，不发 request</td></tr>
         </tbody>
       </table>
     </div>
@@ -1569,7 +1569,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <h3><span class="h3no">7.2</span>request 写出去之后：两本账，各管一段</h3>
     <p>预检通过，不代表答案一定回来。v2 把后续拆成两个独立的问题：</p>
     <ol>
-      <li><strong>请求送达了吗？</strong>看 host 的累计 <code>ack</code>。request 走会话可靠日志，丢了按 RTO 重传。服务端请求的 ack 期限是 <code>3 × keepalive = 15s</code>，足够覆盖一次 10s 的 RTO；浏览器交互请求为了快速失败，使用 <code>interactiveAckWindow = 5s</code>，超时只失败这一单并给 host 记一个 abort。</li>
+      <li><strong>请求送达了吗？</strong>看 host 的累计 <code>ack</code>。request 走会话可靠日志，丢了按 RTO 重传。所有会产生副作用或承载数据的请求，ack 期限是 <code>3 × keepalive = 15s</code>，足够覆盖一次 10s 的 RTO；只有显式白名单里的健康探针和轻量只读接口使用 <code>fastReadAckWindow = 5s</code> 快速失败，失败后浏览器可以安全重试；session-updates 这类承载数据的读走可靠期限。超时只失败这一单并给 host 记一个 abort。</li>
       <li><strong>答案回来了吗？</strong>看中继面。<code>respond</code> 按 <code>chunkSeq</code> 分块，hub 用 <code>relayAcks</code> 告诉 host“我收到第几块”。如果 host 已确认请求但迟迟没有答案，就进入 <code>RelayTimeout</code>（45 分钟）的 RPC 等待；host 自己设 40 分钟先失败，保证错因来自更近的一侧。</li>
     </ol>
     <p>两本账不能混：把“答案慢”当成“请求没送到”，会重复执行；把“请求没送到”当成“答案慢”，会让浏览器白等。v2 的解决办法是让 <code>request</code> 和 <code>respond</code> 各用各的序号与确认表，谁也不替谁背锅。</p>
@@ -1726,7 +1726,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <tr><td>P2 按观看者省流</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-host/internal/hub/client.go</code><br><code>acp-host/internal/hub/session.go</code></td><td><code>viewingSetLocked</code>、<code>audienceLocked</code>、<code>SetSubscriberViewing</code>、<code>setAudience</code>、<code>trimUnwatched</code></td></tr>
           <tr><td>P3 正常断开</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-hub/cmd/capri-hub/main.go</code></td><td><code>detach</code>、<code>hostsChanged</code>、<code>Online</code>/<code>LastSeen</code></td></tr>
           <tr><td>P4 输出中断</td><td><code>acp-host/internal/hub/session.go</code><br><code>acp-host/internal/hub/writer.go</code><br><code>acp-fe/src/store/chat/actions/hosts.ts</code><br><code>acp-fe/src/components/composer/Composer.tsx</code></td><td><code>hbInterval</code>、<code>BusyKeepalive</code>、<code>SplitFrame</code>、<code>SILENCE_PROBE_AFTER_MS</code>、<code>HOST_HEARTBEAT_STALE_MS</code>、<code>probeHostHeartbeat</code></td></tr>
-          <tr><td>P5 请求预检</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-hub/internal/hub/session.go</code><br><code>acp-host/internal/hub/relay_outbox.go</code></td><td><code>Dispatch</code>、<code>relayHealthWindow</code>、<code>relayProbeTimeout</code>、<code>interactiveAckWindow</code>、<code>relayAcks</code>、<code>relayOutbox</code></td></tr>
+          <tr><td>P5 请求预检</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-hub/internal/hub/session.go</code><br><code>acp-host/internal/hub/relay_outbox.go</code></td><td><code>DispatchPolicy</code>、<code>relayHealthWindow</code>、<code>relayProbeTimeout</code>、<code>fastReadAckWindow</code>、<code>relayAcks</code>、<code>relayOutbox</code></td></tr>
         </tbody>
       </table>
     </div>
@@ -1737,7 +1737,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
         <span class="k">return</span> RelayResponse{}, &amp;RelayError{Status: <span class="n">503</span>, Message: <span class="s">"host 正在重连"</span>}
     }
 }
-<span class="c">// 通过之后才 sess.dispatch(reqID, ..., interactiveAckWindow)</span></code></pre>
+<span class="c">// 通过之后才 sess.dispatch(reqID, ..., 策略窗口)</span></code></pre>
     <p class="codecap">这段代码就是“无输出断开发送请求时可感知”的核心：预检失败不写 request，因此不会留下晚点自己执行的幽灵。</p>
 
     <div class="box note">
@@ -2019,7 +2019,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <tr><td rowspan="4">中继</td><td class="mono">relayChunkSize</td><td class="mono">256 KiB</td><td>host 每个 respond 块的负载</td></tr>
           <tr><td class="mono">RelayTimeout</td><td class="mono">45m</td><td>已确认请求等待答案的上限</td></tr>
           <tr><td class="mono">host relay timeout</td><td class="mono">40m</td><td>host 侧先失败，给更近的错因</td></tr>
-          <tr><td class="mono">interactiveAckWindow</td><td class="mono">5s</td><td>浏览器请求帧未 ack 的失败期限</td></tr>
+          <tr><td class="mono">fastReadAckWindow</td><td class="mono">5s</td><td>只读请求帧未 ack 的快速失败期限</td></tr>
           <tr><td rowspan="3">预检</td><td class="mono">relayHealthWindow</td><td class="mono">2s</td><td>最近有帧则跳过 preflight</td></tr>
           <tr><td class="mono">relayProbeTimeout</td><td class="mono">1.5s</td><td>preflight probe 等待上限</td></tr>
           <tr><td class="mono">general request ack</td><td class="mono">15s</td><td>3 × keepalive，非浏览器请求</td></tr>

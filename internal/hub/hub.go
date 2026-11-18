@@ -117,12 +117,59 @@ var (
 	relayTombstoneTTL         = 5 * time.Minute
 )
 
-// interactiveAckWindow is how long a browser-facing (interactive) request may
-// stay unacked before the hub fails just that request. It is deliberately
-// shorter than the general requestAckDeadline: an interactive caller prefers
-// a fast 503 over waiting out a retransmit, and the preflight probe already
-// checked the link before the frame was written.
-var interactiveAckWindow = 5 * time.Second
+// fastReadAckWindow is the delivery budget for an idempotent read. Reads may
+// fail fast because the browser can safely retry them; it is deliberately
+// shorter than requestAckDeadline, which is the reliability deadline reserved
+// for requests with side effects. Everything not on fastReadRoutes uses that
+// reliability deadline, so a single lost frame cannot fail a prompt.
+var fastReadAckWindow = 5 * time.Second
+
+// RelayPolicy selects the delivery-failure budget for one relayed request.
+type RelayPolicy uint8
+
+const (
+	// RelayReliable waits out one retransmit: the deadline is 3*keepalive,
+	// always above the 2*keepalive RTO. This is the default because a
+	// non-idempotent request that was actually executed must not be failed
+	// early and retried by the user.
+	RelayReliable RelayPolicy = iota
+	// RelayFastRead fails an idempotent read early. A retry is safe, so the
+	// browser prefers a fast 503 over waiting out a retransmit.
+	RelayFastRead
+)
+
+// fastReadRoutes is a strict allowlist of read-only relayed endpoints. They
+// may fail with fastReadAckWindow and be retried by the browser. Anything
+// absent, including every unrecognised path and every mutating POST, uses
+// RelayReliable. Keep this list read-only: a write classified as a fast read
+// could be executed after the hub already returned 503.
+var fastReadRoutes = map[string]bool{
+	"GET /api/status":         true,
+	"GET /api/probe":          true,
+	"GET /api/mcp/list":       true,
+	"GET /api/extensions":     true,
+	"GET /api/settings":       true,
+	"POST /api/sessions":      true,
+	"POST /api/session-state": true,
+}
+
+// RelayPolicyFor classifies a browser request. The default is reliable;
+// only the read-only allowlist above opts into the fast path.
+func RelayPolicyFor(method, path string) RelayPolicy {
+	if fastReadRoutes[method+" "+path] {
+		return RelayFastRead
+	}
+	return RelayReliable
+}
+
+// ackWindow returns the per-request ack budget; zero means the session's
+// general requestAckDeadline (3*keepalive).
+func (p RelayPolicy) ackWindow() time.Duration {
+	if p == RelayFastRead {
+		return fastReadAckWindow
+	}
+	return 0
+}
 
 // EventBufGrace is how long after a host disconnect we keep its gap-pull
 // buffer so a short blip can still be filled via GET /api/events. Zero
@@ -1364,6 +1411,7 @@ func (h *Hub) attach(hostID string, epoch, resumeUp, resumeDown uint64, deflate 
 		epoch:  epoch,
 		proto:  hs.proto,
 		wake:   make(chan struct{}, 1),
+		notify: make(chan struct{}, 1),
 		stop:   make(chan struct{}),
 	}
 	// The hello handshake is itself a fresh frame; a Dispatch that races the
@@ -1508,9 +1556,19 @@ func (h *Hub) failRequest(hostID, reqID string, status int, message string) {
 		h.addAbortTombstoneLocked(hostID, reqID)
 		pr.parked = nil
 	}
+	var sess *session
+	if hs := h.hosts[hostID]; hs != nil {
+		sess = hs.session
+	}
 	h.mu.Unlock()
 	if pr == nil {
 		return
+	}
+	// The abort lives in the ack table; push it now rather than waiting for
+	// the next heartbeat. The host may still execute a non-cancellable
+	// request if the abort arrives after the request frame.
+	if sess != nil {
+		sess.notifyAckTable()
 	}
 	pr.chunks = nil
 	body, _ := json.Marshal(map[string]any{"ok": false, "error": message})
@@ -2061,8 +2119,22 @@ func (h *Hub) EventsAfter(hostID string, after uint64) []Event {
 
 // ── request relay ─────────────────────────────────────────────────────
 
-// Dispatch relays a browser request to a host and waits for its answer.
-// The host must have a live stream; otherwise a *RelayError is returned.
+// Dispatch relays a browser request to a host with the reliable delivery
+// deadline (3*keepalive). It is the default entry point: callers that know a
+// request is an idempotent read may use DispatchPolicy with RelayFastRead.
+func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body json.RawMessage) (RelayResponse, error) {
+	return h.DispatchPolicy(ctx, hostID, method, path, body, RelayReliable)
+}
+
+// DispatchFastRead relays an idempotent read with the short delivery budget.
+// It is a convenience for tests and internal callers that already know the
+// request is safe to retry; production HTTP traffic goes through
+// DispatchPolicy with RelayPolicyFor.
+func (h *Hub) DispatchFastRead(ctx context.Context, hostID, method, path string, body json.RawMessage) (RelayResponse, error) {
+	return h.DispatchPolicy(ctx, hostID, method, path, body, RelayFastRead)
+}
+
+// DispatchPolicy relays a browser request with an explicit delivery policy.
 //
 // ctx is the BROWSER's request context. When it is cancelled (tab closed,
 // navigation, mobile network drop) the wait is abandoned and the pending
@@ -2073,7 +2145,11 @@ func (h *Hub) EventsAfter(hostID string, after uint64) []Event {
 // cancel the host-side work: the prompt keeps running on the agent (that is
 // the point of the server-authoritative design) and its output still
 // reaches browsers over the event stream.
-func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body json.RawMessage) (RelayResponse, error) {
+func (h *Hub) DispatchPolicy(ctx context.Context, hostID, method, path string, body json.RawMessage, policy RelayPolicy) (RelayResponse, error) {
+	return h.dispatchWithWindow(ctx, hostID, method, path, body, policy.ackWindow())
+}
+
+func (h *Hub) dispatchWithWindow(ctx context.Context, hostID, method, path string, body json.RawMessage, window time.Duration) (RelayResponse, error) {
 	reqID := fmt.Sprintf("%d", h.nextReq.Add(1))
 
 	h.mu.Lock()
@@ -2139,9 +2215,8 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 
 	// Delivery is the session's problem: the frame is logged and retransmitted
 	// until the host's cumulative ack covers it. A frame that stays unacked
-	// past the interactive ack window fails this request alone (see
-	// session.run).
-	if err := sess.dispatch(reqID, method, path, body, interactiveAckWindow); err != nil {
+	// past the per-request window fails this request alone (see session.run).
+	if err := sess.dispatch(reqID, method, path, body, window); err != nil {
 		h.dropPending(hostID, reqID)
 		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
 	}
@@ -2176,16 +2251,20 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 
 func (h *Hub) dropPending(hostID, reqID string) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if m := h.pending[hostID]; m != nil {
-		if pr, ok := m[reqID]; ok {
-			delete(m, reqID)
-			h.addAbortTombstoneLocked(hostID, reqID)
-			pr.parked = nil
-		}
-		if len(m) == 0 {
-			delete(h.pending, hostID)
-		}
+	pr := h.takePendingLocked(hostID, reqID)
+	if pr != nil {
+		h.addAbortTombstoneLocked(hostID, reqID)
+		pr.parked = nil
+	}
+	var sess *session
+	if hs := h.hosts[hostID]; hs != nil {
+		sess = hs.session
+	}
+	h.mu.Unlock()
+	// Browser cancel / relay timeout also creates an abort: tell the host
+	// immediately so a late request is not executed after the browser left.
+	if pr != nil && sess != nil {
+		sess.notifyAckTable()
 	}
 }
 
