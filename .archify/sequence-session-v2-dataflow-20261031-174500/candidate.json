@@ -1,0 +1,371 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Capri Session v2 正常数据流",
+    "locale": "zh-CN",
+    "output": "docs/session-v2-dataflow.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/AgentsHarness/capri-hub",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "824e9f96b03ac6a00442c7d2c02930b88f81685b"
+    },
+    "views": [
+      {
+        "id": "handshake",
+        "label": "握手与会话",
+        "focus": [
+          "host",
+          "hub",
+          "fe"
+        ],
+        "note": "hello 建立 (hostId, epoch) 会话；hello_ack 下发权威水位、观众快照、时标与上限。"
+      },
+      {
+        "id": "events",
+        "label": "事件上行与扇出",
+        "focus": [
+          "agent",
+          "host",
+          "hub",
+          "fe"
+        ],
+        "note": "事件 seq 就是会话上行 seq；hub 逐事件推进水位并扇出给 /ws/fe。"
+      },
+      {
+        "id": "relay",
+        "label": "中继请求与响应",
+        "focus": [
+          "fe",
+          "hub",
+          "host",
+          "agent"
+        ],
+        "note": "request 走下行可靠序列，respond 走独立 relay 平面。"
+      },
+      {
+        "id": "liveness",
+        "label": "心跳与正常关闭",
+        "focus": [
+          "host",
+          "hub",
+          "fe"
+        ],
+        "note": "keepalive 与 idle 两个数字维持会话；关闭由传输层 CloseReason 表达。"
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "agent",
+      "type": "backend",
+      "label": "grok-build",
+      "sublabel": "ACP agent"
+    },
+    {
+      "id": "host",
+      "type": "backend",
+      "label": "capri-host",
+      "sublabel": "本机客户端",
+      "sources": [
+        {
+          "path": "wire/PROTOCOL-V2.md",
+          "line": 60,
+          "end_line": 190,
+          "label": "会话帧与可靠投递"
+        },
+        {
+          "path": "wire/sender.go",
+          "line": 18,
+          "end_line": 40,
+          "label": "Sender 序列与日志"
+        },
+        {
+          "path": "wire/receiver.go",
+          "line": 18,
+          "end_line": 40,
+          "label": "Receiver 水位与窗口"
+        }
+      ]
+    },
+    {
+      "id": "hub",
+      "type": "backend",
+      "label": "capri-hub",
+      "sublabel": "中继与扇出",
+      "sources": [
+        {
+          "path": "internal/hub/session.go",
+          "line": 429,
+          "end_line": 620,
+          "label": "会话循环与事件接收"
+        },
+        {
+          "path": "internal/hub/hub.go",
+          "line": 1598,
+          "end_line": 1650,
+          "label": "事件入环与扇出"
+        },
+        {
+          "path": "internal/hub/hub.go",
+          "line": 2796,
+          "end_line": 2830,
+          "label": "audience 快照"
+        }
+      ]
+    },
+    {
+      "id": "fe",
+      "type": "frontend",
+      "label": "Capri FE",
+      "sublabel": "/ws/fe",
+      "sources": [
+        {
+          "path": "cmd/capri-hub/main.go",
+          "line": 978,
+          "end_line": 1040,
+          "label": "事件批量写出"
+        },
+        {
+          "path": "cmd/capri-hub/main.go",
+          "line": 1116,
+          "end_line": 1192,
+          "label": "subscribe / viewing"
+        },
+        {
+          "path": "internal/hub/hub.go",
+          "line": 2869,
+          "end_line": 2880,
+          "label": "epoch 复位 subscribed"
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 300,
+      "label": "握手与会话"
+    },
+    {
+      "from": 306,
+      "to": 450,
+      "label": "事件上行 → 浏览器"
+    },
+    {
+      "from": 456,
+      "to": 624,
+      "label": "中继请求 / 响应"
+    },
+    {
+      "from": 630,
+      "to": 700,
+      "label": "心跳与正常关闭"
+    }
+  ],
+  "messages": [
+    {
+      "id": "hello",
+      "from": "host",
+      "to": "hub",
+      "y": 160,
+      "label": "hello · epoch / resume / caps",
+      "variant": "emphasis"
+    },
+    {
+      "id": "hello-ack",
+      "from": "hub",
+      "to": "host",
+      "y": 190,
+      "label": "hello_ack · hubBoot, ack, audience, limits",
+      "variant": "return"
+    },
+    {
+      "id": "epoch-reset",
+      "from": "hub",
+      "to": "fe",
+      "y": 220,
+      "label": "subscribed {seq: baseline} · 新 epoch 前置",
+      "variant": "dashed"
+    },
+    {
+      "id": "viewer-subscribe",
+      "from": "fe",
+      "to": "hub",
+      "y": 250,
+      "label": "subscribe {host, session} + viewing"
+    },
+    {
+      "id": "audience",
+      "from": "hub",
+      "to": "host",
+      "y": 280,
+      "label": "audience {gen, watchers, all, sessions}",
+      "variant": "emphasis"
+    },
+    {
+      "id": "hb-up",
+      "from": "host",
+      "to": "hub",
+      "y": 310,
+      "label": "hb {ack, status}",
+      "variant": "dashed"
+    },
+    {
+      "id": "agent-event",
+      "from": "agent",
+      "to": "host",
+      "y": 340,
+      "label": "event seq=100 · session/update"
+    },
+    {
+      "id": "events-up",
+      "from": "host",
+      "to": "hub",
+      "y": 370,
+      "label": "events {seq:100, ack, events[]}",
+      "variant": "emphasis"
+    },
+    {
+      "id": "events-fanout",
+      "from": "hub",
+      "to": "fe",
+      "y": 400,
+      "label": "events {seq:100…, hostId, hostName}",
+      "variant": "dashed"
+    },
+    {
+      "id": "ack-events",
+      "from": "hub",
+      "to": "host",
+      "y": 430,
+      "label": "hb {ack:100} · 累计确认",
+      "variant": "return"
+    },
+    {
+      "id": "fe-http",
+      "from": "fe",
+      "to": "hub",
+      "y": 460,
+      "label": "POST /api/…"
+    },
+    {
+      "id": "request",
+      "from": "hub",
+      "to": "host",
+      "y": 490,
+      "label": "request {seq:12, reqId, method, path}",
+      "variant": "emphasis"
+    },
+    {
+      "id": "local-turn",
+      "from": "host",
+      "to": "agent",
+      "y": 520,
+      "label": "本地 ACP 回合",
+      "variant": "dashed"
+    },
+    {
+      "id": "turn-output",
+      "from": "agent",
+      "to": "host",
+      "y": 550,
+      "label": "回合输出",
+      "variant": "return"
+    },
+    {
+      "id": "respond",
+      "from": "host",
+      "to": "hub",
+      "y": 580,
+      "label": "respond {reqId, status, chunk, more, ack}",
+      "variant": "return"
+    },
+    {
+      "id": "http-response",
+      "from": "hub",
+      "to": "fe",
+      "y": 610,
+      "label": "HTTP 200 {body | chunk}",
+      "variant": "return"
+    },
+    {
+      "id": "hb-down",
+      "from": "hub",
+      "to": "host",
+      "y": 640,
+      "label": "hb {status, ack}",
+      "variant": "dashed"
+    },
+    {
+      "id": "close",
+      "from": "host",
+      "to": "hub",
+      "y": 670,
+      "label": "transport close(normal)",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "agent",
+      "from": 310,
+      "to": 550,
+      "type": "backend"
+    },
+    {
+      "participant": "host",
+      "from": 154,
+      "to": 676,
+      "type": "backend"
+    },
+    {
+      "participant": "hub",
+      "from": 160,
+      "to": 646,
+      "type": "backend"
+    },
+    {
+      "participant": "fe",
+      "from": 210,
+      "to": 616,
+      "type": "frontend"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "单一序列与累计确认",
+      "items": [
+        "会话 = (hostId, epoch)；新 epoch 重置双向 seq，audience.gen 继续递增",
+        "每个方向一条无洞 seq；ack=N 表示 ≤N 的可靠帧已应用",
+        "events 帧的 seq 是首事件 seq；hub 逐事件推进上行水位",
+        "FE 水位与 host 事件 seq 同坐标；trimmed 保留原 seq",
+        "keepalive 5s；idle 20s；RTO 10s（2×keepalive）；请求确认期 15s（3×keepalive）",
+        "正常关闭由传输层 CloseReason 表达，没有 JSON close 帧"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "观众状态决定上行",
+      "items": [
+        "hello_ack.audience 是握手时的绝对快照",
+        "audience{gen,watchers,all,sessions} 每次变化整帧下发",
+        "watchers==0 暂停上传；all:true 时 host 不裁剪",
+        "sessions 是显示会话加一层子代理子会话"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "中继平面",
+      "items": [
+        "request 是下行可靠帧，host 的累计 ack 证明送达",
+        "respond 不占会话 seq（seq:0），按 1MiB 分块并携带 ack",
+        "hub 按 reqId 路由；最终块关闭该请求",
+        "relay memo 按 (hubBoot, reqId) 去重；应答可跨同 hubBoot 会话重发"
+      ]
+    }
+  ]
+}

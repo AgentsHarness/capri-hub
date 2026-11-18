@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "bff09394-d6d0-44ee-b081-ea02b26e56b2",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/Users/benin/ccwork/acp-hub/.archify/sequence-session-v2-dataflow-20261031-174500/candidate.json",
+  "output": "/Users/benin/ccwork/acp-hub/docs/session-v2-dataflow.html",
+  "specification": {
+    "sha256": "30e46b83f9f5959d86a234ca55c19c71e3fcafd67ba24cd6cb14c2195ca16fb7",
+    "bytes": 8696
+  },
+  "artifact": {
+    "sha256": "88e80d945f30431ebae2812c0d819caaebc6c1344a7fb1b0a06fe9b5c10283ae",
+    "bytes": 824590
+  }
+}

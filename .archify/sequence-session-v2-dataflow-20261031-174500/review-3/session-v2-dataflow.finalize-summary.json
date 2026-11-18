@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "sequence",
+  "quality": "showcase",
+  "specification": {
+    "path": "/Users/benin/ccwork/acp-hub/.archify/sequence-session-v2-dataflow-20261031-174500/candidate.json",
+    "sha256": "30e46b83f9f5959d86a234ca55c19c71e3fcafd67ba24cd6cb14c2195ca16fb7",
+    "bytes": 8696
+  },
+  "artifact": {
+    "path": "/Users/benin/ccwork/acp-hub/docs/session-v2-dataflow.html",
+    "sha256": "88e80d945f30431ebae2812c0d819caaebc6c1344a7fb1b0a06fe9b5c10283ae",
+    "bytes": 824590
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/Users/benin/ccwork/acp-hub/.archify/sequence-session-v2-dataflow-20261031-174500/review-3/session-v2-dataflow.finalize.json",
+    "summaryReceipt": "/Users/benin/ccwork/acp-hub/.archify/sequence-session-v2-dataflow-20261031-174500/review-3/session-v2-dataflow.finalize-summary.json",
+    "browserCheckReceipt": "/Users/benin/ccwork/acp-hub/.archify/sequence-session-v2-dataflow-20261031-174500/review-3/session-v2-dataflow.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-31T09:44:29.818Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 1765,
+  "browserCheck": {
+    "requested": true,
+    "ran": true
+  }
+}
