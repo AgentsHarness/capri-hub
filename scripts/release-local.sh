@@ -98,7 +98,7 @@ for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 wi
   GOARCH="${target#*/}"
   ext=""
   [[ "$GOOS" == "windows" ]] && ext=".exe"
-  name="capri-hub-${GOOS}-${GOARCH}${ext}"
+  name="capri-hub-${TAG}-${GOOS}-${GOARCH}${ext}"
   echo "build  $name"
   CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
     go build -trimpath \

@@ -45,13 +45,13 @@ jobs:
           ext=""
           [ "$GOOS" = "windows" ] && ext=".exe"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/capri-hub-${GOOS}-${GOARCH}${ext}" ./cmd/capri-hub
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/capri-hub-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}${ext}" ./cmd/capri-hub
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: capri-hub-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/capri-hub-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+          path: dist/capri-hub-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
           retention-days: 1
           if-no-files-found: error
 
