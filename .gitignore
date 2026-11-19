@@ -7,6 +7,9 @@ acp-hub
 *.so
 *.dylib
 
+# Local release artifacts (scripts/release-local.sh)
+/dist/
+
 # Test binary
 *.test
 

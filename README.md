@@ -66,6 +66,17 @@ docker build --build-arg GOPROXY=https://goproxy.cn,direct -t capri-hub:local .
 FE_TOKEN=$(openssl rand -hex 24) go run ./cmd/capri-hub
 ```
 
+### 本地出发布包
+
+想绕开 GitHub Actions，或只有本地改动要发时：
+
+```bash
+scripts/release-local.sh v0.5.1 --build-only          # 只构建到 dist/release/v0.5.1
+scripts/release-local.sh v0.5.1 --notes-file notes.md # 构建并创建/更新 GitHub Release
+```
+
+脚本在 tag 对应提交上构建 6 个平台二进制；`--allow-dirty` 可带未提交改动出包。
+
 ### 配对码
 
 启动日志会打印 **6 位配对码**，15 分钟有效、过期自动轮换，所以那一行很快
