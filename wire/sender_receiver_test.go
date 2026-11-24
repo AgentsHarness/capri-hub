@@ -2,8 +2,10 @@ package wire
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -17,12 +19,6 @@ func TestSenderReceiverLossyChannel(t *testing.T) {
 	}
 }
 
-type packet struct {
-	seq  uint64
-	body []byte
-	due  int
-}
-
 type ackMsg struct {
 	due int
 	ack uint64
@@ -34,7 +30,6 @@ func runTrace(t *testing.T, seed int64) {
 	s := NewSender(0)
 	r := NewReceiver(0)
 
-	var flight []packet
 	var acks []ackMsg
 	bySeq := make(map[uint64][]byte)
 	applied := 0
@@ -42,15 +37,16 @@ func runTrace(t *testing.T, seed int64) {
 	assigned := 0
 
 	deliver := func(seq uint64, body []byte) uint64 {
-		ready, ack, err := r.Accept(seq, body)
+		before := r.Acked()
+		payload, ack, err := r.Accept(seq, body)
 		if err != nil {
 			t.Fatalf("seed %d: accept seq %d: %v", seed, seq, err)
 		}
-		for _, got := range ready {
+		if ack > before {
 			applied++
 			want, ok := bySeq[uint64(applied)]
-			if !ok || !bytes.Equal(got, want) {
-				t.Fatalf("seed %d: applied #%d = %q, want %q", seed, applied, got, want)
+			if !ok || !bytes.Equal(payload, want) {
+				t.Fatalf("seed %d: applied #%d = %q, want %q", seed, applied, payload, want)
 			}
 		}
 		if ack < lastAck {
@@ -58,18 +54,6 @@ func runTrace(t *testing.T, seed int64) {
 		}
 		lastAck = ack
 		return ack
-	}
-
-	// send packs one wire transmission: loss, reorder and a possible duplicate.
-	send := func(seq uint64, body []byte, at int) {
-		if rng.Intn(100) < 12 {
-			return
-		}
-		due := at + rng.Intn(4)
-		flight = append(flight, packet{seq: seq, body: body, due: due})
-		if rng.Intn(100) < 8 {
-			flight = append(flight, packet{seq: seq, body: body, due: due + rng.Intn(3)})
-		}
 	}
 
 	for step := 0; step < 40+rng.Intn(160); step++ {
@@ -85,35 +69,34 @@ func runTrace(t *testing.T, seed int64) {
 			bySeq[seq] = body
 			assigned++
 			checkLog(t, seed, s)
-			send(seq, body, step)
 		}
 
-		if rng.Intn(100) < 15 {
+		// One transmission is the unacked log in order. The transport is a
+		// single ordered stream, so a break drops the rest of the batch; the
+		// next transmission replays it from the watermark. A repeated seq
+		// models a retransmission the peer already applied.
+		if rng.Intn(100) < 70 {
 			for _, e := range s.Entries() {
 				if want, ok := bySeq[e.Seq]; !ok || !bytes.Equal(e.Payload, want) {
-					t.Fatalf("seed %d: retransmit %d = %q, want %q", seed, e.Seq, e.Payload, bySeq[e.Seq])
+					t.Fatalf("seed %d: transmit %d = %q, want %q", seed, e.Seq, e.Payload, bySeq[e.Seq])
 				}
-				send(e.Seq, e.Payload, step)
+				if rng.Intn(100) < 12 {
+					break
+				}
+				ack := deliver(e.Seq, e.Payload)
+				if ack > 0 && rng.Intn(100) >= 10 {
+					acks = append(acks, ackMsg{due: step + rng.Intn(4), ack: ack})
+				}
+				if ack > 1 && rng.Intn(100) < 15 {
+					// A stale ack that arrives after a newer one must not move
+					// the watermark back.
+					acks = append(acks, ackMsg{due: step + 1 + rng.Intn(6), ack: ack - 1})
+				}
+				if rng.Intn(100) < 8 {
+					deliver(e.Seq, e.Payload)
+				}
 			}
 		}
-
-		var pending []packet
-		for _, p := range flight {
-			if p.due > step {
-				pending = append(pending, p)
-				continue
-			}
-			ack := deliver(p.seq, p.body)
-			if ack > 0 && rng.Intn(100) >= 10 {
-				acks = append(acks, ackMsg{due: step + rng.Intn(4), ack: ack})
-			}
-			if ack > 1 && rng.Intn(100) < 15 {
-				// A stale ack that arrives after a newer one must not move the
-				// watermark back.
-				acks = append(acks, ackMsg{due: step + 1 + rng.Intn(6), ack: ack - 1})
-			}
-		}
-		flight = pending
 
 		var pendingAcks []ackMsg
 		for _, a := range acks {
@@ -131,8 +114,8 @@ func runTrace(t *testing.T, seed int64) {
 		acks = pendingAcks
 	}
 
-	// Final drain: the channel stops losing and reordering. Both sides must
-	// converge without any seq being renumbered or skipped.
+	// Final drain: the channel stops losing frames. Both sides must converge
+	// without any seq being renumbered or skipped.
 	for guard := 0; s.Len() > 0; guard++ {
 		if guard > 10_000 {
 			t.Fatalf("seed %d: log did not drain (%d entries left)", seed, s.Len())
@@ -150,9 +133,6 @@ func runTrace(t *testing.T, seed int64) {
 	}
 	if s.Bytes() != 0 {
 		t.Fatalf("seed %d: %d bytes left in the drained log", seed, s.Bytes())
-	}
-	if r.Buffered() != 0 {
-		t.Fatalf("seed %d: %d frames still parked", seed, r.Buffered())
 	}
 }
 
@@ -300,32 +280,32 @@ func TestSenderElideFromWalksInOrder(t *testing.T) {
 	}
 }
 
-func TestReceiverDuplicatesAndGaps(t *testing.T) {
+func TestReceiverStrictOrder(t *testing.T) {
 	r := NewReceiver(0)
-	if ready, ack, err := r.Accept(2, []byte("two")); err != nil || len(ready) != 0 || ack != 0 {
-		t.Fatalf("park: ready %d ack %d err %v", len(ready), ack, err)
+	payload, ack, err := r.Accept(1, []byte("one"))
+	if err != nil || ack != 1 || string(payload) != "one" {
+		t.Fatalf("contiguous: payload %q ack %d err %v", payload, ack, err)
 	}
-	if r.Buffered() != 1 {
-		t.Fatalf("buffered %d", r.Buffered())
+	// A duplicate applies nothing but still yields the ack.
+	if payload, ack, err := r.Accept(1, []byte("again")); err != nil || payload != nil || ack != 1 {
+		t.Fatalf("duplicate: payload %q ack %d err %v", payload, ack, err)
 	}
-	// Duplicate parked frame: no second slot, no ack movement.
-	if ready, ack, err := r.Accept(2, []byte("two")); err != nil || len(ready) != 0 || ack != 0 {
-		t.Fatalf("duplicate park: ready %d ack %d err %v", len(ready), ack, err)
+	// A gap is a protocol violation and leaves the watermark alone.
+	payload, ack, err = r.Accept(3, []byte("three"))
+	if !errors.Is(err, ErrOutOfOrder) || !errors.Is(err, ErrProtocol) {
+		t.Fatalf("gap err %v, want ErrOutOfOrder wrapping ErrProtocol", err)
 	}
-	if r.Buffered() != 1 {
-		t.Fatalf("buffered %d after duplicate", r.Buffered())
+	if payload != nil || ack != 1 || r.Acked() != 1 {
+		t.Fatalf("gap moved the watermark to %d (ack %d, payload %q)", r.Acked(), ack, payload)
 	}
-	ready, ack, err := r.Accept(1, []byte("one"))
-	if err != nil || ack != 2 || len(ready) != 2 || string(ready[0]) != "one" || string(ready[1]) != "two" {
-		t.Fatalf("drain: ready %q ack %d err %v", ready, ack, err)
-	}
-	if ready, ack, err := r.Accept(1, nil); err != nil || len(ready) != 0 || ack != 2 {
-		t.Fatalf("duplicate: ready %d ack %d err %v", len(ready), ack, err)
+	if !strings.Contains(err.Error(), "seq 3") || !strings.Contains(err.Error(), "expected 2") {
+		t.Fatalf("gap error %q does not name the expected and actual seq", err)
 	}
 	if _, _, err := r.Accept(0, nil); err == nil {
 		t.Fatal("seq 0 accepted")
 	}
-	if r.Buffered() != 0 {
-		t.Fatalf("buffered %d after drain", r.Buffered())
+	// The missing frame still applies: the gap did not poison the receiver.
+	if payload, ack, err := r.Accept(2, []byte("two")); err != nil || ack != 2 || string(payload) != "two" {
+		t.Fatalf("fill gap: payload %q ack %d err %v", payload, ack, err)
 	}
 }

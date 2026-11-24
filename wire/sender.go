@@ -13,10 +13,8 @@ type Entry struct {
 // the remaining entries in the log are replayed.
 //
 // A Sender is owned by the session loop — one goroutine, no mutex. A seq is
-// assigned exactly once and is never renumbered. A retransmission is normally
-// byte-identical to the original; the exception is an absolute-state frame
-// (audience) whose payload may be replaced while it is unacknowledged, with
-// the sequence kept as the ordering key.
+// assigned exactly once and is never renumbered, so a retransmission is
+// byte-identical to the original. Absolute state never enters this log.
 type Sender struct {
 	next  uint64 // next seq to assign
 	acked uint64 // every seq <= acked is confirmed
@@ -85,9 +83,7 @@ func (s *Sender) Ack(n uint64) {
 }
 
 // Elide replaces the payload logged for seq, keeping the seq. Compaction uses it
-// to turn a droppable event into a trimmed placeholder without opening a hole;
-// the hub also uses it to fold a newer absolute-state snapshot into the single
-// unacknowledged audience entry.
+// to turn a droppable event into a trimmed placeholder without opening a hole.
 func (s *Sender) Elide(seq uint64, replacement []byte) error {
 	_, err := s.ElideFrom(0, seq, replacement)
 	return err

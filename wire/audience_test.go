@@ -5,6 +5,25 @@ import (
 	"testing"
 )
 
+// TestAudienceCarriesNoSeq: audience is absolute latest-wins state, so it
+// stays out of the reliable seq space and is rejected if it takes a seq.
+func TestAudienceCarriesNoSeq(t *testing.T) {
+	if Reliable(TypeAudience) {
+		t.Fatal("audience is treated as a reliable frame")
+	}
+	f := NewAudience(Audience{Gen: 2, Watchers: 1})
+	if f.Seq != 0 || f.Ack != 0 {
+		t.Fatalf("audience carries seq %d ack %d", f.Seq, f.Ack)
+	}
+	if _, err := Encode(f); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	f.Seq = 1
+	if _, err := Encode(f); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("audience with a seq was accepted: %v", err)
+	}
+}
+
 func TestAudienceValidate(t *testing.T) {
 	ok := []Audience{
 		{Gen: 1},

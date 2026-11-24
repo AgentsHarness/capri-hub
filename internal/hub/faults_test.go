@@ -8,7 +8,7 @@ import (
 )
 
 // This file is the Stage-4 fault matrix at the hub end of the session: the
-// failure modes v2 must answer, driven through the real
+// failure modes v3 must answer, driven through the real
 // ServeHost path with an in-process fake host transport.
 
 // collectHostSeqs drains ch until n events of hostID arrived and returns
@@ -357,7 +357,7 @@ func TestSessionUnreadableClosesAndReplays(t *testing.T) {
 	waitFor(t, func() bool { return h.LastSeq("h1") == 2 }, 2*time.Second)
 
 	select {
-	case fh.ft.inbox <- []byte(`{"v":2,"type":"events","seq":3,"events":[`):
+	case fh.ft.inbox <- []byte(`{"v":3,"type":"events","seq":3,"events":[`):
 	case <-time.After(2 * time.Second):
 		t.Fatal("could not inject the corrupt frame")
 	}

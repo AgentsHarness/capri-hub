@@ -31,8 +31,7 @@ var errWriterStopped = errors.New("hub: writer stopped")
 // SendFragment, so a wedged peer blocks output instead of the loop.
 //
 // written is how far the log has been handed to this transport and is advanced
-// only after a complete logical frame was written. A request's ack deadline is
-// armed at that point (proto.noteWritten), never at dispatch.
+// only after a complete logical frame was written.
 type writer struct {
 	s       *session
 	tr      Transport
@@ -40,13 +39,14 @@ type writer struct {
 
 	wake         chan struct{}
 	retransmitCh chan struct{}
-	// rewriteCh asks for one specific unacked entry to be written again after
-	// its payload was replaced in place. Audience is absolute state: the seq
-	// stays fixed, but a newer snapshot must reach the peer without waiting
-	// for the RTO. One slot is enough — only one audience frame is pending.
-	rewriteCh chan uint64
-	progress  chan struct{}
-	busy      atomic.Bool
+	// audienceCh wakes the writer for the pending absolute audience snapshot.
+	// The snapshot itself lives in one latest-wins slot, not a queue: a burst
+	// of viewer changes leaves only the newest frame to write.
+	audienceCh chan struct{}
+	audienceMu sync.Mutex
+	audience   []byte
+	progress   chan struct{}
+	busy       atomic.Bool
 
 	// controlQ is a small FIFO of control frames. Plain heartbeats coalesce
 	// with the previous one (only the newest snapshot matters), while a
@@ -66,7 +66,7 @@ func newWriter(s *session, tr Transport, deflate bool) *writer {
 		deflate:      deflate,
 		wake:         make(chan struct{}, 1),
 		retransmitCh: make(chan struct{}, 1),
-		rewriteCh:    make(chan uint64, 1),
+		audienceCh:   make(chan struct{}, 1),
 		progress:     make(chan struct{}, 1),
 		written:      s.proto.downAcked(),
 	}
@@ -95,22 +95,26 @@ func (w *writer) retransmit() {
 	}
 }
 
-// rewrite asks the writer to write the entry at seq again because its payload
-// was replaced in place. The slot holds one seq; a later replacement of the
-// same single audience entry supersedes an earlier request.
-func (w *writer) rewrite(seq uint64) {
+// postAudience parks the newest absolute audience snapshot. A snapshot already
+// waiting is overwritten: audience is latest-wins state, so an older one has
+// nothing the peer still needs.
+func (w *writer) postAudience(payload []byte) {
+	w.audienceMu.Lock()
+	w.audience = payload
+	w.audienceMu.Unlock()
 	select {
-	case w.rewriteCh <- seq:
+	case w.audienceCh <- struct{}{}:
 	default:
-		select {
-		case <-w.rewriteCh:
-		default:
-		}
-		select {
-		case w.rewriteCh <- seq:
-		default:
-		}
 	}
+}
+
+// takeAudience returns the pending snapshot, if any.
+func (w *writer) takeAudience() ([]byte, bool) {
+	w.audienceMu.Lock()
+	defer w.audienceMu.Unlock()
+	p := w.audience
+	w.audience = nil
+	return p, p != nil
 }
 
 // controlQueueDepth bounds queued control frames. In steady state the queue
@@ -185,6 +189,13 @@ func (w *writer) run() {
 			}
 			continue
 		}
+		if a, ok := w.takeAudience(); ok {
+			if err := w.writeAudience(a); err != nil {
+				w.fail(err)
+				return
+			}
+			continue
+		}
 		if entries := w.s.proto.entriesAfter(w.written); len(entries) > 0 {
 			if err := w.writeEntries(entries); err != nil {
 				w.fail(err)
@@ -201,13 +212,7 @@ func (w *writer) run() {
 				w.fail(err)
 				return
 			}
-		case seq := <-w.rewriteCh:
-			if e, ok := w.s.proto.entry(seq); ok {
-				if err := w.writeEntries([]wire.Entry{e}); err != nil {
-					w.fail(err)
-					return
-				}
-			}
+		case <-w.audienceCh:
 		}
 	}
 }
@@ -230,6 +235,14 @@ func (w *writer) writeControl(payload []byte) error {
 	// written on their own clock, and resetting the RTO on them would push
 	// retransmission past every keepalive tick.
 	return w.tr.Send(payload)
+}
+
+// writeAudience writes one absolute snapshot. It never enters the seq log and
+// is not acknowledged, so there is nothing to arm or replay afterwards.
+func (w *writer) writeAudience(payload []byte) error {
+	w.busy.Store(true)
+	defer w.busy.Store(false)
+	return w.writeFrame(payload)
 }
 
 func (w *writer) writeEntries(entries []wire.Entry) error {
@@ -256,10 +269,6 @@ func (w *writer) writeReliable(e wire.Entry) error {
 	if err := w.writeFrame(e.Payload); err != nil {
 		return err
 	}
-	// The complete logical frame is on the wire: only now may a request's ack
-	// deadline start (or restart, after a retransmission), and only now is an
-	// audience generation known to have reached the peer.
-	w.s.proto.noteWritten(e.Seq, e.Payload)
 	if e.Seq > w.written {
 		w.written = e.Seq
 	}

@@ -56,7 +56,7 @@ func TestStatsEndpoint(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("admin stats status = %d", res.StatusCode)
 	}
-	for _, key := range []string{"ok", "hosts", "pairedHosts", "subscribers", "feDropped", "feResyncs", "uptimeSeconds"} {
+	for _, key := range []string{"ok", "hosts", "pairedHosts", "subscribers", "feDropped", "feResyncs", "relay", "uptimeSeconds"} {
 		if _, ok := body[key]; !ok {
 			t.Errorf("stats lost %q: %v", key, body)
 		}

@@ -26,14 +26,6 @@ func respondFrame(reqID string, seq uint64, status int, chunk []byte, more bool)
 	return f
 }
 
-// shortFastReadAck shrinks the idempotent-read ack window for one test.
-func shortFastReadAck(t *testing.T, d time.Duration) {
-	t.Helper()
-	prev := fastReadAckWindow
-	fastReadAckWindow = d
-	t.Cleanup(func() { fastReadAckWindow = prev })
-}
-
 func findRelayAck(acks []wire.RelayAck, reqID string) (wire.RelayAck, bool) {
 	for _, a := range acks {
 		if a.ReqID == reqID {
@@ -218,16 +210,10 @@ func TestRelayAcksPendingDoneAbortAndTTL(t *testing.T) {
 	}
 }
 
-// Registry departure paths (failRequest, failPendingLocked/dropPending) leave
-// an abort tombstone where the pending entry used to be.
+// Registry departure paths (failPendingLocked/dropPending) leave an abort
+// tombstone where the pending entry used to be.
 func TestRelayFailurePathsAddAbortTombstones(t *testing.T) {
 	h := NewWithDir("")
-	addChunkPending(h, "h1", "expired")
-	h.failRequest("h1", "expired", 503, "host 未确认")
-	if a, _ := findRelayAck(h.relayAcks("h1"), "expired"); !a.Abort {
-		t.Fatalf("failRequest tombstone = %+v, want abort", a)
-	}
-
 	addChunkPending(h, "h1", "cancelled")
 	h.dropPending("h1", "cancelled")
 	if a, _ := findRelayAck(h.relayAcks("h1"), "cancelled"); !a.Abort {
@@ -301,17 +287,37 @@ func TestRelayAcksInHelloAckOnResume(t *testing.T) {
 		t.Fatalf("hello_ack tombsone for %s = %+v (found %v), want done chunk 2", req.ReqID, a, ok)
 	}
 
-	// A request in flight when the link drops is aborted in the same epoch.
+	// A request in flight when the link drops survives the same-epoch
+	// reconnect: hello_ack reports it pending and the down log is replayed on
+	// the new transport.
+	inflight := make(chan RelayResponse, 1)
 	go func() {
-		_, _ = h.Dispatch(context.Background(), "h1", "GET", "/api/other", nil)
+		r, _ := h.Dispatch(context.Background(), "h1", "GET", "/api/other", nil)
+		inflight <- r
 	}()
 	req2 := again.recvType(wire.TypeRequest, 2*time.Second)
 	again.ft.hangup()
 	again.waitReason(2 * time.Second)
 	resumed := dialFakeHost(t, h, "h1", 7)
 	a, ok = findRelayAck(resumed.ack.RelayAcks, req2.ReqID)
-	if !ok || !a.Abort || a.Done {
-		t.Fatalf("hello_ack tombstone for %s = %+v (found %v), want abort", req2.ReqID, a, ok)
+	if !ok || a.Abort || a.Done {
+		t.Fatalf("hello_ack entry for %s = %+v (found %v), want pending", req2.ReqID, a, ok)
+	}
+	replay := resumed.recvType(wire.TypeRequest, 2*time.Second)
+	if replay.ReqID != req2.ReqID {
+		t.Fatalf("replayed request = %q, want %q", replay.ReqID, req2.ReqID)
+	}
+	resumed.send(wire.Frame{
+		V: wire.ProtocolVersion, Type: wire.TypeRespond, Ack: replay.Seq, ChunkSeq: 1,
+		ReqID: replay.ReqID, Status: json.RawMessage(`200`), Body: json.RawMessage(`{"ok":true}`),
+	})
+	select {
+	case r := <-inflight:
+		if r.Status != 200 {
+			t.Fatalf("in-flight request status = %d, want 200 after resume", r.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request did not resolve after the same-epoch resume")
 	}
 
 	// A new epoch starts with no relay memory at all.
@@ -510,56 +516,6 @@ func TestSessionProbeCoalesces(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("waiter %d did not observe the probeAck", i)
 		}
-	}
-}
-
-// A fast read that is never acked fails alone with 503 + abort; the session
-// and other traffic keep working.
-func TestFastReadAckDeadlineFailsOneRequest(t *testing.T) {
-	shortFastReadAck(t, 300*time.Millisecond)
-	shortLiveness(t, 1, 10)
-
-	h := NewWithDir("")
-	testPair(t, h, "h1", "H1")
-	fh := dialFakeHost(t, h, "h1", 1)
-
-	start := time.Now()
-	resp, err := h.DispatchFastRead(context.Background(), "h1", "GET", "/api/status", nil)
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-	if resp.Status != 503 {
-		t.Fatalf("status = %d, want 503", resp.Status)
-	}
-	if elapsed < fastReadAckWindow {
-		t.Fatalf("failed after %s, before the %s window", elapsed, fastReadAckWindow)
-	}
-	req := fh.recvType(wire.TypeRequest, 2*time.Second)
-	if a, ok := findRelayAck(h.relayAcks("h1"), req.ReqID); !ok || !a.Abort {
-		t.Fatalf("expired request tombstone = %+v (found %v), want abort", a, ok)
-	}
-
-	// The abort must reach the host on the wire immediately, not on the next
-	// 1s keepalive: the host could otherwise start executing the request
-	// after the browser already received 503.
-	abortDeadline := time.Now().Add(500 * time.Millisecond)
-	sawAbort := false
-	for !sawAbort {
-		f := fh.recv(time.Until(abortDeadline))
-		if f.Type != wire.TypeHeartbeat {
-			continue
-		}
-		if a, ok := findRelayAck(f.RelayAcks, req.ReqID); ok && a.Abort {
-			sawAbort = true
-		}
-	}
-
-	// The session survives: a later event is still applied.
-	fh.events(1, 0, chunkEvent(1, "alive"))
-	waitFor(t, func() bool { return h.LastSeq("h1") == 1 }, 2*time.Second)
-	if !h.ListHosts()[0].Online {
-		t.Fatal("ack expiry closed the session")
 	}
 }
 

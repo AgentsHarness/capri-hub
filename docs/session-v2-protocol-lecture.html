@@ -314,6 +314,10 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
 </style>
 </head>
 <body>
+<div style="padding:10px 16px;background:#fff3cd;color:#664d03;border-bottom:1px solid #ffe69c;text-align:center;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  历史文档：本讲义描述 capri session v2；当前 host↔hub 协议为 v3，权威规格见
+  <code>wire/PROTOCOL-V2.md</code>（文件名为历史保留）。
+</div>
 <div id="progress"></div>
 
 <header class="cover">
@@ -324,12 +328,13 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
         <span class="small">capri session v2 协议讲义</span>
       </h1>
       <p class="subtitle">一条消息的旅行，以及它失联时我们怎样马上知道。<br>用王爽《汇编语言》的口气，讲一份写给工程师、也写给好奇者的协议论文。</p>
-      <p class="byline">2026-11-02 · 基于 <code>refactor/session-v2</code> 工作区 · 以 <code>wire/PROTOCOL-V2.md</code> 为准</p>
+      <p class="byline">2026-11-20 · 基于 <code>acp-hub</code> / <code>acp-host</code> 的 <code>main</code> 工作区（hub v0.5.1）· 以 <code>wire/PROTOCOL-V2.md</code> 为准</p>
       <div class="cover-chips">
         <span class="chip red">5 条产品优先级</span>
         <span class="chip">7 类帧</span>
         <span class="chip">2 个可靠面</span>
         <span class="chip">1 个 writer</span>
+        <span class="chip">20ms 延迟确认</span>
         <span class="chip">10 秒级断线发现</span>
       </div>
     </div>
@@ -400,7 +405,11 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <h2>五条用户感受，一套协议回答</h2>
     <p>这篇讲义只回答一个问题：当 <strong>capri-host</strong> 和 <strong>capri-hub</strong> 把两者之间的会话协议升级到 <strong>v2</strong> 之后，用户在屏幕前最在意的五件事——打开直播会话时先看到时间线、没人在看的会话不要浪费流量、正常断开马上知道、输出到一半突然没声了几秒内知道、没有输出时发一条消息也不会石沉大海——分别由协议里的什么机制保证？</p>
     <p>我们不背字段。我们先画一张全局图，再把名词一个个讲透，然后拆开五条优先级，看看它们在代码里落在哪一行、为什么这样设计；最后走一遍故障矩阵与未来路线。读完之后，你不需要记住所有常量，但应该能在看到“连接中断，正在重连……”时，知道这句话背后经过了哪些判断。</p>
-    <p class="small"><strong>版本说明：</strong>本文以 2026-11-02 的 <code>refactor/session-v2</code> 工作区为准，包含 transport unit、probe、relay chunk ack 等本轮未提交改动；协议唯一真源是 <code>acp-hub/wire/PROTOCOL-V2.md</code>。页面是解释性文档，不能替代协议文本。</p>
+    <p class="small"><strong>版本说明：</strong>本文以 2026-11-20 的 <code>acp-hub</code> / <code>acp-host</code> <code>main</code> 工作区为准（hub v0.5.1），包含 transport unit、probe、relay chunk ack、20ms 延迟确认（<code>AckDelay</code>）与按请求语义区分的失败期限；协议唯一真源是 <code>acp-hub/wire/PROTOCOL-V2.md</code>。页面是解释性文档，不能替代协议文本。</p>
+    <div class="box note">
+      <div class="box-label">2026-11-20 修订</div>
+      <p>相对 11 月 2 日版，本次按最新代码补齐四处：<code>ack</code> 的 20ms 延迟确认（<code>wire.AckDelay</code>）；<code>lastSeenAgeMs</code> 由 hub 用自己的时钟计算，浏览器不再拿 <code>lastSeen</code> 减本机时钟；<code>hb.status.version</code> 上报 host 构建版本；中继按请求语义区分 5s 只读快速失败与 15s 可靠期限（<code>DispatchPolicy</code>）。</p>
+    </div>
     <div class="tablewrap">
       <table>
         <thead><tr><th>你看到的现象</th><th>协议里谁负责</th><th class="nowrap">关键数字</th></tr></thead>
@@ -511,7 +520,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <p><strong>capri-host</strong>是本地的大管家：它把 agent 的输出整理成“事件”，维护每个会话的顺序，保存未确认日志，必要时把大工具输出裁成占位，还要接住 hub 发来的 HTTP 中继请求。它主动拨号到 hub，像员工上班打卡；hub 没有它的电话，不能反过来叫它。</p>
     <p><strong>capri-hub</strong>是公网上的传达室：它记住哪些 host 在线、哪些浏览器在看哪个会话，把事件扇出给对应的页面。它也保存一小段事件缓冲，方便页面掉线后补缺口。它不执行 agent，也不持有完整会话。</p>
     <p><strong>浏览器里的 Capri FE</strong>是观众席：它通过 <code>/ws/fe</code> 订阅某个 host 的事件，同时用 <code>viewing</code> 控制帧告诉 hub“我现在在看哪个会话”。用户看到的“在线 / 工作中 / 连接中断”，都在这里被画出来。</p>
-    <p>需要说明的是：<code>/ws/fe</code> 的帧形状基本沿用 v1；v2 的主要改动在 host ↔ hub 这一跳，以及 FE 对 <code>lastSeen</code>、<code>hosts_changed</code> 的读取方式。本文讲的是这两块怎么配合，不会重画浏览器协议的全部细节。</p>
+    <p>需要说明的是：<code>/ws/fe</code> 的帧形状基本沿用 v1；v2 的主要改动在 host ↔ hub 这一跳，以及 FE 对 <code>lastSeenAgeMs</code>、<code>hosts_changed</code> 的读取方式。本文讲的是这两块怎么配合，不会重画浏览器协议的全部细节。</p>
 
     <div class="box warning">
       <div class="box-label">注意！一个物理前提</div>
@@ -567,7 +576,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <tr><td class="mono">audience</td><td>hub → host</td><td>“谁在看哪个会话”的绝对快照</td><td>是</td></tr>
           <tr><td class="mono">request</td><td>hub → host</td><td>浏览器发来的 HTTP 请求，交给 host 执行</td><td>是</td></tr>
           <tr><td class="mono">respond</td><td>host → hub</td><td>HTTP 请求的答案，按块送回；不占会话 seq</td><td>否（中继面单独记账）</td></tr>
-          <tr><td class="mono">hb</td><td>双向</td><td>心跳、累计 ack、状态快照、probe/probeAck、relayAcks</td><td>否</td></tr>
+          <tr><td class="mono">hb</td><td>双向</td><td>心跳、累计 ack、状态快照（含 host <code>version</code>）、probe/probeAck、relayAcks</td><td>否</td></tr>
         </tbody>
       </table>
     </div>
@@ -658,6 +667,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <h3><span class="h3no">2.3</span>seq、ack、watermark：协议世界的页码与回执</h3>
     <p>每个方向只有一条可靠序号流。<strong><code>seq</code></strong> 是这一帧的页码；<strong><code>ack</code></strong> 不是“我收到了第 N 页”，而是<strong>“从 1 到 N 页，我一页不漏地都收到了”</strong>。这个累计含义非常关键：它不允许跳过空洞。</p>
     <p><strong>watermark（水位）</strong>就是这条“已经连续收到哪里”的线。接收方只在帧序号连续时推进水位；中间缺了一帧，后面的帧先停在缓冲里，等缺口补上再一起放行。发送方则保留所有未确认的日志，按水位重传。</p>
+    <p>还有一条容易被忽略的时限：<strong><code>ack</code> 不能等下一个心跳</strong>。接收水位一旦前进，接收方必须在 <code>AckDelay = 20ms</code> 内把一个携带新 <code>ack</code> 的出站帧发出去；没有业务数据时，就由延迟确认定时器触发一帧 <code>hb</code>。心跳是存活时钟，不是 ack 延迟的上限。host 侧在 <code>internal/hub/session.go</code> 里用 <code>ackPending/ackDue</code> 实现这条规则。</p>
 
     <div class="box note">
       <div class="box-label">如果你学过一点汇编</div>
@@ -763,13 +773,14 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
       </table>
     </div>
     <p><strong>probe</strong> 是一个随机数（nonce），不是命令。<strong>probeAck</strong> 就是把同一个 nonce 原样送回来。任何收到的帧都能清除 probe 等待；probe 只在漏了心跳时补一次，不是常驻轮询。整套机制的关键是“数字有先后”：<code>keepalive 5s &lt; ProbeAfter 7s &lt; ProbeAfter + ProbeTimeout = 10s &lt; idle 20s</code>。</p>
+    <p><code>hb.status</code> 是 host 的即时快照：<code>ready</code>、<code>busy</code>、<code>booting</code>、<code>pendingCount</code>、<code>port</code>。从 v0.5.x 起还有一个可选的 <code>version</code>（host 二进制的构建版本；本地构建会标成 <code>dev</code> 或 <code>dev-&lt;shortsha&gt;</code>）；hub 保留最后一次非空值，并通过 <code>/api/hosts</code> 暴露。旧 host 不带这个字段，显示为空即可。</p>
 
     <h3><span class="h3no">2.7</span>relay、request、respond、reqId、chunkSeq、relayAcks：中继面</h3>
     <p>浏览器要调 host 的 HTTP 接口（例如发 prompt、读文件），中间要经过 hub 转一手，这叫 <strong>relay（中继）</strong>。v2 把这条路径拆成两条账本：</p>
     <ul>
       <li><strong><code>request</code></strong>：hub → host 的可靠帧，装的是 HTTP method、path、body。它走会话面的 <code>seq/ack</code>，host 的累计 ack 证明“请求已送达”。</li>
       <li><strong><code>respond</code></strong>：host → hub 的答案帧。它<strong>不占会话 seq</strong>（<code>seq: 0</code>），按 <code>reqId</code> 路由，每个请求内部的块用 <code>chunkSeq</code> 从 1 开始连续编号。<code>more:false</code> 的块是终块。</li>
-      <li><strong><code>relayAcks</code></strong>：hub 在 <code>hb</code> 和 <code>hello_ack</code> 里携带的中继确认表。每个 <code>(hubBoot, reqId)</code> 一条：<code>chunk</code> 是最高连续块，<code>done</code> 表示整份答案已收完，<code>abort</code> 表示请求被丢弃、host 别再发了。</li>
+      <li><strong><code>relayAcks</code></strong>：hub 在 <code>hb</code> 和 <code>hello_ack</code> 里携带的中继确认表。每个 <code>(hubBoot, reqId)</code> 一条：<code>chunk</code> 是最高连续块，<code>done</code> 表示整份答案已收完，<code>abort</code> 表示请求被丢弃、host 别再发了。请求完成或被丢弃时，hub 会通过 <code>notifyAckTable</code> 立即补发一帧 <code>hb</code>，不等下一个周期心跳。</li>
     </ul>
     <p>一句话：<strong>request 的信誉由会话 ack 担保，respond 的信誉由 chunk ack 担保</strong>。两本账不能混，否则事件序号和答案块序号会互相污染。</p>
 
@@ -1265,7 +1276,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
       </div>
     </div>
 
-    <p class="lead">这一节回答最容易被用户误解的一件事：为什么输出到一半突然停了，浏览器会在几秒内说“连接中断”，而不是一直转圈，让人以为模型还在努力思考？答案是把“没有输出”拆成三个可观测的信号：host 的忙碌心跳、hub 的 lastSeen、FE 的静默探针。</p>
+    <p class="lead">这一节回答最容易被用户误解的一件事：为什么输出到一半突然停了，浏览器会在几秒内说“连接中断”，而不是一直转圈，让人以为模型还在努力思考？答案是把“没有输出”拆成三个可观测的信号：host 的忙碌心跳、hub 的 <code>lastSeenAgeMs</code>、FE 的静默探针。</p>
 
     <div class="box question">
       <div class="box-label">问题 6.1</div>
@@ -1280,8 +1291,8 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
         <thead><tr><th class="nowrap">谁</th><th>看到了什么</th><th>什么时候动</th><th>默认值</th></tr></thead>
         <tbody>
           <tr><td><strong>host</strong></td><td>回合是否在跑（<code>status.busy</code>）</td><td>busy 时把 <code>hb</code> 周期从 5s 收紧到 1s；空闲时 5s</td><td class="mono">BusyKeepalive = 1s</td></tr>
-          <tr><td><strong>hub</strong></td><td>最后一次收到该 host 任何帧的时间 <code>LastSeen</code></td><td>每收到一个 host 帧就静默刷新；<code>/api/hosts</code> 暴露给 FE</td><td class="mono">不看固定间隔</td></tr>
-          <tr><td><strong>浏览器 FE</strong></td><td>busy 且多久没有 live 事件</td><td>静默 2s 后查一次 <code>/api/hosts</code>；lastSeen 超过 3.5s 判定“心跳停了”</td><td class="mono">2s / 3.5s / 1s 复探</td></tr>
+          <tr><td><strong>hub</strong></td><td>最后一次收到该 host 任何帧的时间 <code>LastSeen</code></td><td>每收到一个 host 帧就静默刷新，并按自己的时钟算出 <code>lastSeenAgeMs</code> 一起下发；<code>/api/hosts</code> 暴露给 FE</td><td class="mono">不看固定间隔</td></tr>
+          <tr><td><strong>浏览器 FE</strong></td><td>busy 且多久没有 live 事件</td><td>静默 2s 后查一次 <code>/api/hosts</code>；<code>lastSeenAgeMs</code> ≥ 3.5s 判定“心跳停了”</td><td class="mono">2s / 3.5s / 1s 复探</td></tr>
           <tr><td><strong>hub 协议层</strong></td><td>多久没有收到 host 的任何帧</td><td>7s 发 <code>hb{probe}</code>；3s 无 <code>probeAck</code> 关闭会话</td><td class="mono">7s / 3s ≈ 10s</td></tr>
           <tr><td><strong>兜底</strong></td><td>多久没有任何完整帧</td><td><code>idle</code> 到点关闭，按 <code>liveness</code></td><td class="mono">20s</td></tr>
         </tbody>
@@ -1344,9 +1355,9 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
             <text x="300" y="118" class="svg-red" font-size="10.5" font-weight="700">绿色刻度 = 正常时每 1s 一拍；这里假设从 0 起全部消失</text>
 
             <text x="24" y="174" class="svg-kai svg-blue" font-size="14" font-weight="700">hub</text>
-            <text x="24" y="191" class="svg-dim" font-size="9.5">LastSeen / probe</text>
+            <text x="24" y="191" class="svg-dim" font-size="9.5">LastSeen / age / probe</text>
             <rect x="70" y="160" width="564" height="30" rx="6" fill="var(--blue-soft)" opacity=".55"/>
-            <text x="88" y="180" class="svg-blue" font-size="10.5">每个 host 帧到达 → 静默刷新 LastSeen（不广播）</text>
+            <text x="88" y="180" class="svg-blue" font-size="10.5">每个 host 帧到达 → 刷新 LastSeen，并算出 lastSeenAgeMs（不广播）</text>
             <line x1="634" y1="175" x2="1010" y2="175" stroke="var(--blue)" stroke-width="2"/>
             <circle cx="634" cy="175" r="5" fill="var(--blue)"/>
             <text x="646" y="169" class="svg-blue" font-size="10.5" font-weight="700">7s：hb{probe}</text>
@@ -1376,7 +1387,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
         <div class="clock-readout" id="clockReadout">
           <div class="t" id="clockBig">0.0s</div>
           <div class="row"><span class="who">host</span><span id="clockHost">心跳正常；host 还在发 hb。</span></div>
-          <div class="row"><span class="who">hub</span><span id="clockHub">LastSeen 持续刷新，一切正常。</span></div>
+          <div class="row"><span class="who">hub</span><span id="clockHub">LastSeen 持续刷新，lastSeenAgeMs 保持很小。</span></div>
           <div class="row"><span class="who">浏览器</span><span id="clockFe">有 live 事件，界面正常。</span></div>
         </div>
       </div>
@@ -1387,9 +1398,10 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <p><code>hosts_changed</code> 只在注册表状态翻转（上线/离线、ready/busy 变化）时广播，<code>LastSeen</code> 的每次刷新是静默的——否则每收到一个 host 帧就广播一次，会把所有页面淹没。这个设计很合理，但带来一个空档：host 静默地停止心跳时，注册表还没翻转为离线，不会有广播。FE 只能主动查：</p>
     <ul>
       <li>它只在“busy 且 2 秒没有 live 事件”时查，不是常驻轮询。</li>
-      <li>它读的是 <code>/api/hosts</code> 里的 <code>lastSeen</code>，如果 age ≥ 3.5 秒，才判定“心跳停了”。3.5 秒给了三拍 busy 心跳的余量，能容忍一次 GC、一次丢包、一次笔记本睡眠唤醒。</li>
+      <li>它读的是 <code>/api/hosts</code> 里的 <code>lastSeenAgeMs</code>：这个 age 由 hub 用自己的时钟算好，如果 ≥ 3.5 秒，才判定“心跳停了”。3.5 秒给了三拍 busy 心跳的余量，能容忍一次 GC、一次丢包、一次笔记本睡眠唤醒。</li>
+      <li>它绝不拿 <code>lastSeen</code> 减浏览器本机时钟：两个时间戳来自两台机器，时钟差几秒就会把一条健康心跳算成“停了”。</li>
       <li>它只影响提示文案，不改变回合状态；真正的断线判定仍归 hub。即使 FE 误报，下一次复探也会撤回。</li>
-      <li>老 hub 不返回 <code>lastSeen</code> 时返回 <code>unknown</code>，FE 保持沉默——不猜。</li>
+      <li>老 hub 不返回 <code>lastSeenAgeMs</code> 时按刚收到心跳处理（alive），不猜——因为 v2 hub 每帧都会算出该字段。</li>
     </ul>
 
     <h3><span class="h3no">6.3</span>大帧不能堵住心跳：transport unit 与单 writer</h3>
@@ -1449,9 +1461,9 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
       <table>
         <thead><tr><th>你看到的现象</th><th>host 的证据</th><th>FE 的判断</th><th>用户看到</th></tr></thead>
         <tbody>
-          <tr><td>模型在长时间思考，没有新文本</td><td><code>hb.status.busy = true</code>，每 1s 一拍；<code>lastSeen</code> 新鲜</td><td class="mono">alive</td><td>“工作中”，计时继续走</td></tr>
+          <tr><td>模型在长时间思考，没有新文本</td><td><code>hb.status.busy = true</code>，每 1s 一拍；<code>lastSeenAgeMs</code> 很小</td><td class="mono">alive</td><td>“工作中”，计时继续走</td></tr>
           <tr><td>工具在跑，暂时没有输出</td><td>同上；工具事件可能稀疏，但心跳不断</td><td class="mono">alive</td><td>“工作中”，不误报离线</td></tr>
-          <tr><td>host 静默消失 / 网络黑洞</td><td>心跳停止；<code>lastSeen</code> 变旧；probe 无回应</td><td class="mono">silent → 3.5s 提示 → hub 10s 判死</td><td>“Host 连接中断，正在重连…”</td></tr>
+          <tr><td>host 静默消失 / 网络黑洞</td><td>心跳停止；<code>lastSeenAgeMs</code> 持续变大；probe 无回应</td><td class="mono">silent → 3.5s 提示 → hub 10s 判死</td><td>“Host 连接中断，正在重连…”</td></tr>
           <tr><td>浏览器 ↔ hub 自己断了</td><td>与 host 无关</td><td>FE 连接状态变化</td><td>Hub 连接提示，另走一条 UI 分支</td></tr>
         </tbody>
       </table>
@@ -1560,7 +1572,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <path d="M380 462 L326 462" class="svg-arrow-green" marker-end="url(#flowArrowGreen)"/>
           <text x="352" y="453" text-anchor="middle" class="svg-green" font-size="11" font-weight="700">是</text>
 
-          <text x="540" y="522" text-anchor="middle" class="svg-dim" font-size="10.5">request 写完后：host 累计 ack 证明送达；浏览器请求 5s 未 ack 只失败这一单，不影响会话。</text>
+          <text x="540" y="522" text-anchor="middle" class="svg-dim" font-size="10.5">request 写完后：host 累计 ack 证明送达；只读请求 5s 未 ack 只失败这一单，有副作用的请求按 15s 可靠期限。</text>
         </svg>
       </div>
       <figcaption><b>图 7.1：</b>预检发生在 request 帧写入之前。链路新鲜就直接发；不新鲜就花 1.5 秒敲门。失败返回 503 且不留下任何请求状态，所以 prompt 不会在 host 恢复后突然执行。</figcaption>
@@ -1569,7 +1581,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <h3><span class="h3no">7.2</span>request 写出去之后：两本账，各管一段</h3>
     <p>预检通过，不代表答案一定回来。v2 把后续拆成两个独立的问题：</p>
     <ol>
-      <li><strong>请求送达了吗？</strong>看 host 的累计 <code>ack</code>。request 走会话可靠日志，丢了按 RTO 重传。所有会产生副作用或承载数据的请求，ack 期限是 <code>3 × keepalive = 15s</code>，足够覆盖一次 10s 的 RTO；只有显式白名单里的健康探针和轻量只读接口使用 <code>fastReadAckWindow = 5s</code> 快速失败，失败后浏览器可以安全重试；session-updates 这类承载数据的读走可靠期限。超时只失败这一单并给 host 记一个 abort。</li>
+      <li><strong>请求送达了吗？</strong>看 host 的累计 <code>ack</code>。request 走会话可靠日志，丢了按 RTO 重传。所有会产生副作用或承载数据的请求，ack 期限是 <code>3 × keepalive = 15s</code>，足够覆盖一次 10s 的 RTO；只有显式白名单里的健康探针和轻量只读接口使用 <code>fastReadAckWindow = 5s</code> 快速失败，失败后浏览器可以安全重试；session-updates 这类承载数据的读走可靠期限。当前白名单是 <code>GET /api/status</code>、<code>/api/probe</code>、<code>/api/mcp/list</code>、<code>/api/extensions</code>、<code>/api/settings</code>、<code>POST /api/sessions</code>、<code>POST /api/session-state</code>。超时只失败这一单并给 host 记一个 abort。</li>
       <li><strong>答案回来了吗？</strong>看中继面。<code>respond</code> 按 <code>chunkSeq</code> 分块，hub 用 <code>relayAcks</code> 告诉 host“我收到第几块”。如果 host 已确认请求但迟迟没有答案，就进入 <code>RelayTimeout</code>（45 分钟）的 RPC 等待；host 自己设 40 分钟先失败，保证错因来自更近的一侧。</li>
     </ol>
     <p>两本账不能混：把“答案慢”当成“请求没送到”，会重复执行；把“请求没送到”当成“答案慢”，会让浏览器白等。v2 的解决办法是让 <code>request</code> 和 <code>respond</code> 各用各的序号与确认表，谁也不替谁背锅。</p>
@@ -1584,7 +1596,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <p>这就是“无输出断开发送请求时可感知”的完整含义：<strong>不是让请求永远成功，而是让失败在用户做下一个决定之前发生，并且留下可恢复的入口。</strong></p>
 
     <h3><span class="h3no">7.4</span>为什么 host 恢复后不会“补跑”一条旧 prompt</h3>
-    <p>因为预检失败时根本没有写 request 帧。即使 request 帧已经写出但 host 没 ack，hub 也会在 5 秒后只失败这一单，并给 host 记一个 <code>abort</code> 墓碑；host 收到 abort 后不会执行这个 <code>reqId</code>。如果请求已经执行、答案正在回传，host 的 <code>relayOutbox</code> 会按 <code>(hubBoot, reqId)</code> 保留答案块；重连后用 <code>hello_ack.relayAcks</code> 续传，不重新执行。浏览器重试时复用同一个 <code>promptId</code>，host 的 memo 把它当成同一个请求。</p>
+    <p>因为预检失败时根本没有写 request 帧。即使 request 帧已经写出但 host 没 ack，hub 也只会失败这一单：只读白名单请求按 5 秒快速失败，有副作用的请求按 15 秒可靠期限失败，并给 host 记一个 <code>abort</code> 墓碑；host 收到 abort 后不会执行这个 <code>reqId</code>。如果请求已经执行、答案正在回传，host 的 <code>relayOutbox</code> 会按 <code>(hubBoot, reqId)</code> 保留答案块；重连后用 <code>hello_ack.relayAcks</code> 续传，不重新执行。浏览器重试时复用同一个 <code>promptId</code>，host 的 memo 把它当成同一个请求。</p>
 
     <div class="box checkpoint">
       <div class="box-label">检测点 7.1</div>
@@ -1594,7 +1606,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
 
     <div class="box summary">
       <div class="box-label">本章小结</div>
-      <p>发请求前先看 2 秒新鲜度，不新鲜就花 1.5 秒 probe；失败即 503，不写 request。写出去之后，request 靠会话 ack 证明送达，respond 靠 chunkSeq/relayAcks 证明答案；浏览器 5 秒快速失败，用户看到“等待 Host 确认送达…”或“未送达”。预检换来的是“不会晚点自己跑”的确定性。</p>
+      <p>发请求前先看 2 秒新鲜度，不新鲜就花 1.5 秒 probe；失败即 503，不写 request。写出去之后，request 靠会话 ack 证明送达，respond 靠 chunkSeq/relayAcks 证明答案；只读请求 5 秒快速失败，其余请求按 15 秒可靠期限，用户看到“等待 Host 确认送达…”或“未送达”。预检换来的是“不会晚点自己跑”的确定性。</p>
     </div>
   </section>
   <section class="chapter" id="ch8">
@@ -1613,12 +1625,12 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <p>v2 最重要的结构变化，是把协议模型从 host 和 hub 各自的代码里抽出来，放进 <code>acp-hub/wire</code> 这个嵌套 Go module（包名 <code>wire</code>）。它是纯模型：不 import WebSocket、QUIC、net 或 os，只定义帧、序号、关闭原因、限额和 unit 编解码。host 和 hub 都通过 <code>replace</code> 指向同一份源码，因此不可能出现“两个仓库对同一个字段理解不同”的分叉。</p>
     <p>核心文件：</p>
     <div class="kv">
-      <dt><code>wire/frame.go</code></dt><dd><code>Frame</code> 单一 union、7 类帧、<code>Hello</code>/<code>HelloAck</code>/<code>Audience</code>/<code>Liveness</code>/<code>Limits</code>/<code>RelayAck</code> 类型与校验。</dd>
+      <dt><code>wire/frame.go</code></dt><dd><code>Frame</code> 单一 union、7 类帧、<code>Hello</code>/<code>HelloAck</code>/<code>Audience</code>/<code>Liveness</code>/<code>Limits</code>/<code>RelayAck</code>/<code>HeartbeatStatus</code> 类型与校验。</dd>
       <dt><code>wire/sender.go</code></dt><dd>每方向一个函数式 <code>Sender</code>：分配 seq、保留未确认日志、按 ack 删除、按 RTO 重放；<code>Elide</code> 原地替换占位。</dd>
       <dt><code>wire/receiver.go</code></dt><dd>每方向一个 <code>Receiver</code>：重复帧忽略、乱序帧停泊、只在连续时推进水位；窗口取对端公布的 <code>resumeWindow</code>。</dd>
       <dt><code>wire/unit.go</code></dt><dd>32 KiB transport unit 的 13 字节头、<code>SplitFrame</code>、<code>DecodeUnit</code>、<code>Reassembler</code>；允许完整控制帧插在分片之间。</dd>
       <dt><code>wire/identity.go</code></dt><dd>8 种 <code>CloseReason</code> 及 WS/QUIC 映射表；<code>NewEpoch</code> 随机生成非零 epoch。</dd>
-      <dt><code>wire/limits.go</code></dt><dd><code>DefaultLiveness</code>（5s/20s）、<code>DefaultLimits</code>（8MiB/28MiB/1500）、<code>ProbeAfter</code>/<code>ProbeTimeout</code>/<code>BusyKeepalive</code>。</dd>
+      <dt><code>wire/limits.go</code></dt><dd><code>DefaultLiveness</code>（5s/20s）、<code>DefaultLimits</code>（8MiB/28MiB/1500）、<code>ProbeAfter</code>/<code>ProbeTimeout</code>/<code>BusyKeepalive</code>，以及 ack 的延迟上限 <code>AckDelay = 20ms</code>。</dd>
     </div>
     <p>这份模块的维护规则写在 <code>wire/PROTOCOL-V2.md</code> 顶部：任何 wire 变更必须在同一个 commit 更新协议文档；wire 不得 import 任何 hub 包；如果出现第三方 host 实现或多个 SDK，才考虑拆成独立仓库。当前它仍然是 <code>acp-hub</code> 的嵌套 module，因为 hub 是协议权威。</p>
 
@@ -1686,6 +1698,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
 
     <h3><span class="h3no">8.3</span>握手：hello 与 hello_ack</h3>
     <p>无论 WebSocket 还是 QUIC，握手都是同一个形状：host 先写 <code>hello</code>，hub 回 <code>hello_ack</code>。hello 里带四样东西：<code>epoch</code>、<code>token</code>、<code>resume{up,down}</code>、<code>caps{deflate,transportUnits,relayAck}</code>。hello_ack 回：<code>epoch</code>、<code>hubBoot</code>、<code>ackUp/ackDown</code>、当前 <code>audience</code>、<code>liveness</code>、<code>limits</code>、能力回显、当前 <code>relayAcks</code>。</p>
+    <p>从 v0.5.0 起，hub 的配对码、host 归属和浏览器订阅都按用户隔离；这些是 hub 的账户层规则，不改变 host ↔ hub 的帧形状。<code>hello.token</code> 仍然只证明这台 host 的身份，hub 用它解析出 <code>hostId</code>，不会从 token 里推断用户。</p>
     <p>resume 的语义值得单独记：</p>
     <ul>
       <li><strong>同 epoch 重连：</strong>host 从 hub 的 <code>ackUp</code> 重放上行日志；hub 用 <code>hello.resume.down</code> 把下行确认推进到 host 已应用的位置，只前进不回退。</li>
@@ -1701,6 +1714,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
       <li><strong>可靠 events 与 relay 轮转：</strong>两者在帧边界交替，避免任意一方饿死；</li>
       <li><strong>大帧分片：</strong>压缩后按 32 KiB 切片，每个片之间有机会插入控制帧；</li>
       <li><strong>RTO 抑制：</strong>writer 正在写一个逻辑帧时，会话不触发重传；写完最后一个 unit 后才重新开始等 ack；写进展会重置 RTO；</li>
+      <li><strong>延迟确认：</strong>接收水位前进后，<code>20ms</code>（<code>AckDelay</code>）内必须有出站帧携带新 <code>ack</code>；host 用延迟确认定时器，hub 在 ack 推进时直接补发一帧 <code>hb</code>；</li>
       <li><strong>写超时：</strong>按 unit 计算，<code>idle × 3/4 = 15s</code>，替换旧的固定 30s。</li>
     </ol>
     <p>为什么“单 writer”这么重要？因为多 goroutine 同时写一个 socket，会出现帧交错、写顺序不可控、ack 与重传互相踩踏。单 writer 把并发问题收敛成一个队列问题：谁先谁后由优先级决定，不由调度器决定。</p>
@@ -1724,8 +1738,8 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
         <tbody>
           <tr><td>P1 live lite</td><td><code>acp-host/internal/acp/lite.go</code><br><code>acp-fe/src/store/chat/loadHistory.ts</code><br><code>acp-fe/src/store/chat/historyFill.ts</code></td><td><code>DetailLite</code>、<code>liteProjectPage</code>、<code>liteStamp</code>、<code>historyWindowBuffer</code>、<code>fillEntryRange</code></td></tr>
           <tr><td>P2 按观看者省流</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-host/internal/hub/client.go</code><br><code>acp-host/internal/hub/session.go</code></td><td><code>viewingSetLocked</code>、<code>audienceLocked</code>、<code>SetSubscriberViewing</code>、<code>setAudience</code>、<code>trimUnwatched</code></td></tr>
-          <tr><td>P3 正常断开</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-hub/cmd/capri-hub/main.go</code></td><td><code>detach</code>、<code>hostsChanged</code>、<code>Online</code>/<code>LastSeen</code></td></tr>
-          <tr><td>P4 输出中断</td><td><code>acp-host/internal/hub/session.go</code><br><code>acp-host/internal/hub/writer.go</code><br><code>acp-fe/src/store/chat/actions/hosts.ts</code><br><code>acp-fe/src/components/composer/Composer.tsx</code></td><td><code>hbInterval</code>、<code>BusyKeepalive</code>、<code>SplitFrame</code>、<code>SILENCE_PROBE_AFTER_MS</code>、<code>HOST_HEARTBEAT_STALE_MS</code>、<code>probeHostHeartbeat</code></td></tr>
+          <tr><td>P3 正常断开</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-hub/cmd/capri-hub/main.go</code></td><td><code>detach</code>、<code>hostsChanged</code>、<code>Online</code>/<code>LastSeen</code>/<code>LastSeenAgeMs</code></td></tr>
+          <tr><td>P4 输出中断</td><td><code>acp-host/internal/hub/session.go</code><br><code>acp-host/internal/hub/writer.go</code><br><code>acp-fe/src/store/chat/actions/hosts.ts</code><br><code>acp-fe/src/components/composer/TurnStatusLine.tsx</code></td><td><code>hbInterval</code>、<code>BusyKeepalive</code>、<code>SplitFrame</code>、<code>SILENCE_PROBE_AFTER_MS</code>、<code>HOST_HEARTBEAT_STALE_MS</code>、<code>probeHostHeartbeat</code></td></tr>
           <tr><td>P5 请求预检</td><td><code>acp-hub/internal/hub/hub.go</code><br><code>acp-hub/internal/hub/session.go</code><br><code>acp-host/internal/hub/relay_outbox.go</code></td><td><code>DispatchPolicy</code>、<code>relayHealthWindow</code>、<code>relayProbeTimeout</code>、<code>fastReadAckWindow</code>、<code>relayAcks</code>、<code>relayOutbox</code></td></tr>
         </tbody>
       </table>
@@ -1779,7 +1793,8 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <tr><td>relay 块乱序/重复</td><td>按 <code>chunkSeq</code> 停块/去重，连续后按序应用</td><td>答案不会拼错、不会重复写</td></tr>
           <tr><td>relay 断链</td><td><code>hello_ack.relayAcks</code> 水位后续传；<code>done</code>/<code>abort</code> 释放</td><td>不重跑请求，答案能续传</td></tr>
           <tr><td>浏览器请求时 host 不可达</td><td>2s 新鲜窗 + 1.5s preflight；失败 503，不写 request</td><td>马上失败，绝不当“晚点自己跑”的幽灵</td></tr>
-          <tr><td>请求帧 5s 未被 ack</td><td>只失败这一单，记 abort，会话继续</td><td>其他请求不受影响，重试可幂等</td></tr>
+          <tr><td>请求帧超过 ack 期限</td><td>只读白名单 5s、其余请求 15s；只失败这一单，记 abort，会话继续</td><td>有副作用的请求不会在 host 已执行后被提前判失败；重试可幂等</td></tr>
+          <tr><td>单台 host 在途中继请求过多</td><td><code>maxPendingRelayPerHost = 16</code>，新的请求直接返回 429</td><td>不会无限占用内存；已有请求继续跑，稍后可重试</td></tr>
           <tr><td>audience 收窄/抖动</td><td>未观看正文变 <code>trimmed</code>；未确认 audience 只保留最新 gen</td><td>省流不破序，状态不堆积</td></tr>
         </tbody>
       </table>
@@ -1788,29 +1803,29 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     <h3><span class="h3no">9.2</span>v1 到 v2：数字会说话</h3>
     <div class="tablewrap">
       <table>
-        <thead><tr><th>指标</th><th>v1（main）</th><th>v2（refactor/session-v2）</th><th>变化带来的感受</th></tr></thead>
+        <thead><tr><th>指标</th><th>v1（main）</th><th>v2（main / v0.5.1）</th><th>变化带来的感受</th></tr></thead>
         <tbody>
           <tr class="hl"><td>host↔hub 帧类型</td><td class="mono">10</td><td class="mono">7</td><td>少掉三套“补丁帧”，行为更可预测</td></tr>
           <tr><td>存活时间值</td><td>四套独立定时器</td><td>一条 <code>keepalive + idle</code> 时间尺度，probe 是派生升级</td><td>不会再出现“这个超时和那个超时打架”</td></tr>
           <tr><td>每方向状态修复路径</td><td>2 条（主动修复 + 隐式重发）</td><td>1 条（未确认日志按 ack 重放）</td><td>排障时只有一个真相</td></tr>
           <tr class="hl"><td>最坏 relay 丢弃等待</td><td class="mono">45 分钟</td><td class="mono">15 秒</td><td>请求失败从“吃个饭回来”变成“眨个眼”</td></tr>
           <tr><td>host <code>client.go</code> 行数</td><td class="mono">约 4,186 行</td><td class="mono">约 1,389 行</td><td>少了三套队列和两套会话层</td></tr>
-          <tr><td>hub <code>hub.go</code> 行数</td><td class="mono">约 3,896 行</td><td class="mono">约 3,402 行</td><td>删掉重复的状态机后更好读</td></tr>
+          <tr><td>hub <code>hub.go</code> 行数</td><td class="mono">约 3,896 行</td><td class="mono">约 3,974 行<br><span style="color:var(--ink-3)">（v2 重构时 3,402）</span></td><td>核心会话层先收敛到 3,402；v0.5.x 的多用户与中继策略补回约 570 行</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="small">上表中的代码行数是本轮重构提交的统计口径，用于说明“结构收敛”的方向，不是性能指标。帧类型与超时数值来自 v1 对比页与 v2 协议文档。</p>
+    <p class="small">上表中的代码行数是本轮重构提交的统计口径，用于说明“结构收敛”的方向，不是性能指标。当前数字按 2026-11-20 的 <code>main</code>（v0.5.1）复核；帧类型与超时数值来自 v1 对比页与 v2 协议文档。</p>
 
     <h3><span class="h3no">9.3</span>验证：怎么知道这些不是纸上谈兵</h3>
     <p>本轮工作区的验证记录包括：</p>
     <ul>
-      <li><code>acp-hub/wire</code>：<code>go build/vet/test ./...</code>、<code>go test -race ./...</code>，24+ 个测试函数，500 条随机丢包/乱序/重复轨迹。</li>
+      <li><code>acp-hub/wire</code>：<code>go build/vet/test ./...</code>、<code>go test -race ./...</code>，35 个测试函数，500 条随机丢包/乱序/重复轨迹。</li>
       <li><code>acp-hub</code>：<code>go test ./...</code>、<code>go test -race ./internal/hub ./cmd/capri-hub</code>。</li>
       <li><code>acp-host</code>：<code>go test ./...</code>、<code>go test -race ./internal/hub ./internal/acp</code>。</li>
       <li>跨仓库 e2e：<code>CAPRI_E2E_HUB=$HOME/ccwork/acp-hub go test -tags e2e ./internal/hub -run TestE2E -v</code>，WebSocket 与 QUIC 都通过，包含 4 MB relay 场景。</li>
-      <li>FE：<code>npx tsc -b</code>、<code>npx vitest run</code>（237 个文件、2910 个测试）、<code>npm run build</code> 全过。</li>
+      <li>FE：<code>npx tsc -b</code>、<code>npx vitest run</code>（重构时 237 个文件、2910 个测试）、<code>npm run build</code> 全过。</li>
     </ul>
-    <p>这些记录说明协议的核心路径有自动化覆盖。它们不说明“所有慢写/超大帧/真实浏览器 host-kill 场景都已 E2E 覆盖”——这些仍是第 10 章列出的未来事项。诚实地说明边界，比堆一张“全部通过”的奖状更有用。</p>
+    <p>2026-11-20 本次修订复跑了三个 Go 仓库的 <code>go test ./...</code>（wire / hub / host），全部通过；FE 的浏览器交互验证见页面内的断线时钟与观众实验。原有记录说明协议核心路径有自动化覆盖，但不说明“所有慢写/超大帧/真实浏览器 host-kill 场景都已 E2E 覆盖”——这些仍是第 10 章列出的未来事项。诚实地说明边界，比堆一张“全部通过”的奖状更有用。</p>
 
     <div class="box checkpoint">
       <div class="box-label">检测点 9.1</div>
@@ -1851,9 +1866,9 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <g>
             <rect x="28" y="78" width="300" height="96" rx="10" class="svg-box-red"/>
             <text x="46" y="102" class="svg-text" font-size="13" font-weight="700">① 可观测性</text>
-            <text x="46" y="122" class="svg-dim" font-size="10.8">重传次数 · RTO · outbox 深度</text>
-            <text x="46" y="139" class="svg-dim" font-size="10.8">close reason 分布 · relay 延迟</text>
-            <text x="46" y="156" class="svg-dim" font-size="10.8">没有 metrics，调参就是猜</text>
+            <text x="46" y="122" class="svg-dim" font-size="10.8">已有 /api/stats：扇出、evbuf、下行积压</text>
+            <text x="46" y="139" class="svg-dim" font-size="10.8">仍缺重传、RTO、close reason、relay 延迟</text>
+            <text x="46" y="156" class="svg-dim" font-size="10.8">补齐这些，调参才不靠猜</text>
 
             <rect x="28" y="190" width="300" height="82" rx="10" class="svg-box-red"/>
             <text x="46" y="214" class="svg-text" font-size="13" font-weight="700">② 慢链路 probe 自适应</text>
@@ -1910,7 +1925,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     </figure>
 
     <h3><span class="h3no">10.1</span>可观测性：先让协议会“说话”</h3>
-    <p>v2 目前没有 metrics。这不是小事：协议里有 RTO、重传、outbox 深度、resumeWindow、relayAcks、close reason，但出了线上问题，工程师只能翻日志。下一步应该把关键指标做成可聚合的计数器/直方图：</p>
+    <p>v2 已经有一半“会说话”：hub 提供 admin-only 的 <code>GET /api/stats</code>，按 host 暴露 <code>lastSeq</code>、<code>epoch</code>、<code>fanoutDropped</code>、<code>fanoutLen</code>、<code>subscribers</code>、<code>evBufLen</code>、<code>evBufBytes</code>、<code>downUnacked</code>，进程级暴露 <code>feDropped</code>、<code>feResyncs</code>、<code>uptimeSeconds</code>。这些足够回答“扇出有没有丢、FE 有没有 resync、下行 ack 有没有积压”。但协议内部还缺下面这些可聚合的计数器/直方图：</p>
     <ul>
       <li>每方向的重传次数、RTO 触发次数、ack 延迟分布；</li>
       <li>outbox 的条目数/字节数、trimmed 比例、overflow 次数；</li>
@@ -1987,7 +2002,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     </div>
 
     <h3><span class="h3no">11.2</span>最后一段话</h3>
-    <p>学到这里，你不需要记住每一个常量。你只要在看到“连接中断，正在重连……”时，能想起背后有 1 秒的忙碌心跳、2 秒的静默探针、3.5 秒的 stale 判断、7 秒的 probe、10 秒的关闭，还有 20 秒的 idle 兜底——这就够了。</p>
+    <p>学到这里，你不需要记住每一个常量。你只要在看到“连接中断，正在重连……”时，能想起背后有 20 毫秒的 ack 延迟、1 秒的忙碌心跳、2 秒的静默探针、3.5 秒的 stale 判断、7 秒的 probe、10 秒的关闭，还有 20 秒的 idle 兜底——这就够了。</p>
     <p>协议不是写给机器看的。机器只认字段，人认的是“现在到底发生了什么”。一份好的协议，应该让屏幕前的人不必猜：消息到哪了、对方还在不在、我发的这句话算不算数。v2 把这些问题变成了可以验证的数字：<code>seq</code>、<code>ack</code>、<code>gen</code>、<code>probe</code>。</p>
     <p class="center" style="margin-top:42px;color:var(--ink-3);font-family:var(--font-kai);font-size:19px">—— 全文完 ——</p>
   </section>
@@ -2005,29 +2020,31 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
       <table>
         <thead><tr><th>类别</th><th>常量</th><th class="nowrap">默认值</th><th>作用</th></tr></thead>
         <tbody>
-          <tr><td rowspan="6">存活</td><td class="mono">keepalive</td><td class="mono">5s</td><td>空闲 hb 周期；传输层保活周期</td></tr>
+          <tr><td rowspan="7">存活</td><td class="mono">keepalive</td><td class="mono">5s</td><td>空闲 hb 周期；传输层保活周期</td></tr>
           <tr><td class="mono">BusyKeepalive</td><td class="mono">1s</td><td>回合活跃时的 hb 周期</td></tr>
           <tr><td class="mono">idle</td><td class="mono">20s</td><td>无完整帧超时，按 liveness 关闭</td></tr>
           <tr><td class="mono">ProbeAfter</td><td class="mono">7s</td><td>无帧多久后发 probe</td></tr>
           <tr><td class="mono">ProbeTimeout</td><td class="mono">3s</td><td>probe 无回应多久后关闭</td></tr>
           <tr><td class="mono">RTO</td><td class="mono">10s</td><td>2 × keepalive；未确认日志重传</td></tr>
+          <tr><td class="mono">AckDelay</td><td class="mono">20ms</td><td>接收水位前进后，新 ack 必须在出站帧上发出的延迟上限</td></tr>
           <tr><td rowspan="5">限额</td><td class="mono">maxFrame</td><td class="mono">8 MiB</td><td>单个逻辑帧上限</td></tr>
           <tr><td class="mono">maxRelayBody</td><td class="mono">28 MiB</td><td>单个中继答案上限</td></tr>
           <tr><td class="mono">resumeWindow</td><td class="mono">1500 帧</td><td>接收方乱序停泊窗口</td></tr>
           <tr><td class="mono">UnitSize</td><td class="mono">32 KiB</td><td>transport unit 数据段目标</td></tr>
           <tr><td class="mono">unit header</td><td class="mono">13 B</td><td>flags/frameID/total/offset</td></tr>
-          <tr><td rowspan="4">中继</td><td class="mono">relayChunkSize</td><td class="mono">256 KiB</td><td>host 每个 respond 块的负载</td></tr>
+          <tr><td rowspan="5">中继</td><td class="mono">relayChunkSize</td><td class="mono">256 KiB</td><td>host 每个 respond 块的负载</td></tr>
           <tr><td class="mono">RelayTimeout</td><td class="mono">45m</td><td>已确认请求等待答案的上限</td></tr>
           <tr><td class="mono">host relay timeout</td><td class="mono">40m</td><td>host 侧先失败，给更近的错因</td></tr>
           <tr><td class="mono">fastReadAckWindow</td><td class="mono">5s</td><td>只读请求帧未 ack 的快速失败期限</td></tr>
+          <tr><td class="mono">maxPendingRelayPerHost</td><td class="mono">16</td><td>单台 host 并发中继请求上限，超出返回 429</td></tr>
           <tr><td rowspan="3">预检</td><td class="mono">relayHealthWindow</td><td class="mono">2s</td><td>最近有帧则跳过 preflight</td></tr>
           <tr><td class="mono">relayProbeTimeout</td><td class="mono">1.5s</td><td>preflight probe 等待上限</td></tr>
-          <tr><td class="mono">general request ack</td><td class="mono">15s</td><td>3 × keepalive，非浏览器请求</td></tr>
+          <tr><td class="mono">general request ack</td><td class="mono">15s</td><td>3 × keepalive，默认/有副作用请求的 ack 期限</td></tr>
           <tr><td rowspan="3">观众</td><td class="mono">maxViewingSessions</td><td class="mono">64</td><td>超过则 all=true 不裁剪</td></tr>
           <tr><td class="mono">maxViewingSessionIDLen</td><td class="mono">128 B</td><td>超长 id 也 widen 到 all</td></tr>
           <tr><td class="mono">viewingChildCap</td><td class="mono">4096</td><td>子代理父子关系 FIFO 上限</td></tr>
           <tr><td rowspan="4">FE</td><td class="mono">SILENCE_PROBE_AFTER_MS</td><td class="mono">2s</td><td>busy 静默多久后查 /api/hosts</td></tr>
-          <tr><td class="mono">HOST_HEARTBEAT_STALE_MS</td><td class="mono">3.5s</td><td>lastSeen 多旧算心跳停</td></tr>
+          <tr><td class="mono">HOST_HEARTBEAT_STALE_MS</td><td class="mono">3.5s</td><td><code>lastSeenAgeMs</code> 多大算心跳停</td></tr>
           <tr><td class="mono">HEARTBEAT_REPROBE_MS</td><td class="mono">1s</td><td>静默期间复探间隔</td></tr>
           <tr><td class="mono">SEND_ACK_GRACE_MS</td><td class="mono">3s</td><td>没受理回执多久后改文案</td></tr>
         </tbody>
@@ -2079,21 +2096,21 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
           <tr><td class="mono">acp-hub/wire/frame.go</td><td><code>Frame</code> 单一 union、7 类帧、校验</td></tr>
           <tr><td class="mono">acp-hub/wire/sender.go · receiver.go</td><td>seq/ack、日志、乱序停泊、trimmed 替换</td></tr>
           <tr><td class="mono">acp-hub/wire/unit.go</td><td>32 KiB transport unit 编解码与重组</td></tr>
-          <tr><td class="mono">acp-hub/internal/hub/session.go · writer.go · hub.go</td><td>hub 侧会话、writer、注册表、audience、fan-out</td></tr>
+          <tr><td class="mono">acp-hub/internal/hub/session.go · writer.go · hub.go</td><td>hub 侧会话、writer、注册表、audience、fan-out；<code>GET /api/stats</code> 的诊断快照</td></tr>
           <tr><td class="mono">acp-host/internal/hub/session.go · writer.go · outbox.go</td><td>host 侧会话、单 writer、上行日志</td></tr>
           <tr><td class="mono">acp-host/internal/hub/relay.go · relay_outbox.go · relay_lane.go</td><td>中继请求、答案日志、chunkSeq/relayAcks、QUIC 独立 relay lane</td></tr>
           <tr><td class="mono">acp-host/internal/acp/lite.go</td><td>lite 投影：删正文、折工具卡、记 omitted/msgSeqEnd</td></tr>
           <tr><td class="mono">acp-fe/src/store/chat/historyFill.ts · loadHistory.ts</td><td>lite 请求策略、窗口缓冲、full 补全</td></tr>
-          <tr><td class="mono">acp-fe/src/store/chat/actions/hosts.ts · components/composer/Composer.tsx</td><td>FE 静默探针、lastSeen stale 判断、发送确认文案</td></tr>
+          <tr><td class="mono">acp-fe/src/store/chat/actions/hosts.ts · components/composer/TurnStatusLine.tsx</td><td>FE 静默探针、<code>lastSeenAgeMs</code> stale 判断、发送确认文案</td></tr>
         </tbody>
       </table>
     </div>
     <h3><span class="h3no">C.1</span>参考条目</h3>
     <ol class="small" style="max-width:80ch">
-      <li>capri-hub. <em>Capri host↔hub session protocol v2</em>. <code>acp-hub/wire/PROTOCOL-V2.md</code>, 2026-11-02.</li>
+      <li>capri-hub. <em>Capri host↔hub session protocol v2</em>. <code>acp-hub/wire/PROTOCOL-V2.md</code>, 2026-11-18 修订（main / v0.5.1）。</li>
       <li>capri-host. <em>lite.go — /api/session-updates 的投影档位</em>. <code>acp-host/internal/acp/lite.go</code>.</li>
       <li>capri-fe. <em>historyFill.ts / loadHistory.ts — 精简回放与窗口缓冲</em>. <code>acp-fe/src/store/chat/</code>.</li>
-      <li>capri-fe. <em>hosts.ts / Composer.tsx — 静默探针与连接中断文案</em>. <code>acp-fe/src/</code>.</li>
+      <li>capri-fe. <em>hosts.ts / TurnStatusLine.tsx — 静默探针、lastSeenAgeMs 与连接中断文案</em>. <code>acp-fe/src/</code>.</li>
     </ol>
   </section>
 </main>
@@ -2101,7 +2118,7 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
 
 <footer>
   <div class="fin">—— 把协议讲成人话，把断线讲成时间 ——</div>
-  <p>capri session v2 协议讲义 · 2026-11-02 · 基于 <code>refactor/session-v2</code> 工作区<br>
+  <p>capri session v2 协议讲义 · 2026-11-20 · 基于 <code>acp-hub</code> / <code>acp-host</code> 的 <code>main</code> 工作区（hub v0.5.1）<br>
   解释性文档；实现以 <code>wire/PROTOCOL-V2.md</code> 与当前代码为准。</p>
 </footer>
 
@@ -2185,22 +2202,22 @@ footer .fin{font-family:var(--font-kai);font-size:22px;color:var(--red);margin-b
     if (t < 2) {
       return {
         host: "最后一次发帧后的最初 2 秒。正常时 host 会每 1 秒发一次忙心跳；这里假设它已经消失。",
-        hub: "LastSeen 还停留在 2 秒以内，preflight 的 2 秒新鲜窗仍然信任这条链路。",
+        hub: "lastSeenAgeMs 还在 2 秒以内，preflight 的 2 秒新鲜窗仍然信任这条链路。",
         fe: "有 live 事件或刚结束，界面正常。"
       };
     }
     if (t < 3.5) {
       return {
         host: "host 仍然没有新的帧；正常应出现的忙心跳缺席。",
-        hub: "LastSeen 逐渐变旧，但仍可能没超过 3.5 秒，注册表还没判离线。",
+        hub: "lastSeenAgeMs 逐渐变大，但仍可能没超过 3.5 秒，注册表还没判离线。",
         fe: "busy 且静默 2 秒：FE 去查一次 /api/hosts，开始每秒复探；提示还没出现。"
       };
     }
     if (t < 7) {
       return {
         host: "host 没有任何响应；如果还活着，它本该在 1 秒一拍的心跳里出现。",
-        hub: "LastSeen 已超过 3.5 秒。hub 继续等自己的 7 秒 probeAfter，暂不惊动会话。",
-        fe: "lastSeen 年龄 ≥ 3.5 秒：界面显示“Host 连接中断，正在重连…”，并在每次复探中观察是否恢复。"
+        hub: "lastSeenAgeMs 已超过 3.5 秒。hub 继续等自己的 7 秒 probeAfter，暂不惊动会话。",
+        fe: "lastSeenAgeMs ≥ 3.5 秒：界面显示“Host 连接中断，正在重连…”，并在每次复探中观察是否恢复。"
       };
     }
     if (t < 10) {

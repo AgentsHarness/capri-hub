@@ -1,8 +1,12 @@
-# Capri host↔hub session protocol v2
+# Capri host↔hub session protocol, wire version 3
 
-Status: implemented by `capri-host` and `capri-hub` on the
-`refactor/session-v2` branch. No backward compatibility with v1; host, hub
-and FE ship together.
+Status: implemented by `capri-host` and `capri-hub`. `wire.ProtocolVersion`
+is 3; no backward compatibility with earlier versions, host, hub and FE ship
+together. The filename `PROTOCOL-V2.md` is historical and kept so existing
+links stay valid.
+
+Version 3 moves `audience` out of the reliable sequence space: it is absolute
+latest-wins state, carries no seq and is never acknowledged.
 
 Scope: the session between `capri-host` and `capri-hub`. The browser-facing
 `/ws/fe` wire keeps its current `seq` / `subscribed.seq` / `trimmed`
@@ -18,7 +22,9 @@ delivery proof moves onto the session ack.
    been applied. The receiver advances only over contiguous frames.
 3. **generation** — absolute state carries a per-host monotonic `gen`.
    `gen` orders state across sessions; `seq` orders frames inside one
-   session. They are never substituted for each other.
+   session. They are never substituted for each other. `audience` is the
+   only absolute state frame: unreliable, gen-ordered and latest-wins, so it
+   consumes no seq and needs no ack.
 4. **placeholder** — when a payload is discarded, its seq is kept and the
    frame becomes `{"type":"trimmed",...}`. A hole is never opened.
 
@@ -30,9 +36,9 @@ A session is `(hostId, epoch)`.
   non-zero) and sent in `hello`.
 - Same epoch on reconnect = resume. The host replays its unacked log from
   the hub's `ackUp`.
-- New epoch = new sequence space. The hub resets the up watermark, the
-  down sender, and the out-of-order buffers. The per-host `audience.gen`
-  keeps increasing; it is not reset by an epoch change.
+- New epoch = new sequence space. The hub resets the up watermark and the
+  down sender. The per-host `audience.gen` keeps increasing; it is not reset
+  by an epoch change.
 - `hello.resume.up` carries the retired high-water mark at the start of a
   new epoch. The hub seeds its up receiver with it, so the first live
   up-seq is `resume.up + 1`; events below it are history the FE rebuilds
@@ -61,15 +67,15 @@ A session is `(hostId, epoch)`.
 Every host↔hub JSON frame has:
 
 ```json
-{"v":2,"type":"...","seq":N,"ack":M}
+{"v":3,"type":"...","seq":N,"ack":M}
 ```
 
 - `seq` is present on reliable frames and absent (or 0) on unreliable ones.
-- `ack` is present on every frame that can carry it. It acknowledges the
-  opposite direction's reliable frames. A peer that has advanced its receive
-  watermark MUST put the new `ack` on an outbound frame within `AckDelay`
-  (20ms) even when it has no application data to send; the periodic
-  heartbeat is a liveness clock, not the maximum ack latency.
+- `ack` is present on every frame that can carry it, except `audience`.
+  It acknowledges the opposite direction's reliable frames. A peer that has
+  advanced its receive watermark MUST put the new `ack` on an outbound frame
+  within `AckDelay` (20ms) even when it has no application data to send; the
+  periodic heartbeat is a liveness clock, not the maximum ack latency.
 - `epoch` appears only in `hello` / `hello_ack`; every other frame belongs
   to the session's epoch implicitly. `hubBoot` appears only in `hello_ack`
   and identifies the hub process for the life of the session.
@@ -85,8 +91,8 @@ Every host↔hub JSON frame has:
   `relayAck`. A capability is only used after the hub echoes it in
   `hello_ack`.
 
-Reliable in the session seq space: `events`, `audience`, `request`.
-Unreliable in that space: `hello`, `hello_ack`, `hb`, `respond`.
+Reliable in the session seq space: `events`, `request`.
+Unreliable in that space: `hello`, `hello_ack`, `audience`, `hb`, `respond`.
 
 `respond` is reliable at the relay layer (per-request, chunked) and does not
 consume the session seq space; its `seq` is 0. It still carries `ack` so it
@@ -100,7 +106,7 @@ Both transports use one shape: the host writes `hello` as the first frame.
 ### 3.1 Host → hub
 
 ```json
-{"v":2,"type":"hello","epoch":7,"token":"...",
+{"v":3,"type":"hello","epoch":7,"token":"...",
  "resume":{"up":41,"down":17},
  "caps":{"deflate":true,"transportUnits":true,"relayAck":true}}
 ```
@@ -118,10 +124,10 @@ Both transports use one shape: the host writes `hello` as the first frame.
 ### 3.2 Hub → host
 
 ```json
-{"v":2,"type":"hello_ack","epoch":7,"hubBoot":9001,"ackUp":41,"ackDown":17,
+{"v":3,"type":"hello_ack","epoch":7,"hubBoot":9001,"ackUp":41,"ackDown":17,
  "audience":{"gen":33,"watchers":2,"all":false,"sessions":["s1"]},
  "liveness":{"keepalive":5,"idle":20},
- "limits":{"maxFrame":8388608,"maxRelayBody":29360128,"resumeWindow":1500},
+ "limits":{"maxFrame":8388608,"maxRelayBody":29360128},
  "caps":{"deflate":true,"transportUnits":true,"relayAck":true}}
 ```
 
@@ -135,9 +141,7 @@ Both transports use one shape: the host writes `hello` as the first frame.
   lock at handshake time.
 - `liveness` is in seconds. `idle` MUST be at least `2*keepalive`.
 - `limits` replace the duplicated constants (`maxFrameBytes`,
-  `replayFrameBudget`, `eventBufCap`, 28MB relay cap). `resumeWindow` is
-  the receiver's parked-frame bound in both directions: each side builds
-  its receiver with the window it was told, never with a package constant.
+  `replayFrameBudget`, `eventBufCap`, 28MB relay cap).
 - `caps.deflate` echoes the host's offer. Compressed uplink frames are
   allowed only after this echo. `caps.transportUnits` and `caps.relayAck`
   echo the same way and gate transport-unit framing (§7.1) and the relay ack
@@ -164,12 +168,15 @@ In the up direction one log entry is one **event**, and the event's own seq
 is the session seq. An `events` frame is a transport batch of a contiguous
 run of entries; the frame's `seq` is the first entry's seq. The hub accepts
 each event in order, so its watermark has the same per-event meaning as the
-FE's. In the down direction one log entry is one frame (audience/request).
+FE's. In the down direction one log entry is one frame (`request`); `audience`
+is absolute state and never enters the log.
 
 - Assign: `next++`, stamp `seq`, append to `log`.
 - Ack: `ack >= acked` drops every frame `<= ack`; `acked = max(acked, ack)`.
-- Retransmit on RTO (`2*keepalive`, reset on ack progress): send every
-  frame in `log` in order, starting at `acked+1`.
+- Retransmit on RTO (`2*keepalive`, reset on ack progress): send a bounded
+  batch from the unacked log, starting at `acked+1`. The hub replays at most
+  8 frames / 1MiB per batch; the host replays one contiguous `events` batch
+  capped by `limits.maxFrame`. Entries stay in the log until acknowledged.
 - No max-retry counter. The session idle timer ends a dead link.
 
 ### 4.2 Receiver
@@ -177,16 +184,20 @@ FE's. In the down direction one log entry is one frame (audience/request).
 ```go
 type Receiver struct {
     acked uint64
-    buf   map[uint64]Frame // at most resumeWindow frames
 }
 ```
 
+Reliable frames travel on one ordered stream (a WebSocket message stream,
+or the single QUIC control stream), and the sender never creates a gap: an
+uplink gap in the event bus becomes `trimmed` placeholders at the missing
+seqs, and the hub assigns downlink seqs consecutively. Acceptance is
+therefore strict — there is no reorder buffer and nothing to park.
+
 - `seq <= acked`: duplicate; apply nothing, still ack.
-- `seq == acked+1`: apply, then drain contiguous buffered frames.
-- `seq > acked+1`: park. If `len(buf) > resumeWindow`, close the session
-  with `overflow`; the peer reconnects with the same epoch and replays from
-  its log. The watermark MUST NOT jump. The window is the value the peer
-  advertised in `hello_ack.limits.resumeWindow`, not a local constant.
+- `seq == acked+1`: apply and advance the watermark.
+- `seq > acked+1`: protocol violation; close the session with `protocol`.
+  The watermark MUST NOT jump, and the gap is not remembered: a peer that
+  repairs the stream still has to continue from `acked+1`.
 
 ### 4.3 Flow control / outbox
 
@@ -211,7 +222,7 @@ is the repair path.
 ### 5.1 `events` (host → hub, reliable)
 
 ```json
-{"v":2,"type":"events","seq":100,"ack":17,
+{"v":3,"type":"events","seq":100,"ack":17,
  "events":[{"type":"chunk","seq":100,...},{"type":"chunk","seq":101,...}]}
 ```
 
@@ -224,52 +235,79 @@ is the repair path.
 - A receiver that sees a non-contiguous run closes with `unreadable`. The
   frame carries no separate first-seq field.
 
-### 5.2 `audience` (hub → host, reliable)
+### 5.2 `audience` (hub → host, unreliable)
 
 ```json
-{"v":2,"type":"audience","seq":12,"ack":100,
+{"v":3,"type":"audience",
  "gen":34,"watchers":2,"all":false,"sessions":["s1","s2"]}
 ```
 
-- Absolute state. `watchers` is the number of FE subscribers receiving this
-  host's events; `watchers == 0` pauses event upload.
+- Absolute state, gen-ordered and latest-wins. It carries no `seq` and no
+  `ack`: audience is never retransmitted and never enters the reliable log.
+- `watchers` is the number of FE subscribers receiving this host's events;
+  `watchers == 0` pauses event upload.
 - `sessions` is the union of displayed sessions plus one level of subagent
   children. `all:true` means the audience cannot be narrowed; the host
   filters nothing.
-- Apply when `gen >= lastGen`. Equal gen = duplicate: apply once, still ack.
-- The hub keeps at most one unacknowledged audience frame per session. A newer
-  snapshot replaces its payload in place under the same seq; if the previous
-  payload may already have been applied under that seq, the newest snapshot is
-  also sent under a fresh seq.
-- A receiver MUST apply an audience frame carrying a newer `gen` even when its
-  seq is at or below the delivered watermark: the seq can predate an in-place
-  payload update.
-- This single frame replaces `subscribers` and `viewing`, their two gens,
-  their two ack paths and their two retransmit entries.
+- Apply when `gen >= lastGen`; an older gen is ignored. An equal gen is the
+  same state applied again, which changes nothing — the hub repeats the
+  newest snapshot on every periodic heartbeat.
+- The hub keeps one latest-wins slot, not a queue: a burst of viewer changes
+  leaves only the newest snapshot to write. A frame lost on the wire is
+  corrected by the next heartbeat refresh, so the worst-case staleness is one
+  heartbeat interval.
+- This single frame replaces `subscribers` and `viewing`, their two gens and
+  their two reliability paths.
 
 ### 5.3 `request` (hub → host, reliable)
 
 ```json
-{"v":2,"type":"request","seq":13,"ack":100,
- "reqId":"7","method":"POST","path":"/api/...","body":{}}
+{"v":3,"type":"request","seq":13,"ack":100,
+ "reqId":"7","method":"POST","path":"/api/...","body":{},
+ "idemKey":"5f0c...","idemScope":"root"}
 ```
 
-- Delivery is proven by the host's cumulative `ack`. The hub fails a
-  request if its frame is not acked within the request ack deadline. The
-  default is `3*keepalive` (one RTO of `2*keepalive` to retransmit a lost
-  frame plus one heartbeat of margin, so a single loss never fails a request
-  the session repaired). It fails a request if no response arrives within
-  `RelayTimeout` (45m).
-- An explicit allowlist of health probes and small idempotent reads MAY use
-  a shorter fast-read deadline (5s). Those requests are safe to retry and
-  may fail on a single lost frame; data-bearing reads, mutating requests and
-  every non-idempotent request MUST use the `3*keepalive` deadline.
+- `idemKey` / `idemScope` are request-only. Any other frame type carrying
+  either field closes with `protocol`; so does a scope without a key.
+  `idemKey` is 1..128 bytes, `idemScope` 0..64, both printable ASCII. The
+  hub generates the scope from the authenticated identity (`root`,
+  `user:<id>`, `guest:<tokenId>`) and ignores any client-supplied scope.
+- The pair makes the host execute one logical write at most once. The host
+  keys its store by `(host, idemScope, idemKey)`; a repeated key returns the
+  first terminal HTTP response instead of running the handler again. The
+  same key with a different request body answers `409
+  idempotency_key_conflict`; a key the host saw start but never finish (it
+  crashed) answers `409 idempotency_outcome_unknown` rather than executing
+  again. Without a key nothing is deduplicated.
+- `promptId` stays the prompt's application-level key. `idemKey` is the outer
+  relay key: it covers every mutation, including the session creation that
+  precedes a prompt, and is understood before any handler runs.
+- Delivery is proven by the host's cumulative `ack`. The frame stays in the
+  down log until that ack covers it (or the epoch ends); RTO replays it.
+  There is no ack-deadline failure: the hub never answers 503 merely because
+  the host has not yet confirmed the frame, because the host may already have
+  executed it.
+- A same-epoch reconnect continues the request: the pending entry survives the
+  transport drop, the down log is replayed on the new link, and the answer
+  still reaches the browser.
+- A new epoch fails every pending request immediately: the host process
+  restarted, so nothing from the retired sequence space can be answered, and
+  the new epoch's down log and relay ack table start empty.
+- A detach with no reconnect keeps pending requests for a grace period
+  (`pendingGrace`, 30s) and then fails them. A same-epoch reconnect inside the
+  window invalidates the timer; a later detach restarts it. The grace is what
+  keeps a transient link loss from becoming an ambiguous 503. Expiry adds an
+  abort tombstone, which `hello_ack.relayAcks` carries to a same-epoch
+  reconnect.
+- `RelayTimeout` (45m) is the outer RPC ceiling. capri-host's own
+  `relayTimeout` (40m) is deliberately shorter so the host answers with a real
+  error before the hub's 504.
 - No "host sent any uplink frame since dispatch" heuristic.
 
 ### 5.4 `respond` (host → hub, relay plane)
 
 ```json
-{"v":2,"type":"respond","ack":100,"reqId":"7","chunkSeq":3,
+{"v":3,"type":"respond","ack":100,"reqId":"7","chunkSeq":3,
  "chunk":"aGk=","encoding":"base64","more":true,"status":200}
 ```
 
@@ -318,7 +356,7 @@ still reaches the browser, and nothing is re-executed.
 ### 5.5 `hb` (both directions, unreliable)
 
 ```json
-{"v":2,"type":"hb","ack":100,"probe":1201,"probeAck":1200,
+{"v":3,"type":"hb","ack":100,"probe":1201,"probeAck":1200,
  "relayAcks":[{"reqId":"7","chunk":2}],
  "status":{"ready":true,"busy":false,"booting":false,"pendingCount":0,"port":8765,"version":"v0.5.0"}}
 ```
@@ -377,9 +415,10 @@ One time scale, advertised by the hub:
   `lastSeenAgeMs`, which the hub computes on its own clock; the browser's
   silence probe reads the age (never subtracts the timestamp from its local
   clock) for UI state, while session liveness remains the `hb`/probe clock.
-- Request deadline is RPC, not liveness: the request ack deadline is
-  `3*keepalive` (one retransmit RTO of `2*keepalive` plus a heartbeat of
-  margin) and `RelayTimeout` (45m).
+- Request deadline is RPC, not liveness: delivery has no ack deadline of its
+  own. A pending request ends on a new epoch, after the detach grace
+  (`pendingGrace`, 30s), or at `RelayTimeout` (45m); capri-host answers with
+  its own error at 40m.
 
 ## 7. Transports
 

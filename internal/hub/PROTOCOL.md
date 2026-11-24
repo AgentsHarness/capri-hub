@@ -1,30 +1,37 @@
 # PROTOCOL — hub-side transport notes
 
 The host ↔ hub session protocol is specified once in
-`wire/PROTOCOL-V2.md` and implemented by
-`github.com/AgentsHarness/capri-hub/wire` (frame model, sender/receiver, close
-reasons). That document is the single source of truth; this file only records
-what the hub's transports do with a frame and in what order.
+`wire/PROTOCOL-V2.md` (historical filename; contents specify wire version 3)
+and implemented by `github.com/AgentsHarness/capri-hub/wire` (frame model,
+sender/receiver, close reasons). That document is the single source of truth;
+this file only records what the hub's transports do with a frame and in what
+order.
 
-Reliability model and fault matrix: see `wire/PROTOCOL-V2.md` and the protocol
-lecture page `docs/session-v2-protocol-lecture.html`.
+Reliability model and fault matrix: see `wire/PROTOCOL-V2.md`. The protocol
+lecture page `docs/session-v2-protocol-lecture.html` describes the historical
+v2 design, not the current wire.
 
 ## 1. Frame envelope
 
-Every frame is one JSON object, `{"v":2,"type":...,"seq":N,"ack":M}`.
+Every frame is one JSON object, `{"v":3,"type":...,"seq":N,"ack":M}`.
 
 - The first frame on a fresh transport is always `hello`; the hub answers
   `hello_ack` and owns down-seq assignment, the up watermark,
   retransmission and the idle timer from then on.
-- Reliable types carry a seq (`events`, `audience`, `request`). Unreliable
-  ones must not (`hello`, `hello_ack`, `hb`, `respond`).
+- Reliable types carry a seq (`events`, `request`). Unreliable ones must not
+  (`hello`, `hello_ack`, `audience`, `hb`, `respond`).
 - `ack` is the sender's watermark over the opposite direction and rides
   every frame that can carry it.
-- `audience` is absolute state: the hub keeps at most one unacknowledged
-  audience frame and may replace its payload under the same seq. A receiver
-  applies a newer `gen` even when the frame's seq is already delivered.
+- `audience` is absolute latest-wins state with no seq and no ack. The
+  writer holds one pending snapshot (a newer one overwrites it) and the
+  session repeats the newest on every periodic heartbeat, so a lost frame costs at
+  most one interval.
 - No capability headers exist. `hello` and `hello_ack` are the only frames
   that name an epoch; the hub also names its process in `hello_ack.hubBoot`.
+- `request` may carry `idemKey` / `idemScope` (request-only, validated by
+  `wire`). The hub copies the browser's `Idempotency-Key` and a
+  hub-generated scope into the frame; it never interprets or caches the key
+  itself — the host owns at-most-once execution.
 
 ## 2. Handshake order
 

@@ -140,7 +140,7 @@ func TestReassemblerInterleavesCompleteUnit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SplitFrame: %v", err)
 	}
-	control, err := SplitFrame([]byte(`{"v":2,"type":"hb"}`), false, 99, 0)
+	control, err := SplitFrame([]byte(`{"v":3,"type":"hb"}`), false, 99, 0)
 	if err != nil {
 		t.Fatalf("SplitFrame control: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestReassemblerInterleavesCompleteUnit(t *testing.T) {
 		t.Fatalf("first fragment: frame %v complete %v err %v", frame, complete, err)
 	}
 	frame, _, complete, err := r.Accept(control[0], 0)
-	if err != nil || !complete || string(frame) != `{"v":2,"type":"hb"}` {
+	if err != nil || !complete || string(frame) != `{"v":3,"type":"hb"}` {
 		t.Fatalf("interleaved complete: %q complete %v err %v", frame, complete, err)
 	}
 	if frame, _, complete, err := r.Accept(units[1], 0); err != nil || complete || frame != nil {

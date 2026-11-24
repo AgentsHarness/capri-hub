@@ -148,8 +148,8 @@ func TestQUICControlFrameDecoding(t *testing.T) {
 	}
 	defer ln.Close()
 
-	bare := []byte(`{"v":2,"type":"hb","ack":3,"status":{}}`)
-	big := []byte(`{"v":2,"type":"hb","ack":4,"status":{"ready":true,"busy":true,"port":8765,"padding":"` +
+	bare := []byte(`{"v":3,"type":"hb","ack":3,"status":{}}`)
+	big := []byte(`{"v":3,"type":"hb","ack":4,"status":{"ready":true,"busy":true,"port":8765,"padding":"` +
 		strings.Repeat("z", 2048) + `"}}`)
 
 	serverDone := make(chan error, 1)
@@ -228,7 +228,7 @@ func TestQUICControlFrameDecoding(t *testing.T) {
 // one frame may be interleaved with a text control frame, and a complete
 // compressed unit is inflated after the deflate echo.
 func TestWSUnitReassembly(t *testing.T) {
-	payload := []byte(`{"v":2,"type":"events","seq":1,"events":[{"type":"chunk","seq":1,"text":"` +
+	payload := []byte(`{"v":3,"type":"events","seq":1,"events":[{"type":"chunk","seq":1,"text":"` +
 		strings.Repeat("x", 4096) + `"}]}`)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +238,7 @@ func TestWSUnitReassembly(t *testing.T) {
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "")
 		ctx := context.Background()
-		hb := []byte(`{"v":2,"type":"hb","status":{}}`)
+		hb := []byte(`{"v":3,"type":"hb","status":{}}`)
 		if err := conn.Write(ctx, websocket.MessageText, hb); err != nil {
 			return
 		}
@@ -298,7 +298,7 @@ func TestWSUnitReassembly(t *testing.T) {
 	}
 }
 
-func hbBytes() []byte { return []byte(`{"v":2,"type":"hb","status":{}}`) }
+func hbBytes() []byte { return []byte(`{"v":3,"type":"hb","status":{}}`) }
 
 // TestWSUnitDecodeFailures: binary garbage is unreadable, and a compressed
 // unit before the deflate echo is a protocol violation, not a frame to skip.
@@ -356,7 +356,7 @@ func TestWSUnitDecodeFailures(t *testing.T) {
 // compressedEventsUnit returns one complete compressed unit carrying a frame.
 func compressedEventsUnit(t *testing.T) []byte {
 	t.Helper()
-	body, err := deflateRaw([]byte(`{"v":2,"type":"events","seq":1,"events":[{"type":"chunk","seq":1}]}`))
+	body, err := deflateRaw([]byte(`{"v":3,"type":"events","seq":1,"events":[{"type":"chunk","seq":1}]}`))
 	if err != nil {
 		t.Fatalf("deflate: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestQUICControlUnitReassembly(t *testing.T) {
 	}
 	defer ln.Close()
 
-	payload := []byte(`{"v":2,"type":"events","seq":1,"events":[{"type":"chunk","seq":1,"text":"` +
+	payload := []byte(`{"v":3,"type":"events","seq":1,"events":[{"type":"chunk","seq":1,"text":"` +
 		strings.Repeat("y", 4096) + `"}]}`)
 
 	serverDone := make(chan error, 1)

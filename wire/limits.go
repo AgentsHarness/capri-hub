@@ -5,10 +5,6 @@ import (
 	"time"
 )
 
-// ResumeWindow is how many out-of-order frames a Receiver parks before it gives
-// up with ErrOverflow.
-const ResumeWindow = 1500
-
 // Probe and heartbeat cadence, shared so host and hub act on the same clock.
 const (
 	ProbeAfter    = 7 * time.Second // no frame for this long -> send probe
@@ -22,12 +18,19 @@ const (
 // otherwise the only carrier and its interval would become the ack latency.
 const AckDelay = 20 * time.Millisecond
 
+// Idempotency envelope bounds: a request's idemKey is 1..IdemKeyMaxLen bytes,
+// its idemScope 0..IdemScopeMaxLen, both printable ASCII.
+const (
+	IdemKeyMaxLen   = 128
+	IdemScopeMaxLen = 64
+)
+
 // Defaults. Liveness and Limits are advertised by the hub in hello_ack; these
 // are what a fresh peer assumes and what the hub itself uses. Treat them as
 // read-only.
 var (
 	DefaultLiveness = Liveness{Keepalive: 5, Idle: 20}
-	DefaultLimits   = Limits{MaxFrame: 8 << 20, MaxRelayBody: 28 << 20, ResumeWindow: ResumeWindow}
+	DefaultLimits   = Limits{MaxFrame: 8 << 20, MaxRelayBody: 28 << 20}
 )
 
 // ValidateLiveness rejects a time scale that would make a single lost heartbeat
@@ -52,8 +55,6 @@ func ValidateLimits(l Limits) error {
 		return fmt.Errorf("%w: limits maxFrame %d outside 1KiB..64MiB", ErrProtocol, l.MaxFrame)
 	case l.MaxRelayBody < 1<<10 || l.MaxRelayBody > 256<<20:
 		return fmt.Errorf("%w: limits maxRelayBody %d outside 1KiB..256MiB", ErrProtocol, l.MaxRelayBody)
-	case l.ResumeWindow < 1 || l.ResumeWindow > 1<<20:
-		return fmt.Errorf("%w: limits resumeWindow %d outside 1..1048576", ErrProtocol, l.ResumeWindow)
 	}
 	return nil
 }

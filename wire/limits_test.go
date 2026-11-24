@@ -15,9 +15,6 @@ func TestDefaults(t *testing.T) {
 	if DefaultLiveness.Idle < 2*DefaultLiveness.Keepalive {
 		t.Fatalf("default idle %d is below 2*keepalive %d", DefaultLiveness.Idle, DefaultLiveness.Keepalive)
 	}
-	if DefaultLimits.ResumeWindow != ResumeWindow {
-		t.Fatalf("DefaultLimits.ResumeWindow %d != ResumeWindow %d", DefaultLimits.ResumeWindow, ResumeWindow)
-	}
 }
 
 func TestValidateLiveness(t *testing.T) {
@@ -47,9 +44,9 @@ func TestValidateLiveness(t *testing.T) {
 
 func TestValidateLimits(t *testing.T) {
 	ok := []Limits{
-		{MaxFrame: 1 << 10, MaxRelayBody: 1 << 10, ResumeWindow: 1},
+		{MaxFrame: 1 << 10, MaxRelayBody: 1 << 10},
 		DefaultLimits,
-		{MaxFrame: 64 << 20, MaxRelayBody: 256 << 20, ResumeWindow: 1 << 20},
+		{MaxFrame: 64 << 20, MaxRelayBody: 256 << 20},
 	}
 	for _, l := range ok {
 		if err := ValidateLimits(l); err != nil {
@@ -58,12 +55,10 @@ func TestValidateLimits(t *testing.T) {
 	}
 	bad := []Limits{
 		{}, // all zero
-		{MaxFrame: 1, MaxRelayBody: 1 << 20, ResumeWindow: 1},
-		{MaxFrame: 1024, MaxRelayBody: 1, ResumeWindow: 1},
-		{MaxFrame: 1024, MaxRelayBody: 1024, ResumeWindow: 0},
-		{MaxFrame: 65 << 20, MaxRelayBody: 1 << 20, ResumeWindow: 1},
-		{MaxFrame: 1024, MaxRelayBody: 257 << 20, ResumeWindow: 1},
-		{MaxFrame: 1024, MaxRelayBody: 1024, ResumeWindow: 1<<20 + 1},
+		{MaxFrame: 1, MaxRelayBody: 1 << 20},
+		{MaxFrame: 1024, MaxRelayBody: 1},
+		{MaxFrame: 65 << 20, MaxRelayBody: 1 << 20},
+		{MaxFrame: 1024, MaxRelayBody: 257 << 20},
 	}
 	for _, l := range bad {
 		if err := ValidateLimits(l); !errors.Is(err, ErrProtocol) {

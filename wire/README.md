@@ -7,10 +7,11 @@ transport-agnostic and side-effect free (no websocket, QUIC, `net` or `os`
 imports), so `capri-host` and `capri-hub` cannot drift apart on the protocol.
 
 - **Spec (single source of truth):**
-  [`PROTOCOL-V2.md`](./PROTOCOL-V2.md).
-- **Reliability model and fault matrix:**
-  [`PROTOCOL-V2.md`](./PROTOCOL-V2.md) and
-  `../docs/session-v2-protocol-lecture.html`.
+  [`PROTOCOL-V2.md`](./PROTOCOL-V2.md) — the filename is historical; the
+  contents specify wire version 3.
+- **Reliability model and fault matrix:** the reliable-delivery and liveness
+  sections of [`PROTOCOL-V2.md`](./PROTOCOL-V2.md). The v2 protocol lecture
+  (`../docs/session-v2-protocol-lecture.html`) is historical background.
 - **Transport specifics:** `../internal/hub/PROTOCOL.md` and
   `acp-host/internal/hub/PROTOCOL.md`.
 
@@ -23,7 +24,7 @@ Both documents above only record how one side uses a frame; where they and
 |---|---|
 | `frame.go` | `Frame` envelope, all 7 frame types, strict encode/decode, `TrimmedEvent` |
 | `sender.go` | `Sender`: seq assignment, unacked log, acks, elision |
-| `receiver.go` | `Receiver`: contiguous watermark, parked frames, overflow |
+| `receiver.go` | `Receiver`: strict in-order watermark |
 | `unit.go` | transport units: 32KiB framing, split and reassembly |
 | `identity.go` | epoch, `CloseReason` and the one WS/QUIC close table |
 | `limits.go` | `Liveness` / `Limits` defaults and their validation |

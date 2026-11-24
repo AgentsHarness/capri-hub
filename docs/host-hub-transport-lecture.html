@@ -1,0 +1,2227 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>从零读懂 Host ↔ Hub 传输协议 · 一堂说人话的工程讲义</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231e56a0'/%3E%3Ctext x='32' y='43' font-size='28' font-weight='700' text-anchor='middle' fill='%23ffffff' font-family='sans-serif'%3EH%E2%86%94H%3C/text%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f7f8fa;
+  --bg-alt: #eef1f6;
+  --surface: #ffffff;
+  --surface-2: #f2f5f9;
+  --surface-3: #e6ebf2;
+  --text: #18202c;
+  --text-2: #4a5568;
+  --text-3: #718096;
+  --border: #d8e0ec;
+  --border-strong: #b9c6d8;
+  --blue: #1e56a0;
+  --blue-soft: #e6effc;
+  --teal: #0f766e;
+  --teal-soft: #dff5f2;
+  --amber: #b45309;
+  --amber-soft: #fef3c7;
+  --red: #b91c1c;
+  --red-soft: #fee2e2;
+  --purple: #6d28d9;
+  --purple-soft: #ede9fe;
+  --code-bg: #161b22;
+  --code-text: #e6edf3;
+  --shadow: 0 2px 6px rgba(15, 23, 42, 0.05), 0 12px 28px rgba(15, 23, 42, 0.04);
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+html[data-theme="dark"] {
+  --bg: #0d1117;
+  --bg-alt: #161b22;
+  --surface: #161b22;
+  --surface-2: #1f2630;
+  --surface-3: #293241;
+  --text: #e6edf3;
+  --text-2: #a5b4c7;
+  --text-3: #7d8da1;
+  --border: #2b3544;
+  --border-strong: #3d4b5f;
+  --blue: #58a6ff;
+  --blue-soft: #172a45;
+  --teal: #39d3bb;
+  --teal-soft: #132f2c;
+  --amber: #f59e0b;
+  --amber-soft: #362812;
+  --red: #f87171;
+  --red-soft: #3b1a1d;
+  --purple: #a78bfa;
+  --purple-soft: #281f47;
+  --code-bg: #090c10;
+  --code-text: #e6edf3;
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.35), 0 14px 32px rgba(0, 0, 0, 0.28);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.85;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, .mono { font-family: var(--font-mono); font-size: 0.88em; }
+code {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  padding: 0.1em 0.38em;
+  border-radius: 5px;
+  overflow-wrap: anywhere;
+}
+pre code { background: none; border: 0; padding: 0; }
+
+/* 顶部进度与浮动工具 */
+#progressBar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 3px;
+  width: 0%;
+  background: linear-gradient(90deg, var(--blue), var(--teal));
+  z-index: 120;
+}
+.fab-bar {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fab-btn {
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  font: 600 13px/1 var(--font-sans);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.fab-btn:hover { background: var(--surface-2); }
+
+/* 顶部 Hero */
+.hero {
+  background: linear-gradient(135deg, var(--blue-soft), var(--surface) 58%, var(--teal-soft));
+  border-bottom: 1px solid var(--border);
+  padding: 46px 24px 36px;
+}
+.hero-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+}
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  font: 600 12px/1.4 var(--font-sans);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  color: var(--text-2);
+}
+.badge.primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #ffffff;
+}
+.hero h1 {
+  margin: 0 0 14px;
+  font-size: clamp(28px, 4.2vw, 46px);
+  line-height: 1.22;
+  letter-spacing: -0.02em;
+}
+.hero-sub {
+  margin: 0 0 22px;
+  max-width: 78ch;
+  font-size: 17px;
+  color: var(--text-2);
+}
+.hero-promises {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 22px;
+}
+.promise-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+.promise-card .p-tag {
+  font: 700 11px/1 var(--font-mono);
+  color: var(--blue);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.promise-card b {
+  display: block;
+  font-size: 15.5px;
+  margin: 6px 0 4px;
+}
+.promise-card span {
+  display: block;
+  font-size: 13.5px;
+  color: var(--text-2);
+  line-height: 1.65;
+}
+
+/* 主体双栏布局 */
+.layout {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 28px 24px 100px;
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  gap: 36px;
+}
+.sidebar {
+  position: sticky;
+  top: 20px;
+  align-self: start;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px 12px;
+  box-shadow: var(--shadow);
+}
+.sidebar-title {
+  font: 700 11px/1.2 var(--font-sans);
+  letter-spacing: 0.14em;
+  color: var(--text-3);
+  text-transform: uppercase;
+  padding: 0 10px 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.toc-list li { margin: 2px 0; }
+.toc-list a {
+  display: block;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 13.2px;
+  line-height: 1.45;
+  color: var(--text-2);
+  border-left: 3px solid transparent;
+  text-decoration: none;
+}
+.toc-list a:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.toc-list a.active {
+  background: var(--blue-soft);
+  color: var(--blue);
+  border-left-color: var(--blue);
+  font-weight: 600;
+}
+
+main, .lesson, .lab-split > *, .term-grid > *, .tradeoff-cols > *, .clock-cards > *, .hero-promises > * { min-width: 0; }
+
+/* 章节卡片 */
+.lesson {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 30px 32px;
+  margin-bottom: 32px;
+  box-shadow: var(--shadow);
+  scroll-margin-top: 20px;
+}
+.lesson-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding-bottom: 16px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.lesson-num {
+  flex: 0 0 auto;
+  background: var(--blue);
+  color: #ffffff;
+  font: 700 13px/1 var(--font-mono);
+  padding: 8px 11px;
+  border-radius: 8px;
+  letter-spacing: 0.04em;
+}
+.lesson-header h2 {
+  margin: 0;
+  font-size: clamp(22px, 2.5vw, 28px);
+  line-height: 1.3;
+}
+.lesson-header p {
+  margin: 6px 0 0;
+  color: var(--text-2);
+  font-size: 14.5px;
+}
+
+h3 {
+  font-size: 19px;
+  line-height: 1.45;
+  margin: 28px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+h3 .sec-tag {
+  font: 700 12px/1 var(--font-mono);
+  background: var(--blue-soft);
+  color: var(--blue);
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+p { margin: 12px 0; }
+ul, ol { margin: 10px 0; padding-left: 22px; }
+li { margin: 6px 0; }
+
+/* 提示盒 */
+.callout {
+  border-radius: 12px;
+  padding: 15px 18px;
+  margin: 18px 0;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.callout-title {
+  font: 700 12.5px/1.3 var(--font-sans);
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.callout.analogy {
+  background: var(--amber-soft);
+  border-color: color-mix(in srgb, var(--amber) 35%, var(--border));
+}
+.callout.analogy .callout-title { color: var(--amber); }
+.callout.rule {
+  background: var(--blue-soft);
+  border-color: color-mix(in srgb, var(--blue) 35%, var(--border));
+}
+.callout.rule .callout-title { color: var(--blue); }
+.callout.warn {
+  background: var(--red-soft);
+  border-color: color-mix(in srgb, var(--red) 35%, var(--border));
+}
+.callout.warn .callout-title { color: var(--red); }
+.callout.good {
+  background: var(--teal-soft);
+  border-color: color-mix(in srgb, var(--teal) 35%, var(--border));
+}
+.callout.good .callout-title { color: var(--teal); }
+
+/* 名词卡片网格 */
+.term-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 16px 0;
+}
+.term-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 15px 16px;
+  background: var(--surface-2);
+}
+.term-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.term-name {
+  font: 700 16px/1.3 var(--font-mono);
+  color: var(--blue);
+}
+.term-human {
+  font: 600 13px/1.4 var(--font-sans);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 2px 9px;
+  border-radius: 999px;
+  color: var(--text-2);
+}
+.term-card p {
+  margin: 6px 0 0;
+  font-size: 14.3px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+.term-card p b { color: var(--text); }
+
+/* 图表容器 */
+figure {
+  margin: 20px 0;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.fig-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  background: var(--surface-3);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 600;
+}
+.fig-bar span.hint {
+  font: 400 12px/1 var(--font-mono);
+  color: var(--text-3);
+}
+.fig-canvas {
+  padding: 16px;
+  background: var(--surface);
+}
+.fig-canvas svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+figcaption {
+  padding: 10px 16px;
+  font-size: 13px;
+  color: var(--text-2);
+  border-top: 1px solid var(--border);
+}
+
+/* 表格 */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin: 16px 0;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.8px;
+  line-height: 1.65;
+  min-width: 580px;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: 10px 13px;
+  border-bottom: 1px solid var(--border);
+}
+th {
+  background: var(--surface-2);
+  font-weight: 700;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+tbody tr:last-child td { border-bottom: 0; }
+
+/* 代码块 */
+pre {
+  background: var(--code-bg);
+  color: var(--code-text);
+  padding: 15px 18px;
+  border-radius: 11px;
+  overflow-x: auto;
+  font: 13px/1.7 var(--font-mono);
+  margin: 14px 0;
+}
+
+/* 交互式实验台通用样式 */
+.lab-box {
+  border: 2px solid color-mix(in srgb, var(--blue) 40%, var(--border));
+  border-radius: 14px;
+  background: var(--surface-2);
+  padding: 18px 20px;
+  margin: 22px 0;
+}
+.lab-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.lab-title {
+  font: 700 15px/1.3 var(--font-sans);
+  color: var(--blue);
+}
+.btn-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 14px;
+}
+.tab-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-2);
+  padding: 6px 13px;
+  border-radius: 8px;
+  font: 600 13px/1.4 var(--font-sans);
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+.tab-btn:hover { background: var(--surface-3); color: var(--text); }
+.tab-btn.active {
+  background: var(--blue);
+  color: #ffffff;
+  border-color: var(--blue);
+}
+.lab-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  gap: 14px;
+}
+.lab-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+/* 水位模拟器格子 */
+.seq-slots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.seq-slot {
+  width: 78px;
+  padding: 8px 6px;
+  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  text-align: center;
+  font-family: var(--font-mono);
+}
+.seq-slot .s-num { font-size: 14px; font-weight: 700; display: block; }
+.seq-slot .s-state { font-size: 11px; color: var(--text-3); display: block; margin-top: 3px; font-family: var(--font-sans); }
+.seq-slot.acked {
+  background: var(--teal-soft);
+  border-color: var(--teal);
+  color: var(--teal);
+}
+.seq-slot.parked {
+  background: var(--amber-soft);
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.seq-slot.trimmed {
+  background: var(--purple-soft);
+  border-color: var(--purple);
+  color: var(--purple);
+}
+
+/* 取舍与细节卡片 */
+.tradeoff-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  margin: 16px 0;
+}
+.tradeoff-card {
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface-2);
+  padding: 18px 20px;
+}
+.tradeoff-card h4 {
+  margin: 0 0 10px;
+  font-size: 16.5px;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tradeoff-cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.t-col {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 11px 13px;
+  font-size: 13.8px;
+}
+.t-col.reject { border-left: 3px solid var(--red); }
+.t-col.choose { border-left: 3px solid var(--teal); }
+.t-col b.label {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+.t-col.reject b.label { color: var(--red); }
+.t-col.choose b.label { color: var(--teal); }
+
+/* 断线时钟滑块 */
+.clock-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+.clock-bar input[type="range"] {
+  flex: 1;
+  min-width: 200px;
+  accent-color: var(--blue);
+}
+.clock-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.clock-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 13.6px;
+}
+.clock-card b {
+  display: block;
+  font-size: 12.5px;
+  color: var(--blue);
+  margin-bottom: 4px;
+}
+
+footer {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 24px 24px 56px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 13.5px;
+  border-top: 1px solid var(--border);
+}
+
+@media (max-width: 980px) {
+  .hero-promises { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .layout { grid-template-columns: 1fr; gap: 20px; }
+  .sidebar { position: static; max-height: none; }
+  .toc-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+  .term-grid, .lab-split, .tradeoff-cols, .clock-cards { grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  .hero { padding: 30px 16px 24px; }
+  .hero-promises { grid-template-columns: 1fr; }
+  .layout { padding: 16px 14px 80px; }
+  .lesson { padding: 20px 16px; }
+  .toc-list { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div style="padding:10px 16px;background:#fff3cd;color:#664d03;border-bottom:1px solid #ffe69c;text-align:center;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  历史文档：本讲义描述 capri session v2；当前 host↔hub 协议为 v3，权威规格见
+  <code>wire/PROTOCOL-V2.md</code>（文件名为历史保留）。
+</div>
+<div id="progressBar"></div>
+
+<header class="hero">
+  <div class="hero-inner">
+    <div class="badge-row">
+      <span class="badge primary">零基础友好 · 纯人话讲义</span>
+      <span class="badge">基于 acp-hub &amp; acp-host 源码</span>
+      <span class="badge">协议版本：Capri Session v2</span>
+    </div>
+    <h1>Host 和 Hub 是怎么通电话的？</h1>
+    <p class="hero-sub">
+      不需要你听说过这个项目，也不需要你背网络术语。我们从<strong>“你在咖啡馆用手机看家里电脑上的 AI 写代码”</strong>这个真实场景出发，把 <code>acp-host</code> 与 <code>acp-hub</code> 之间的传输协议、专属名词、四套优先级、九个工程取舍和八个代码细节一次讲透。
+    </p>
+    <div class="hero-promises">
+      <div class="promise-card">
+        <span class="p-tag">PART 01 · 名词</span>
+        <b>每个术语先翻译成人话</b>
+        <span>不管是 <code>epoch</code>、<code>ack</code>、<code>trimmed</code> 还是 <code>transport unit</code>，先给生活比喻，再看真实 JSON。</span>
+      </div>
+      <div class="promise-card">
+        <span class="p-tag">PART 02 · 优先级</span>
+        <b>冲突时谁先走、谁让路</b>
+        <span>网卡排队、内存爆满、QUIC/WS 选路、快慢请求超时——四套优先级清清楚楚。</span>
+      </div>
+      <div class="promise-card">
+        <span class="p-tag">PART 03 · 取舍</span>
+        <b>为什么不选看似更简单的路</b>
+        <span>为什么宁可发空纸条也不跳号？为什么拆成两本账？九个真实取舍逐一拆解。</span>
+      </div>
+      <div class="promise-card">
+        <span class="p-tag">PART 04 · 细节</span>
+        <b>藏在源码里的八个机关</b>
+        <span>20ms 回执闹钟、写完才掐表、服务端算时间差、分块退还预算等一线实战细节。</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar" aria-label="讲义目录">
+    <div class="sidebar-title">课程目录 · LECTURE TOC</div>
+    <ol class="toc-list">
+      <li><a href="#sec-intro" class="active">0. 一分钟入戏：我们在解决什么问题？</a></li>
+      <li><a href="#sec-terms">1. 名词全翻译：把黑话变成人话</a></li>
+      <li><a href="#sec-frames">2. 七种信封：所有对话就这 7 张表格</a></li>
+      <li><a href="#sec-priority">3. 四大优先级：堵车和爆内存时先保谁？</a></li>
+      <li><a href="#sec-flows">4. 两条主线：实时转播与远程点菜</a></li>
+      <li><a href="#sec-tradeoffs">5. 九大工程取舍：为什么偏要这样设计？</a></li>
+      <li><a href="#sec-details">6. 八个魔鬼细节：只有读源码才懂的机关</a></li>
+      <li><a href="#sec-liveness">7. 断线与故障分诊台：0~20 秒发生了什么</a></li>
+      <li><a href="#sec-reference">附录：常量速查、8 种分手码与源码地图</a></li>
+    </ol>
+  </aside>
+
+  <main>
+    <!-- ==================== 第 0 章 ==================== -->
+    <section class="lesson" id="sec-intro">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 00</span>
+        <div>
+          <h2>一分钟入戏：我们在解决什么问题？</h2>
+          <p>先别管代码，先看懂这四个人是谁、为什么中间非要夹一个“传达室”。</p>
+        </div>
+      </div>
+
+      <p>想象这样一个日常场景：你家里的 Mac 电脑上开着一个能够读代码、改代码、跑终端命令的 AI 编程助手（叫 <strong>Agent</strong>，在这套项目里是 <code>grok-build</code>）。现在你出门喝咖啡了，掏出手机打开浏览器，想做两件事：</p>
+      <ol>
+        <li><strong>实时看直播</strong>：AI 正在家里电脑上哗哗写代码，它每吐出一个字、每调用一个工具，你手机屏幕上要立刻跳出来。</li>
+        <li><strong>随时发指令</strong>：你在手机网页上输入一句“帮我把测试跑一下”或者点一下“批准运行命令”，家里的电脑要立刻收到并执行，再把结果传回手机。</li>
+      </ol>
+
+      <div class="callout analogy">
+        <div class="callout-title">💡 为什么手机不能直接连家里的电脑？</div>
+        <p>因为你家里的电脑躲在自家路由器（家庭内网 NAT/防火墙）后面，没有公网电话号码。外面的手机浏览器就像一个站在大街上的邮递员，根本敲不开你家客厅的门。反过来，<strong>家里的电脑却可以主动往外打电话</strong>。</p>
+      </div>
+
+      <p>于是我们在公网服务器上建了一个 24 小时营业的<strong>“中心传达室”——也就是 <code>acp-hub</code>（代码里叫 <code>capri-hub</code>）</strong>，并在你家电脑上装了一个<strong>“驻家大管家”——也就是 <code>acp-host</code>（代码里叫 <code>capri-host</code>）</strong>：</p>
+
+      <figure>
+        <div class="fig-bar">
+          <span>图 0.1 · 四个角色的站位与唯一的一根“电话线”</span>
+          <span class="hint">本讲义主角：中间红色这条 Host ↔ Hub 专线</span>
+        </div>
+        <div class="fig-canvas">
+          <svg viewBox="0 0 1000 300" role="img" aria-label="Agent、Host、Hub、浏览器四者的连接拓扑图">
+            <defs>
+              <marker id="arBlue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M0 0L10 5L0 10Z" fill="var(--blue)"/>
+              </marker>
+              <marker id="arTeal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M0 0L10 5L0 10Z" fill="var(--teal)"/>
+              </marker>
+            </defs>
+
+            <!-- 家里内网框 -->
+            <rect x="16" y="24" width="446" height="248" rx="16" fill="var(--surface-2)" stroke="var(--border-strong)" stroke-dasharray="6 5"/>
+            <text x="34" y="48" fill="var(--text-3)" font-size="12" font-weight="700">🏠 你的电脑（家庭/公司内网，外网进不来）</text>
+
+            <!-- Agent -->
+            <rect x="34" y="72" width="164" height="168" rx="12" fill="var(--surface)" stroke="var(--border-strong)"/>
+            <text x="116" y="104" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="700">① AI 厨师 (Agent)</text>
+            <text x="116" y="125" text-anchor="middle" fill="var(--text-3)" font-size="12" font-family="var(--font-mono)">grok-build</text>
+            <text x="116" y="156" text-anchor="middle" fill="var(--text-2)" font-size="12">埋头读代码、跑工具</text>
+            <text x="116" y="176" text-anchor="middle" fill="var(--text-2)" font-size="12">完全不知道网络的存在</text>
+            <text x="116" y="206" text-anchor="middle" fill="var(--purple)" font-size="11.5" font-weight="600">只跟本地管家说话</text>
+
+            <!-- stdio arrow -->
+            <line x1="202" y1="156" x2="254" y2="156" stroke="var(--teal)" stroke-width="2" marker-start="url(#arTeal)" marker-end="url(#arTeal)"/>
+            <text x="228" y="144" text-anchor="middle" fill="var(--teal)" font-size="11" font-weight="700">本地管道</text>
+            <text x="228" y="174" text-anchor="middle" fill="var(--text-3)" font-size="10.5">stdio</text>
+
+            <!-- Host -->
+            <rect x="260" y="72" width="184" height="168" rx="12" fill="var(--blue-soft)" stroke="var(--blue)" stroke-width="1.8"/>
+            <text x="352" y="104" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="700">② 本地管家 (Host)</text>
+            <text x="352" y="125" text-anchor="middle" fill="var(--blue)" font-size="12" font-family="var(--font-mono)">acp-host / capri-host</text>
+            <text x="352" y="154" text-anchor="middle" fill="var(--text-2)" font-size="12">把 AI 输出编号、存日志</text>
+            <text x="352" y="174" text-anchor="middle" fill="var(--text-2)" font-size="12">代办网页发来的操作指令</text>
+            <text x="352" y="206" text-anchor="middle" fill="var(--blue)" font-size="12" font-weight="700">主动拨号连向 Hub ➔</text>
+
+            <!-- Session v2 arrow -->
+            <rect x="472" y="96" width="126" height="116" rx="12" fill="var(--amber-soft)" stroke="var(--amber)" stroke-width="1.6"/>
+            <text x="535" y="122" text-anchor="middle" fill="var(--amber)" font-size="13" font-weight="700">★ 传输协议 v2</text>
+            <line x1="452" y1="146" x2="618" y2="146" stroke="var(--blue)" stroke-width="2.5" marker-start="url(#arBlue)" marker-end="url(#arBlue)"/>
+            <text x="535" y="170" text-anchor="middle" fill="var(--text)" font-size="11.5" font-weight="600">QUIC 优先 / WS 兜底</text>
+            <text x="535" y="190" text-anchor="middle" fill="var(--text-2)" font-size="11">单根长连接双向通信</text>
+
+            <!-- Hub -->
+            <rect x="624" y="72" width="174" height="168" rx="12" fill="var(--teal-soft)" stroke="var(--teal)" stroke-width="1.8"/>
+            <text x="711" y="104" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="700">③ 公网传达室 (Hub)</text>
+            <text x="711" y="125" text-anchor="middle" fill="var(--teal)" font-size="12" font-family="var(--font-mono)">acp-hub / capri-hub</text>
+            <text x="711" y="154" text-anchor="middle" fill="var(--text-2)" font-size="12">登记哪台电脑在线</text>
+            <text x="711" y="174" text-anchor="middle" fill="var(--text-2)" font-size="12">统计哪几个网页在看</text>
+            <text x="711" y="206" text-anchor="middle" fill="var(--teal)" font-size="11.5" font-weight="700">转发直播 &amp; 中转请求</text>
+
+            <!-- FE arrow -->
+            <line x1="802" y1="156" x2="844" y2="156" stroke="var(--teal)" stroke-width="2" marker-start="url(#arTeal)" marker-end="url(#arTeal)"/>
+            <text x="823" y="142" text-anchor="middle" fill="var(--text-3)" font-size="10.5">/ws/fe</text>
+
+            <!-- Browser -->
+            <rect x="848" y="72" width="136" height="168" rx="12" fill="var(--surface)" stroke="var(--border-strong)"/>
+            <text x="916" y="104" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="700">④ 网页 (FE)</text>
+            <text x="916" y="125" text-anchor="middle" fill="var(--text-3)" font-size="12" font-family="var(--font-mono)">acp-fe</text>
+            <text x="916" y="156" text-anchor="middle" fill="var(--text-2)" font-size="12">手机/电脑浏览器</text>
+            <text x="916" y="176" text-anchor="middle" fill="var(--text-2)" font-size="12">看实时输出、点按钮</text>
+          </svg>
+        </div>
+        <figcaption>
+          <b>记住一个最重要的物理前提：</b>只有 ② <b>Host</b> 能主动打电话给 ③ <b>Hub</b>。一旦电话线静默断了，Hub 没法反拨回去，只能等 Host 自己发觉并重新拨号，或者在现有电话线上“敲门（发探针）”看对方还回不回话。整套协议的设计都从这个前提长出来。
+        </figcaption>
+      </figure>
+    </section>
+
+    <!-- ==================== 第 1 章 ==================== -->
+    <section class="lesson" id="sec-terms">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 01</span>
+        <div>
+          <h2>名词全翻译：把代码黑话变成大白话</h2>
+          <p>读代码最怕遇到莫名其妙的英文词。下面这 14 个词就是协议的全部词汇表，我们先用人话挨个认识一遍。</p>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">第 1 组</span> 身份与朝代：搞清楚“你是谁、这是第几回见面”</h3>
+      <div class="term-grid">
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">hostId &amp; token</span>
+            <span class="term-human">人话：长期工牌号 &amp; 门禁卡</span>
+          </div>
+          <p>你的电脑第一次连 Hub 时，输入一个 6 位配对码，换回一张长期门禁卡（<code>token</code>）和一个工牌号（<code>hostId</code>，比如 <code>mbp</code>）。以后哪怕电脑重启一百次，工牌号也不变。</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">epoch</span>
+            <span class="term-human">人话：Host 的“本次开机账本号”</span>
+          </div>
+          <p>Host 进程<strong>每次启动时</strong>随机生成的 64 位非零数字。<br>
+          • <b>Wi-Fi 抖了一下重连</b>：Host 没重启，<code>epoch</code> 不变 → Hub 知道“还是刚才那本账，从刚才断掉的页码接着传！”<br>
+          • <b>Host 进程重启了</b>：<code>epoch</code> 换了新数字 → Hub 知道“旧账本翻篇了，清空旧缓冲，开启新账本！”</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">hubBoot</span>
+            <span class="term-human">人话：Hub 的“当班经理编号”</span>
+          </div>
+          <p>Hub 进程启动时随机生成的编号，写在握手回信 <code>hello_ack</code> 里。为什么要有它？因为 Hub 给网页请求发单号（<code>reqId = "1", "2"...</code>）是从 1 开始数的。如果 Hub 重启了，单号又会从 1 开始！Host 把 <b><code>(hubBoot, reqId)</code> 绑在一起记账</b>，就不会把“新经理发的 1 号单”误当成“老经理发过的 1 号单”。</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">wire 模块</span>
+            <span class="term-human">人话：双方共用的“唯一字典”</span>
+          </div>
+          <p>放在 <code>acp-hub/wire</code> 目录下的一小段纯 Go 代码（不依赖任何网络库）。Host 和 Hub 直接引用同一份代码来打包和拆包，从根源上杜绝“Host 改了字段名、Hub 忘了改”的低级错误。</p>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">第 2 组</span> 页码、回执与空纸条：怎么保证一页都不漏？</h3>
+      <div class="term-grid">
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">seq</span>
+            <span class="term-human">人话：连续不跳号的“书页码”</span>
+          </div>
+          <p>凡是绝对不能丢的信（<code>events</code> 事件、<code>audience</code> 观众名单、<code>request</code> 网页指令），每封信都会盖上一个连续递增的页码 <code>seq</code>（1, 2, 3...）。<b>一条铁律：页码只分配一次，永远不跳号，重传时也用原来的页码。</b></p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">ack (watermark 水位线)</span>
+            <span class="term-human">人话：“1 到 N 页我全收齐了”</span>
+          </div>
+          <p><code>ack: 101</code> <b>不是</b>“我刚收到第 101 页”，而是<b>“从第 1 页到第 101 页，我一页不落全收齐了”</b>。这条“连续收齐到哪一页”的分界线就叫<b>水位线（watermark）</b>。只要中间缺了第 102 页，哪怕 103、104 页先到了，<code>ack</code> 也必须死守在 101，绝不跳过缺口！</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">trimmed</span>
+            <span class="term-human">人话：“撕掉正文、只留页码”的占位纸条</span>
+          </div>
+          <p>长这样：<code>{"type":"trimmed","sessionId":"s2","seq":123}</code>。<br>
+          当某个对话没人看、或者内存积压太多时，Host 会把几百 KB 的正文撕掉，换成这张只有二十多字节的小纸条发过去。<b>为什么不干脆不发？</b>因为不发就会缺了第 123 页，接收方会以为丢包了，死等第 123 页而卡住后面的所有消息！</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">resumeWindow (1500)</span>
+            <span class="term-human">人话：乱序信件的“等候室座位上限”</span>
+          </div>
+          <p>如果第 102 页在路上耽搁了，先到的 103、104 页会先坐在接收方的等候室（<code>Receiver.buf</code>）里等 102 页。等候室最多有 <b>1500 个座位</b>。如果超过 1500 封信还没补上缺口，接收方直接挂断电话（报 <code>overflow</code>），重连后按水位线整整齐齐重发。</p>
+        </div>
+      </div>
+
+      <!-- 交互式实验台 1：seq / ack / trimmed 水位线模拟器 -->
+      <div class="lab-box" id="lab-watermark">
+        <div class="lab-header">
+          <span class="lab-title">🧪 动手试一试：为什么缺了一页，水位线（ack）就不能往前走？</span>
+          <span class="mono" id="wmStatusText" style="font-size:13px;color:var(--teal);font-weight:700">当前累计回执 ack = 100（1..100 已收齐）</span>
+        </div>
+        <p style="margin:0 0 10px;font-size:14px;color:var(--text-2)">
+          假设 Hub 已经连续收齐了 1..100 号事件。现在点击下方按钮，模拟 Host 发送 101..104 号事件，看看<b>乱序到达</b>和<b><code>trimmed</code> 空纸条补洞</b>时，等候室和 <code>ack</code> 怎么变：
+        </p>
+        <div class="btn-group">
+          <button type="button" class="tab-btn" data-wm-act="101">① 正常收到 101 号</button>
+          <button type="button" class="tab-btn" data-wm-act="103">② 跳过 102，先收到 103 号</button>
+          <button type="button" class="tab-btn" data-wm-act="104">③ 再收到 104 号</button>
+          <button type="button" class="tab-btn" data-wm-act="102-trimmed">④ 102 号以 trimmed 空纸条到达！</button>
+          <button type="button" class="tab-btn" data-wm-act="reset">↺ 重置回 100</button>
+        </div>
+        <div class="seq-slots" id="wmSlots"></div>
+        <div class="lab-panel" id="wmExplain" style="font-size:13.8px;color:var(--text-2)"></div>
+      </div>
+
+      <h3><span class="sec-tag">第 3 组</span> 观众点名、中继分块与大箱拆小包</h3>
+      <div class="term-grid">
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">audience &amp; gen</span>
+            <span class="term-human">人话：观众席点名册 &amp; 名册第几版</span>
+          </div>
+          <p>Hub 随时统计“现在有几个网页连着（<code>watchers</code>）、它们在看哪几个对话（<code>sessions</code>）”，打包成一张 <code>audience</code> 名单发给 Host。每次名单变化，版本号 <code>gen</code> 加 1。Host 只认版本号最新的那张名单，没人看的对话就不传正文。</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">chunkSeq &amp; relayAcks</span>
+            <span class="term-human">人话：大答卷的“第几分册” &amp; 答卷签收表</span>
+          </div>
+          <p>网页向 Host 请求一段长历史，答案可能有 20 MB。Host 会按 <b>256 KiB 一块</b> 切开装进 <code>respond</code> 帧，每块标上 <code>chunkSeq: 1, 2, 3...</code>。它<b>不占用会话页码 <code>seq</code></b>，而是由 Hub 在心跳帧的 <code>relayAcks</code> 表里单独勾选“某请求我收到了第几块（<code>chunk</code>）、收齐了（<code>done</code>）还是取消了（<code>abort</code>）”。</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">transport unit (32 KiB)</span>
+            <span class="term-human">人话：大货箱拆成 32KB 小包裹（为了能让急件插队）</span>
+          </div>
+          <p>如果一封信有 4 MB，在慢网下要发十几秒。如果整封信一口气写进网卡，这十几秒里心跳包根本发不出去，对方会误以为你断网死掉了！所以协议把超过 <b>32 KiB</b> 的帧切成小单元（每个带 13 字节头），<b>每发完一个 32 KiB 小单元，就看一眼有没有心跳急件要插队</b>。</p>
+        </div>
+
+        <div class="term-card">
+          <div class="term-head">
+            <span class="term-name">probe &amp; probeAck</span>
+            <span class="term-human">人话：“你还在吗？”的敲门暗号与回音</span>
+          </div>
+          <p>平时双方每 5 秒（AI 干活时每 1 秒）发一次心跳 <code>hb</code>。如果整整 <b>7 秒（<code>ProbeAfter</code>）</b>没收到对方任何声音，就立刻发一封带随机数暗号的心跳 <code>hb{probe: 9527}</code>；对方必须在 <b>3 秒（<code>ProbeTimeout</code>）</b>内原样回传 <code>hb{probeAck: 9527}</code>，否则当场判死挂断。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 第 2 章 ==================== -->
+    <section class="lesson" id="sec-frames">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 02</span>
+        <div>
+          <h2>七种信封：Host 和 Hub 一辈子只说这 7 种话</h2>
+          <p>以前旧版协议有 10 种帧，各种补丁满天飞；现在的 v2 砍到了只剩 7 种，而且共用同一个 JSON 信封结构（<code>wire.Frame</code>）。</p>
+        </div>
+      </div>
+
+      <p>你可以把这 7 种帧分成三类，一下子就记住了：</p>
+      <ul>
+        <li><strong>见面握手（2 种）</strong>：<code>hello</code>（Host 报家门）、<code>hello_ack</code>（Hub 定规矩并回告双方进度）。</li>
+        <li><strong>日常干活（4 种）</strong>：<code>events</code>（Host 上报 AI 实时事件）、<code>audience</code>（Hub 下发谁在看哪个会话）、<code>request</code>（Hub 转发网页操作请求）、<code>respond</code>（Host 分块交回请求答卷）。</li>
+        <li><strong>脉搏与账单（1 种）</strong>：<code>hb</code>（双向心跳：报状态、捎带 <code>ack</code>、敲门探活 <code>probe/probeAck</code>、核对答卷进度 <code>relayAcks</code>）。</li>
+      </ul>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>帧类型 (type)</th>
+              <th>谁发给谁</th>
+              <th>人话一句话作用</th>
+              <th>占不占会话页码 (seq)？</th>
+              <th>丢了怎么补救？</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono"><b>hello</b></td>
+              <td>Host → Hub</td>
+              <td>刚连上时的第一句话：报上 token、本次开机号 <code>epoch</code>、上次进度和能力</td>
+              <td>不占（<code>seq=0</code>）</td>
+              <td>10 秒握不上手直接断开重拨</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>hello_ack</b></td>
+              <td>Hub → Host</td>
+              <td>握手回信：拍板权威水位 <code>ackUp/ackDown</code>、心跳秒数、限额、当前观众名单</td>
+              <td>不占（<code>seq=0</code>）</td>
+              <td>同上，握手失败重连</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>events</b></td>
+              <td>Host → Hub</td>
+              <td>打包一段连续的 AI 事件（首条事件的编号就是这帧的 <code>seq</code>）</td>
+              <td><b>占！</b>（每条事件 1 个号）</td>
+              <td>存在 Host <code>outbox</code>，没收到 <code>ack</code> 就按 RTO(10s) 或重连重发</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>audience</b></td>
+              <td>Hub → Host</td>
+              <td>最新的“观众席点名册”快照：有几个人看、看哪几个对话</td>
+              <td><b>占！</b>（每帧 1 个号）</td>
+              <td>Hub 只留最新一帧未确认名册，原地更新或换新号补发</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>request</b></td>
+              <td>Hub → Host</td>
+              <td>用户在网页上发起的 HTTP 请求（如发消息、查状态），转交给 Host 执行</td>
+              <td><b>占！</b>（每帧 1 个号）</td>
+              <td>存在 Hub 下行日志，10s 重传；5s(只读) 或 15s(可靠) 没收到 ack 则报错 503</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>respond</b></td>
+              <td>Host → Hub</td>
+              <td>Host 执行完 HTTP 请求后的答卷，按 256KiB 切块，自带 <code>chunkSeq (1..N)</code></td>
+              <td><b>不占会话 seq！</b>（独立账本）</td>
+              <td>存在 Host <code>relayOutbox</code>，靠 Hub 的 <code>relayAcks</code> 逐块对账续传</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>hb</b></td>
+              <td>双向互发</td>
+              <td>心跳脉搏：捎带对方 <code>ack</code>、Host 忙闲快照、敲门探针 <code>probe</code>、答卷签收表 <code>relayAcks</code></td>
+              <td>不占（<code>seq=0</code>）</td>
+              <td>普通心跳丢了等下一拍；带 <code>probe</code> 的 3 秒没回音就判断线</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- 交互式实验台 2：7 种信封解剖台 -->
+      <div class="lab-box" id="lab-frames">
+        <div class="lab-header">
+          <span class="lab-title">🔍 交互式信封解剖台：点选任意一种帧，看真实 JSON 长什么样</span>
+          <span class="mono" style="font-size:12px;color:var(--text-3)">定义位置：acp-hub/wire/frame.go</span>
+        </div>
+        <div class="btn-group" role="tablist" aria-label="7种协议帧切换">
+          <button type="button" class="tab-btn active" data-frame="hello">1. hello</button>
+          <button type="button" class="tab-btn" data-frame="hello_ack">2. hello_ack</button>
+          <button type="button" class="tab-btn" data-frame="events">3. events</button>
+          <button type="button" class="tab-btn" data-frame="audience">4. audience</button>
+          <button type="button" class="tab-btn" data-frame="request">5. request</button>
+          <button type="button" class="tab-btn" data-frame="respond">6. respond</button>
+          <button type="button" class="tab-btn" data-frame="hb">7. hb (心跳)</button>
+        </div>
+        <div class="lab-split">
+          <div>
+            <pre style="margin:0"><code id="frameJsonBox"></code></pre>
+          </div>
+          <div class="lab-panel" id="frameNotesBox"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 第 3 章 ==================== -->
+    <section class="lesson" id="sec-priority">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 03</span>
+        <div>
+          <h2>四大优先级：当网卡堵车、内存吃紧时，协议先保谁？</h2>
+          <p>写协议最核心的不是“顺风顺水时怎么发”，而是“网速变慢、流量暴增、连接闪断时，谁排第一、谁排第二”。代码里一共有 4 套严密的优先级。</p>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">优先级 1</span> 网卡发信排队优先级（单 Writer 调度：谁先上车？）</h3>
+      <p>在 Host 和 Hub 里，每条会话都<strong>只有一个专门负责往网卡写数据的协程（单 <code>writer</code>，见 <code>writer.go</code>）</strong>。为什么要单协程写？因为如果多个协程同时往一根连接里塞数据，大文件和小控制帧就会撞成一团。单 <code>writer</code> 每次挑活干时，严格按下面 4 级顺序选：</p>
+
+      <figure>
+        <div class="fig-bar">
+          <span>图 3.1 · 单 Writer 的四级发车顺序与 32 KiB 分片插队机制</span>
+          <span class="hint">源码：acp-host/internal/hub/writer.go &amp; acp-hub/internal/hub/writer.go</span>
+        </div>
+        <div class="fig-canvas">
+          <svg viewBox="0 0 1000 320" role="img" aria-label="单Writer的四级优先级调度与32KB分片插队示意图">
+            <!-- 优先级梯队 -->
+            <rect x="20" y="22" width="290" height="62" rx="10" fill="var(--red-soft)" stroke="var(--red)" stroke-width="1.6"/>
+            <text x="36" y="47" fill="var(--red)" font-size="13.5" font-weight="700">第一顺位（最高）：控制帧 (hb / probe)</text>
+            <text x="36" y="68" fill="var(--text-2)" font-size="12">救命心跳与敲门回音，随时来随时先发</text>
+
+            <rect x="20" y="96" width="290" height="62" rx="10" fill="var(--amber-soft)" stroke="var(--amber)" stroke-width="1.5"/>
+            <text x="36" y="121" fill="var(--amber)" font-size="13.5" font-weight="700">第二顺位：超时补发 (retransmit)</text>
+            <text x="36" y="142" fill="var(--text-2)" font-size="12">只补发“最老的一小批”，不倒全量日志</text>
+
+            <rect x="20" y="170" width="290" height="62" rx="10" fill="var(--blue-soft)" stroke="var(--blue)" stroke-width="1.5"/>
+            <text x="36" y="195" fill="var(--blue)" font-size="13.5" font-weight="700">第三顺位：events 与 respond 轮流发</text>
+            <text x="36" y="216" fill="var(--text-2)" font-size="12">WS 下一替一帧；QUIC 下 respond 走独立车道</text>
+
+            <rect x="20" y="244" width="290" height="54" rx="10" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+            <text x="36" y="268" fill="var(--text-2)" font-size="13" font-weight="700">第四顺位：大帧拆成 32 KiB 慢慢搬</text>
+            <text x="36" y="286" fill="var(--text-3)" font-size="11.5">每搬完一个 32 KiB，回头检查有没有第一顺位！</text>
+
+            <!-- 右侧：32KB分片插队示意 -->
+            <rect x="344" y="22" width="636" height="276" rx="14" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+            <text x="366" y="52" fill="var(--text)" font-size="14.5" font-weight="700">📦 为什么 2 MB 的大帧不会把心跳堵死？（32 KiB Transport Unit 插队）</text>
+            <text x="366" y="76" fill="var(--text-2)" font-size="12.5">假设正在发一个 2 MB 的 events 大帧。Writer 先把它压缩，再切成很多个 32 KiB 的小包裹：</text>
+
+            <!-- 分片轨道 -->
+            <g font-family="var(--font-mono)" font-size="11">
+              <rect x="366" y="102" width="96" height="58" rx="8" fill="var(--blue-soft)" stroke="var(--blue)"/>
+              <text x="414" y="126" text-anchor="middle" fill="var(--blue)" font-weight="700">分片 #1</text>
+              <text x="414" y="145" text-anchor="middle" fill="var(--text-2)">offset: 0</text>
+
+              <rect x="472" y="102" width="96" height="58" rx="8" fill="var(--blue-soft)" stroke="var(--blue)"/>
+              <text x="520" y="126" text-anchor="middle" fill="var(--blue)" font-weight="700">分片 #2</text>
+              <text x="520" y="145" text-anchor="middle" fill="var(--text-2)">offset: 32K</text>
+
+              <!-- 插队的 HB -->
+              <rect x="578" y="92" width="128" height="78" rx="9" fill="var(--red-soft)" stroke="var(--red)" stroke-width="2"/>
+              <text x="642" y="118" text-anchor="middle" fill="var(--red)" font-weight="700">⚡ hb 心跳插队！</text>
+              <text x="642" y="138" text-anchor="middle" fill="var(--text)" font-size="10.5">完整小帧直接穿过</text>
+              <text x="642" y="155" text-anchor="middle" fill="var(--red)" font-size="10">不打断大帧重组</text>
+
+              <rect x="716" y="102" width="96" height="58" rx="8" fill="var(--blue-soft)" stroke="var(--blue)"/>
+              <text x="764" y="126" text-anchor="middle" fill="var(--blue)" font-weight="700">分片 #3</text>
+              <text x="764" y="145" text-anchor="middle" fill="var(--text-2)">offset: 64K</text>
+
+              <rect x="822" y="102" width="134" height="58" rx="8" fill="var(--blue-soft)" stroke="var(--blue)" stroke-dasharray="4 3"/>
+              <text x="889" y="126" text-anchor="middle" fill="var(--blue)" font-weight="700">... 直到发完</text>
+              <text x="889" y="145" text-anchor="middle" fill="var(--text-2)">total: 2.1MB</text>
+            </g>
+
+            <rect x="366" y="192" width="590" height="86" rx="9" fill="var(--surface)" stroke="var(--border)"/>
+            <text x="382" y="216" fill="var(--text)" font-size="12.5" font-weight="700">接收方（Reassembler）怎么区分它们？</text>
+            <text x="382" y="238" fill="var(--text-2)" font-size="12">• 每个 unit 开头有 13 字节头：<tspan font-family="var(--font-mono)">flags(1B) | frameID(4B) | total(4B) | offset(4B)</tspan>。</text>
+            <text x="382" y="258" fill="var(--text-2)" font-size="12">• 正在拼分片时，遇到一个 <tspan font-family="var(--font-mono)">fragment=0</tspan> 的完整小帧（如心跳），立刻放行交给上层，手里的分片继续接着拼！</text>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="callout good">
+        <div class="callout-title">✨ 细节亮点：普通心跳会“合并”，但带敲门暗号的心跳绝不丢！</div>
+        <p>在 Hub 的 <code>writer.go</code> 里，控制队列 <code>controlQ</code> 有一个极聪明的区分：如果队列里已经有了一封普通 <code>hb</code>，又来了一封新的普通 <code>hb</code>，直接<strong>用新快照覆盖旧快照</strong>（因为状态只看最新值）；但如果这封 <code>hb</code> 带有 <code>probe</code> 或 <code>probeAck</code> 暗号，就<strong>老老实实排队保留，绝不合并覆盖</strong>，因为对端正在掐着秒表等那个特定的随机数回音！</p>
+      </div>
+
+      <h3><span class="sec-tag">优先级 2</span> 内存保命与省流优先级（Outbox：先保谁、先扔谁？）</h3>
+      <p>当断网或者弱网发不出去，或者同时开了 20 个会话但你只看其中 1 个时，Host 的上行待发日志（<code>outbox.go</code>）按以下优先级决定谁留正文、谁变 <code>trimmed</code> 空纸条：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>保命层级</th>
+              <th>触发条件</th>
+              <th>保留什么 / 牺牲什么</th>
+              <th>为什么这样排优先级？</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>0. 有人看 vs 没人看</b><br><span class="mono">trimUnwatched</span></td>
+              <td>收到 Hub 的 <code>audience</code> 名单，且 <code>all == false</code></td>
+              <td>
+                • <b>完全暂停</b>：当 <code>watchers == 0</code> 时，暂停发所有 <code>events</code>，只发心跳。<br>
+                • <b>只裁正文、不裁控制</b>：没人看的对话，把 11 种正文事件（<code>chunk</code>、<code>thought</code>、<code>tool_call</code>、<code>tool_call_update</code>、<code>image</code>、<code>plan</code> 等）换成 <code>trimmed</code>；但<b>忙闲状态、回合结束、权限弹窗等控制事件一律保留</b>。
+              </td>
+              <td>没人看的正文传上去纯属浪费带宽；但控制事件不能裁，否则你切到那个对话时，它会卡在错误的“还在运行中”状态。</td>
+            </tr>
+            <tr>
+              <td><b>1. 单条巨无霸</b><br><span class="mono">&gt; 8 MiB (maxFrame)</span></td>
+              <td>单条事件加上 64 字节信封就已经超过单帧上限 8 MiB</td>
+              <td>无论它是什么类型，在进 <code>outbox</code> 的那一刻<b>直接变成同 <code>seq</code> 的 <code>trimmed</code> 占位符</b>。</td>
+              <td>因为协议规定单个逻辑帧最大 8 MiB，放进去也永远发不出去，还会把整条通道卡死。</td>
+            </tr>
+            <tr>
+              <td><b>2. 超过软上限</b><br><span class="mono">&gt; 16 MiB (2 × maxFrame)</span></td>
+              <td>未收到 <code>ack</code> 的待发日志总字节数超过 16 MiB</td>
+              <td>启动单次扫描（<code>ElideFrom</code>）：<b>先把可丢弃的流式碎片（<code>chunk</code>、<code>thought</code>、<code>user_chunk</code>）原地替换成 <code>trimmed</code></b>；<b>死保关键事件（<code>tool_call</code>、<code>tool_call_update</code>、<code>plan</code>、<code>image</code>、控制帧）</b>。</td>
+              <td>流式打字碎片丢了，前端可以从磁盘历史补；但工具调用和回合终态是时间线骨架，必须优先保住。</td>
+            </tr>
+            <tr>
+              <td><b>3. 超过硬上限</b><br><span class="mono">&gt; 64 MiB (8 × maxFrame)</span></td>
+              <td>把所有可丢弃碎片全换成 <code>trimmed</code> 后，光靠关键事件仍然超过 64 MiB</td>
+              <td><b>绝不静默丢弃关键事件！</b>先把当前批次写完入账，然后主动以 <code>CloseOverflow</code> 关闭连接，重连后按水位线重放。</td>
+              <td>一旦关键事件被静默删掉，页码就会出现永远补不上的死洞。主动断连重放是唯一诚实的恢复手段。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><span class="sec-tag">优先级 3</span> 选路与重连策略优先级（QUIC 优先 + 5 分钟冷静期 + 8 种分手码）</h3>
+      <p>Host 连 Hub 支持两条路：<strong>QUIC（基于 UDP，默认 8788 端口）</strong> 和 <strong>WebSocket（基于 TCP，<code>/ws/host</code>）</strong>。代码在 <code>client.go</code> 里定了一套非常务实的选路优先级：</p>
+      <ol>
+        <li><strong>默认首选 QUIC</strong>：因为 QUIC 没有 TCP 的队头阻塞，而且 Host 可以把每个 HTTP 答卷（<code>respond</code>）放到独立的 QUIC 请求流（<code>relayLane</code>）里发，完全不挡主控制流的心跳和事件。</li>
+        <li><strong>单次失败当场降级 WebSocket</strong>：如果拨 QUIC 超过 8 秒（<code>quicDialTimeout</code>）没连上，立刻无缝回退拨 WebSocket（6 秒超时）。</li>
+        <li><strong>防折腾的“5 分钟冷静期”</strong>：有些公司的防火墙或代理直接封死了 UDP，或者放行了握手却在几秒后掐断 UDP。为了不让每次重连都白白浪费 8 秒钟去撞南墙，Host 设了两个计数器：
+          <ul>
+            <li><strong>连续 3 次建立失败</strong>（<code>quicFailMax = 3</code>），或者</li>
+            <li><strong>连续 3 次连上后活不过 2 分钟就断掉</strong>（闪断防抖 <code>quicFlapMax = 3, quicFlapMin = 2m</code>）</li>
+          </ul>
+          只要触发任意一条，接下来 <strong>5 分钟（<code>quicFailCooldown</code>）内直接跳过 QUIC 走 WebSocket</strong>！等 5 分钟后再重新尝试一次 QUIC。
+        </li>
+      </ol>
+
+      <h3><span class="sec-tag">优先级 4</span> 请求签收期限与断线感知的时间优先级（5 秒快读 vs 15 秒可靠）</h3>
+      <p>当用户在浏览器上点了一个操作，Hub 把它封装成 <code>request</code> 发给 Host 时，Hub 怎么知道 Host 有没有收到？看 Host 传回来的累计回执 <code>ack</code> 有没有跨过这封 <code>request</code> 的页码 <code>seq</code>！但<strong>等多久没收到 <code>ack</code> 才算失败？</strong>代码（<code>acp-hub/internal/hub/hub.go</code> 的 <code>RelayPolicy</code>）分成了两档：</p>
+      <ul>
+        <li><strong>第一档：轻量只读白名单（<code>RelayFastRead</code>，限时 5 秒）</strong>——仅限 7 个纯读取且随时可安全重试的接口（<code>GET /api/status</code>、<code>/api/probe</code>、<code>/api/mcp/list</code>、<code>/api/extensions</code>、<code>/api/settings</code>、<code>POST /api/sessions</code>、<code>POST /api/session-state</code>）。<code>request</code> 帧写完后 <strong>5 秒</strong> 内没收到 Host 的 <code>ack</code>，立刻给浏览器返回 503，让前端马上重试。</li>
+        <li><strong>第二档：有副作用或重数据请求（<code>RelayReliable</code>，限时 15 秒 = <code>3 × keepalive</code>）</strong>——比如<strong>发聊天消息（prompt）</strong>、审批权限、拉取历史消息（<code>/api/session-updates</code>）。为什么必须等 15 秒？因为协议的丢包重传周期 <code>RTO = 2 × keepalive = 10 秒</code>！如果只等 5 秒就给用户报错“发送失败”，万一第 10 秒自动重传成功了，Host 就会在后台偷偷把那句 prompt 执行了！给足 <strong>15 秒（一次 10 秒重传 + 5 秒心跳余量）</strong>，保证单次丢包一定能救回来，真正超时才记上 <code>abort</code> 作废章。</li>
+      </ul>
+    </section>
+
+    <!-- ==================== 第 4 章 ==================== -->
+    <section class="lesson" id="sec-flows">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 04</span>
+        <div>
+          <h2>两条业务主线：实时转播与远程点菜是怎么跑的？</h2>
+          <p>认识了名词和优先级，我们把它们串起来，看一看协议最核心的两条日常流水线。</p>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">主线 A</span> 实时转播（Events 上行）与按观众省流（Audience 下行）</h3>
+      <p>想象家里电脑同时开了 3 个对话（<code>s1</code>、<code>s2</code>、<code>s3</code>），但你手机浏览器当前只打开了 <code>s1</code>。整条链路是这样配合省流量的：</p>
+      <ol>
+        <li><strong>网页报备</strong>：浏览器连上 Hub 的 <code>/ws/fe</code> 时，先发一帧空的 <code>viewing</code>（声明“我支持按会话过滤协议”）；当你点开 <code>s1</code> 时，浏览器发 <code>{"v":1,"type":"viewing","host":"mbp","session":"s1"}</code>。</li>
+        <li><strong>Hub 点名汇总</strong>：Hub 检查所有盯着这台 Host 的浏览器。如果所有页面都声明了在看谁，且总会话数 ≤ 64、每个 ID 长度 ≤ 128，Hub 就会把名单排序去重，并<strong>自动把被观看会话的一层子代理（Subagent）会话也加进白名单</strong>（因为子代理的进度条就嵌在父会话页面里！），生成一帧 <code>audience{gen:35, watchers:1, all:false, sessions:["s1"]}</code> 发给 Host。如果哪怕有一个旧网页没声明 <code>viewing</code>，Hub 就把 <code>all</code> 设为 <code>true</code>（宁可多传，绝不漏传）。</li>
+        <li><strong>Host 攒批与裁剪</strong>：Host 的 <code>forwardLoop</code> 每 <strong>50 毫秒或满 32 条事件</strong> 打包一次。在写进上行日志 <code>outbox</code> 之前，先调用 <code>trimUnwatched</code>：<code>s1</code>（以及它的子代理）原样保留；<code>s2</code> 和 <code>s3</code> 的正文事件全部原地抽干，变成 <code>{"type":"trimmed","sessionId":"s2","seq":105}</code>，最后写进 <code>outbox</code> 由 <code>writer</code> 发给 Hub。</li>
+      </ol>
+
+      <!-- 交互式实验台 3：Audience 裁剪模拟器 -->
+      <div class="lab-box" id="lab-audience">
+        <div class="lab-header">
+          <span class="lab-title">🎛️ 交互式观众席模拟器：切换浏览器观看状态，看 Host 发出的帧怎么变</span>
+          <span class="mono" style="font-size:12px;color:var(--text-3)">源码：trimUnwatched (client.go)</span>
+        </div>
+        <div class="btn-group">
+          <button type="button" class="tab-btn" data-aud-mode="none">场景 1：没人打开网页 (watchers = 0)</button>
+          <button type="button" class="tab-btn active" data-aud-mode="s1">场景 2：只看会话 s1 (带子代理 s1-sub)</button>
+          <button type="button" class="tab-btn" data-aud-mode="s1s2">场景 3：两个网页分别看 s1 和 s2</button>
+          <button type="button" class="tab-btn" data-aud-mode="all">场景 4：有旧网页未声明 / 超 64 个会话 (all = true)</button>
+        </div>
+        <div class="lab-split">
+          <div class="lab-panel">
+            <div style="font-size:12.5px;font-weight:700;color:var(--blue);margin-bottom:6px">Hub 下发给 Host 的 audience 帧：</div>
+            <pre style="margin:0"><code id="audFrameOut"></code></pre>
+          </div>
+          <div class="lab-panel">
+            <div style="font-size:12.5px;font-weight:700;color:var(--teal);margin-bottom:6px">Host 收到后对上行事件的处理结果：</div>
+            <div id="audBehaviorOut" style="font-size:13.8px;color:var(--text-2)"></div>
+          </div>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">主线 B</span> 远程点菜（Request 下行 &amp; Respond 分块上行）：为什么要用“两本账”？</h3>
+      <p>当你在手机网页上点“发送消息”或“读取对话历史”时，浏览器向 Hub 发了一个普通 HTTP 请求，Hub 需要把它转给 Host 执行，再把结果拿回来。这里有一个非常精妙的<strong>“两本账分离”</strong>设计：</p>
+
+      <figure>
+        <div class="fig-bar">
+          <span>图 4.1 · 中继请求的两本账：Request 走会话页码，Respond 走独立分块账本</span>
+          <span class="hint">源码：acp-host/internal/hub/relay.go &amp; relay_outbox.go</span>
+        </div>
+        <div class="fig-canvas">
+          <svg viewBox="0 0 1000 310" role="img" aria-label="中继请求与响应的双账本工作流图">
+            <!-- 左：第一本账 -->
+            <rect x="20" y="20" width="460" height="270" rx="14" fill="var(--blue-soft)" stroke="var(--blue)" stroke-width="1.5"/>
+            <text x="42" y="52" fill="var(--blue)" font-size="16" font-weight="700">第一本账：把命令送过去（会话面）</text>
+            <text x="42" y="76" fill="var(--text-2)" font-size="12.5">目标：确保命令 100% 送到，且绝不重复执行同一条命令</text>
+
+            <rect x="42" y="96" width="416" height="52" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+            <text x="56" y="118" fill="var(--text)" font-size="12.5" font-weight="700">① 发送前预检 (Preflight)</text>
+            <text x="56" y="137" fill="var(--text-2)" font-size="11.5">2 秒内有帧 → 直接发；否则发 probe 等 1.5 秒，不通直接回 503</text>
+
+            <rect x="42" y="160" width="416" height="52" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+            <text x="56" y="182" fill="var(--text)" font-size="12.5" font-weight="700">② 占用下行会话页码 (request.seq = 13)</text>
+            <text x="56" y="201" fill="var(--text-2)" font-size="11.5">Host 收到后在 20ms 内回 ack=13，证明“命令已进门”</text>
+
+            <rect x="42" y="224" width="416" height="50" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+            <text x="56" y="245" fill="var(--text)" font-size="12.5" font-weight="700">③ 备忘录防重跑：按 (hubBoot, reqId) 登记</text>
+            <text x="56" y="263" fill="var(--text-2)" font-size="11.5">就算重连后收到重复的 request，也只认第一次，绝不跑第二遍</text>
+
+            <!-- 右：第二本账 -->
+            <rect x="520" y="20" width="460" height="270" rx="14" fill="var(--teal-soft)" stroke="var(--teal)" stroke-width="1.5"/>
+            <text x="542" y="52" fill="var(--teal)" font-size="16" font-weight="700">第二本账：把答卷寄回来（中继面）</text>
+            <text x="542" y="76" fill="var(--text-2)" font-size="12.5">目标：哪怕答卷有 28 MB、中途断网，也能断点续传且不堵事件</text>
+
+            <rect x="542" y="96" width="416" height="52" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+            <text x="556" y="118" fill="var(--text)" font-size="12.5" font-weight="700">① 不占会话 seq（respond.seq = 0）</text>
+            <text x="556" y="137" fill="var(--text-2)" font-size="11.5">按 256 KiB 切块，每块标自己的 chunkSeq: 1, 2, ... N</text>
+
+            <rect x="542" y="160" width="416" height="52" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+            <text x="556" y="182" fill="var(--text)" font-size="12.5" font-weight="700">② 存入进程级 relayOutbox（跨断线存活）</text>
+            <text x="556" y="201" fill="var(--text-2)" font-size="11.5">哪怕执行期间网断了，答卷也留在日志里等下一条连接送出</text>
+
+            <rect x="542" y="224" width="416" height="50" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+            <text x="556" y="245" fill="var(--text)" font-size="12.5" font-weight="700">③ Hub 用 relayAcks 表逐块签收</text>
+            <text x="556" y="263" fill="var(--text-2)" font-size="11.5">确认到第几块就删掉前几块释放内存；done 彻底结案，abort 立即停发</text>
+          </svg>
+        </div>
+      </figure>
+    </section>
+
+    <!-- ==================== 第 5 章 ==================== -->
+    <section class="lesson" id="sec-tradeoffs">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 05</span>
+        <div>
+          <h2>九大工程取舍：为什么偏要这样设计？</h2>
+          <p>架构里没有免费的午餐。理解一份协议最快的方法，就是看它在分岔路口放弃了什么、保住了什么。</p>
+        </div>
+      </div>
+
+      <div class="tradeoff-grid">
+        <div class="tradeoff-card">
+          <h4>取舍 1：没人在看的对话，为什么宁可发 20 字节的 <code>trimmed</code> 空纸条，也不干脆不发？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果干脆不发（直接跳过序号）</b>
+              上行序号会从 100 直接跳到 115。Hub 和前端看到 115 时根本分不清：“101~114 是因为没人看被省掉了，还是在网络上丢包了？”为了区分这两种情况，你必须再发明一套复杂的“跳号通知帧”。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（撕掉正文留页码）</b>
+              花 20 多字节发一张 <code>{"type":"trimmed","seq":101}</code>。换来了一条黄金定律：<b>“序号永远连续，任何空洞 100% 都是丢包”</b>。收发双方和浏览器前端的排序代码瞬间简单十倍，几百 KB 的正文也照样省掉了。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 2：为什么把 <code>respond</code>（HTTP 答卷）踢出会话 <code>seq</code>，单独搞一套 <code>chunkSeq + relayAcks</code>？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果所有帧共用同一条 seq 流水号</b>
+              一个 28 MB 的历史响应要切成 112 块。如果它们占用会话 <code>seq</code>，一旦第 3 块丢包重传，后面跟着的所有 AI 实时打字事件（<code>events</code>）都会因为“页码不连续”被卡在接收等候室里，整个直播画面当场冻住！
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（会话面与中继面分账）</b>
+              <code>respond.seq</code> 永远是 0，每个请求内部用 <code>chunkSeq (1..N)</code> 排顺序，由 <code>relayAcks</code> 单独对账。代价是多维护一张小表，收益是<b>大答卷丢块重传时，AI 实时打字流丝毫不受影响</b>。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 3：为什么 <code>audience</code>（观众名单）允许在未确认时“原地换信纸”，打破“同 seq 内容不变”的规矩？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果每次切会话都追加一帧新的 audience</b>
+              用户在左侧列表快速连点切换了 10 个对话，Hub 就会排队发出 10 帧 <code>audience</code>。弱网下 Host 要一帧接一帧地按过时的名单开关过滤器，造成毫无意义的状态抖动和队列积压。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（单槽位原地替换 + gen 破例放行）</b>
+              观众名单是“最终状态”，中间过程毫无价值。Hub 同一时间只留<b>唯一一帧</b>未确认的 <code>audience</code>，新名单直接原地覆盖旧 payload（<code>Sender.Elide</code>）并通知 Writer 立刻重写；Host 看到 <code>seq &lt;= acked</code> 但 <code>gen</code> 更大的名单时破例放行。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 4：超时重传（RTO = 10s）触发时，为什么只补发“最老的一小批”，而不把未确认日志全重发一遍？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果 RTO 到点把所有未确认帧全倒进网卡</b>
+              网络本来就慢或者刚丢了一个包，日志里可能攒了 10 MB 的未确认数据。如果一口气全重发，会瞬间把本就脆弱的慢连接彻底灌爆，引发“重传 → 超时 → 再全量重传”的雪崩（这也是旧版 v1 真实发生过的线上故障）。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（小步试探重传）</b>
+              Hub 下行每次 RTO 最多只重发最老的 <b>8 帧或 1 MiB</b>（<code>retransmitBatch</code>）；Host 上行每次 RTO 只从 <code>acked</code> 水位起打包<b>一帧</b> <code>events</code> + <b>最老的一块</b>未确认答卷（<code>relayOutbox.repair</code>），确认通了再继续推进。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 5：发请求前为什么要花最多 1.5 秒做敲门预检（Preflight），而且失败了连 <code>request</code> 帧都不写？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果直接把 request 写进发送日志靠重传兜底</b>
+              假如 Host 刚好断网了（但 Hub 还没满 10 秒判死），用户点“发送消息”。如果把 <code>request</code> 写进日志，用户会在几秒后看到超时报错以为没发出去；结果 12 秒后 Host 重连成功，这条命令被重放并突然开始执行——俗称“幽灵自动执行”。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（2s 新鲜窗 + 1.5s 敲门预检）</b>
+              只要最近 2 秒内收到过 Host 的任何帧，0 延迟直发；如果超过 2 秒没动静，先发 <code>hb{probe}</code> 最多等 1.5 秒。敲不开门当场给浏览器回 <code>503 host 正在重连</code>，<b>压根不生成 <code>request</code> 帧</b>，保证“报错没发出去就绝对不会晚点偷跑”。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 6：浏览器为什么不自己做心跳探活，而是“3.5 秒先弹暂定提示、10 秒等 Hub 权威宣判”？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果让每个浏览器标签页各自 ping Host</b>
+              10 个网页标签页就会产生 10 倍探活流量；而且如果 3.5 秒一到就直接把会话判死切断，一次稍微长一点的垃圾回收（GC）或 Wi-Fi 抖动就会造成大量假断线。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（提示权与宣判权分离）</b>
+              AI 干活时 Host 每 1 秒发一次忙心跳。网页如果 2 秒没收到新事件，就去问 Hub 拿 <code>lastSeenAgeMs</code>；满 <b>3.5 秒</b> 网页先提示“连接中断，正在重连…”（安抚用户别瞎猜，下一秒心跳来了就立刻撤掉提示）；真正掐断连接由 Hub 在 <b>7s + 3s = 10 秒</b> 权威执行。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 7：为什么 QUIC 坚决不开 0-RTT（零往返快速握手）？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果开启 QUIC 0-RTT</b>
+              省下几毫秒握手时间，但底层网络库在遇到丢包时会把 0-RTT 期间写入的字节流整段重放，导致同一帧 <code>hello</code> 被当作两条连接处理，引发假 <code>superseded</code> 互相顶号。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（禁用 0-RTT，应用层续传）</b>
+              长连接几小时才握一次手，那几毫秒毫无意义。禁用 0-RTT（见 <code>transport_quic.go:298</code>），完全靠应用层的 <code>(epoch, ackUp, ackDown)</code> 做确定性续传。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 8：为什么不给协议做复杂的多版本兼容，而是版本/能力不对直接 <code>CloseProtocol</code>（同版锁步 Lockstep）？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果同时兼容 v1、半残版 v2、无分片版 v2</b>
+              代码里到处都是 <code>if peerSupportsX</code> 的分支，测试组合爆炸；而且没有 <code>transportUnits</code> 就分不清二进制分片与文本帧，没有 <code>relayAck</code> 大响应就会卡死。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（严格校验，不兼容当场明示）</b>
+              握手时只要 <code>v != 2</code> 或没回显 <code>transportUnits</code> + <code>relayAck</code>，当场以 <code>CloseProtocol</code> 关闭并在日志打印“请把 host 与 hub 升到同一版本”。状态机永远只有一种行为。
+            </div>
+          </div>
+        </div>
+
+        <div class="tradeoff-card">
+          <h4>取舍 9：Host 执行完的答卷为什么要放在进程级 <code>relayOutbox</code>（最多 75 MiB），但请求去重表 <code>relayMemo</code> 却只存“墓碑”不存答卷正文？</h4>
+          <div class="tradeoff-cols">
+            <div class="t-col reject">
+              <b class="label">✗ 如果在去重表里也缓存每份答卷的完整正文</b>
+              以前在 memo 里额外缓存答卷正文，既浪费内存，又出现过“超过 1 MiB 的大答卷放不进 memo，断线重连后直接丢掉”的毛病。
+            </div>
+            <div class="t-col choose">
+              <b class="label">✓ 现在的取舍（relayOutbox 管续传，memo 只管“别跑第二遍”）</b>
+              答卷从出生起就切好块放进唯一的进程级 <code>relayOutbox</code>，靠 <code>relayAcks</code> 驱动重传和释放；<code>relayMemo</code> 只记一个几十字节的“墓碑”（代表这个 <code>(hubBoot, reqId)</code> 已经跑过了），职责干净且零双份内存开销。
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 第 6 章 ==================== -->
+    <section class="lesson" id="sec-details">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 06</span>
+        <div>
+          <h2>八个魔鬼细节：只有读过源码才会拍案叫绝的机关</h2>
+          <p>纸面上的协议谁都会画，真正决定系统稳不稳的，是下面这 8 个藏在 Go 源码里的细节。</p>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">细节 1</span> 20 毫秒回执闹钟（<code>AckDelay = 20ms</code>）：绝不傻等 5 秒心跳才回执</h3>
+      <p>既然 <code>ack</code> 是捎带在出站帧上的，那如果 Hub 给 Host 发了一封 <code>request</code> 或 <code>audience</code>，而 Host 此时刚好闲着没产生任何 AI 事件，Host 岂不是要等 5 秒后的周期心跳才能把 <code>ack</code> 带回去？那样的话，5 秒超时的快速只读请求岂不是每次都在超时边缘徘徊？</p>
+      <p><strong>代码里的解法（<code>acp-host/internal/hub/session.go:602</code>）：</strong>每当 Host 收到下行可靠帧让接收水位前进时，立刻设一个 <strong>20 毫秒的闹钟（<code>ackPending = true, ackDue = now + 20ms</code>）</strong>。如果这 20 毫秒内刚好有别的帧要发，闹钟自动取消；如果 20 毫秒到了还没别的话可说，立刻专门发一帧 <code>hb</code> 把新 <code>ack</code> 送出去！</p>
+
+      <h3><span class="sec-tag">细节 2</span> 请求超时必须等“整帧写进网卡（<code>noteWritten</code>）”才开始掐表</h3>
+      <p>如果 Hub 收到浏览器的请求（<code>dispatchRequest</code>）那一刻就开始倒计时 5 秒，万一当时 Writer 正在写一个大帧，这封 <code>request</code> 在 Hub 自己的内存队列里排了 4.5 秒才写进网卡，那 Host 岂不是只剩 0.5 秒来回 <code>ack</code>？</p>
+      <p><strong>代码里的解法（<code>acp-hub/internal/hub/session.go:297</code>）：</strong><code>dispatchRequest</code> 入队时，<code>deadline</code> 填的是零值（不计时）！只有当 <code>writer.writeReliable</code> 把这封 <code>request</code> 的最后一个字节真正写进传输层之后，才回调 <code>proto.noteWritten(seq)</code> 正式按下 5 秒或 15 秒的秒表。而且重传期间如果原期限还没到，不会无限续命；只有原期限已过且新副本真正写完时才重开窗口。</p>
+
+      <h3><span class="sec-tag">细节 3</span> 为什么 <code>lastSeenAgeMs</code> 必须由 Hub 算好，绝不能让浏览器用 <code>当前时间 - lastSeen</code>？</h3>
+      <p>Hub 会记录最后一次收到 Host 任何帧的时间戳 <code>LastSeen</code>。如果浏览器拿到 <code>lastSeen: "14:00:00"</code>，然后用手机自己的时钟 <code>14:00:05</code> 去减它，会发生什么？<strong>只要用户的手机或电脑系统时间比服务器快了 4 秒，浏览器就会把一台每秒都在正常发心跳的 Host 永久误判成“已经断线 4 秒了”！</strong></p>
+      <p><strong>代码里的解法（<code>acp-hub/internal/hub/hub.go:2608</code>）：</strong>Hub 在返回 <code>/api/hosts</code> 时，直接用 Hub 自己的同一块系统时钟算出 <code>lastSeenAgeMs = time.Since(info.LastSeen).Milliseconds()</code>。浏览器只看这个相差毫秒数（≥ 3500ms 判静默），彻底消灭了跨机器时钟偏差。</p>
+
+      <h3><span class="sec-tag">细节 4</span> Host 重启换 <code>epoch</code> 时，怎么防止队列里残存的“前朝旧事件”把浏览器的水位线污染了？</h3>
+      <p>这是一个极容易踩坑的并发竞态：假设旧 Host 进程发到了 <code>seq = 5000</code> 然后重启了，新 Host 进程从基线 <code>resume.up = 100</code> 重新开始发（新事件是 <code>101, 102...</code>）。Hub 收到新 <code>hello</code> 时，需要发一帧 <code>{"type":"subscribed","host":"mbp","seq":100}</code> 告诉所有浏览器：“把你们的页码表拨回 100！”</p>
+      <p>但是！此时 Hub 的扇出队列（<code>fanout</code>）里可能还排着旧进程刚入队的第 <code>4999、5000</code> 号事件没来得及发给浏览器。如果“重置到 100”绕过队列直接发给浏览器，紧接着队列里的旧 <code>5000</code> 号事件才冒出来，浏览器的水位线就会瞬间又被推到 5000——随后新进程发来的 <code>101, 102...</code> 全都会被浏览器当成“小于 5000 的旧重复消息”统统丢掉！</p>
+      <p><strong>代码里的解法（<code>acp-hub/internal/hub/hub.go:412, 1388</code>）：</strong></p>
+      <ol>
+        <li>每条放进 <code>fanout</code> 队列的事件，都必须贴上它入队时的朝代标签 <code>fanoutItem.epoch</code>。</li>
+        <li>重置帧 <code>subscribed{seq:baseline}</code> 不许走后门，必须贴上<strong>新 <code>epoch</code> 标签</strong>排进同一个 <code>fanout</code> 队列。</li>
+        <li>发送协程从队列取事件时，先核对 <code>item.epoch == hs.epoch.Load()</code>（<code>fanoutItemCurrent</code>）：凡是发现还贴着旧朝代标签的残留事件，当场扔进垃圾桶！并且写出给浏览器时，<code>writeBatch</code> 会把混在批次里的 <code>subscribed</code> 拆成独立顶层帧发出（<code>cmd/capri-hub/main.go:1306</code>），确保浏览器 100% 收到重置信号。</li>
+      </ol>
+
+      <h3><span class="sec-tag">细节 5</span> 为什么压缩（Deflate）必须“先压整帧、再切 32 KiB 分片”，且锁死 32 MiB 解压上限？</h3>
+      <p><strong>代码里的解法（<code>writer.go</code> &amp; <code>main.go:1104</code>）：</strong></p>
+      <ul>
+        <li><strong>低于 256 字节不压缩</strong>（<code>minCompressSize = 256</code>）：像心跳这样只有几十字节的小 JSON，加上 DEFLATE 头部反而更胖，直接发原文；而且只要压完没有变小，也自动退回发原文。</li>
+        <li><strong>先压整帧，再切 32 KiB Unit</strong>：一段 2 MB 的 JSON 作为整体压缩，重复字段多，往往能压到一两百 KB；如果先切成 32 KiB 再各自压缩，压缩率会大打折扣。接收方在 <code>Reassembler</code> 里把分片拼回完整帧后，再看 <code>UnitCompressed</code> 标志统一解压。</li>
+        <li><strong>32 MiB 解压炸弹护栏</strong>（<code>maxInflatedFrame = 32 MiB</code>）：解压时用 <code>io.LimitReader(zr, 32&lt;&lt;20 + 1)</code>。如果一个只有几十 KB 的损坏或恶意压缩包解压出几百 MB，达到 32 MiB 立刻报 <code>CloseUnreadable</code> 断开，绝不撑爆服务器内存。</li>
+      </ul>
+
+      <h3><span class="sec-tag">细节 6</span> 中继应答日志 <code>relayOutbox</code> 的字节记账与“单请求 502 降级”</h3>
+      <p>Host 的 <code>relayOutbox</code> 最多允许缓存约 <strong>75 MiB</strong> 的待确认答卷（<code>2 × (28MiB × 4/3 + 256KiB)</code>，够装两份满额的 base64 编码大响应）。这里有两个关键细节：</p>
+      <ul>
+        <li><strong>逐块确认、逐块退还预算（<code>relay_outbox.go:80</code>）</strong>：一个大响应切成很多个 256 KiB 的分块后，Hub 每通过 <code>hb.relayAcks</code> 确认前几块，Host 的 <code>advance(n)</code> 就会删掉已确认的分块，并<strong>立刻把这些分块占用的字节数从总账本 <code>o.bytes</code> 里扣掉</strong>（如果等到整单 <code>done</code> 才扣，分块确认期间就会永久泄漏字节预算，最终导致所有请求报 502）。</li>
+        <li><strong>满了只杀当前请求，不杀会话（<code>relay.go:72</code>）</strong>：万一真的有超多并发大响应把 75 MiB 占满了，Host 不会断开连接，而是调用 <code>addError</code>（无视预算放行几十字节的错误帧）给当前这一个请求回一条 HTTP 502 <code>"中继应答积压，已放弃本次响应"</code>，其他请求和实时事件流完全不受影响。</li>
+      </ul>
+
+      <h3><span class="sec-tag">细节 7</span> 多个网页同时发请求时，预检敲门（Preflight Probe）会自动“拼车”</h3>
+      <p>如果 Host 刚好安静了 3 秒，此时前端页面同时发来 5 个 API 请求，难道 Hub 要连发 5 帧 <code>hb{probe}</code> 去敲门吗？</p>
+      <p><strong>代码里的解法（<code>acp-hub/internal/hub/session.go:529</code>）：</strong><code>session.probe()</code> 里有一个 <code>probeGroup</code> 拼车锁。第一个发现超过 2 秒没动静的请求负责发出唯一一帧 <code>hb{probe: nonce}</code>；紧随其后的另外 4 个请求看到已经有 <code>probeGroup</code> 在等回音了，直接加入同一个等候组（<code>g.wait</code>）。只要 Host 回了一声 <code>probeAck</code>，5 个请求同时放行！</p>
+
+      <h3><span class="sec-tag">细节 8</span> QUIC 必须等 <code>hello.token</code> 验明正身后，才开启请求流接收协程</h3>
+      <p>在 QUIC 模式下，除了双向控制流，Host 还可以打开单向请求流来发 <code>respond</code>。如果 Hub 在刚建立 QUIC 连接、还没核对 <code>hello.token</code> 时就允许接收单向流，恶意连接就可以在未认证状态下狂开单向流往 Hub 的 64 槽帧队列里塞 32 MB 大包（耗尽约 2 GB 内存）。</p>
+      <p><strong>代码里的解法（<code>acp-hub/internal/hub/session.go:769</code>）：</strong>Hub 只有在读完第一帧 <code>hello</code>（未认证前控制流单帧上限锁死在 <code>quicPreAuthFrameLimit = 1 MiB</code>）并验证 <code>HostIDForToken</code> 通过之后，才调用 <code>starter.StartRequestStreams()</code> 开启单向流接收。</p>
+    </section>
+
+    <!-- ==================== 第 7 章 ==================== -->
+    <section class="lesson" id="sec-liveness">
+      <div class="lesson-header">
+        <span class="lesson-num">LESSON 07</span>
+        <div>
+          <h2>断线与故障分诊台：0~20 秒里每一秒发生了什么？</h2>
+          <p>当网线被拔掉、电脑合上盖子、或者某一方重启时，协议是怎样像钟表一样一步步处理故障的？</p>
+        </div>
+      </div>
+
+      <!-- 交互式实验台 4：0~20s 静默断线时钟 -->
+      <div class="lab-box" id="lab-clock">
+        <div class="lab-header">
+          <span class="lab-title">⏱️ 交互式断线时钟：拖动滑块，看 AI 正在输出时突然断网的 0~20 秒全过程</span>
+          <span class="mono" id="clockReadoutBadge" style="font-size:15px;font-weight:700;color:var(--blue)">t = 0.0 秒</span>
+        </div>
+        <div class="clock-bar">
+          <span style="font-size:13px;color:var(--text-3)">0s (刚刚断网)</span>
+          <input type="range" id="clockSlider" min="0" max="20" step="0.5" value="0" aria-label="断线经过的秒数">
+          <span style="font-size:13px;color:var(--text-3)">20s (idle 兜底)</span>
+        </div>
+        <div class="btn-group">
+          <button type="button" class="tab-btn" data-clock-jump="0">0s 正常输出中</button>
+          <button type="button" class="tab-btn" data-clock-jump="2">2.0s 浏览器起疑</button>
+          <button type="button" class="tab-btn" data-clock-jump="3.5">3.5s 界面提示重连</button>
+          <button type="button" class="tab-btn" data-clock-jump="7">7.0s Hub 敲门 (Probe)</button>
+          <button type="button" class="tab-btn" data-clock-jump="10">10.0s 权威判死断开</button>
+          <button type="button" class="tab-btn" data-clock-jump="20">20.0s Idle 终极兜底</button>
+        </div>
+        <div class="clock-cards">
+          <div class="clock-card">
+            <b>🏠 Host（你的电脑）</b>
+            <div id="clockHostText"></div>
+          </div>
+          <div class="clock-card">
+            <b>🏢 Hub（公网中转站）</b>
+            <div id="clockHubText"></div>
+          </div>
+          <div class="clock-card">
+            <b>📱 浏览器网页（FE）</b>
+            <div id="clockFeText"></div>
+          </div>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">分诊表</span> 12 种常见意外与协议的标准动作</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>意外场景</th>
+              <th>协议怎么发现？</th>
+              <th>协议怎么处理？</th>
+              <th>用户在网页上看到什么？</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>1. Host 正常退出 / 进程崩溃</b></td>
+              <td>操作系统内核立刻发 TCP <code>FIN/RST</code> 或 QUIC Close</td>
+              <td>Hub 的 <code>Recv()</code> 当场报错返回 → 立刻执行 <code>detach</code> → 广播 <code>hosts_changed</code></td>
+              <td><b>0 秒级（1 个网络往返内）</b>直接变灰显示“连接中断，正在重连…”</td>
+            </tr>
+            <tr>
+              <td><b>2. Wi-Fi 假死 / 拔网线（无 FIN 信号）</b></td>
+              <td>7 秒收不到任何帧 → 发 <code>hb{probe}</code> → 3 秒无 <code>probeAck</code></td>
+              <td>第 10 秒按 <code>CloseLiveness</code> 关闭连接 → <code>detach</code> → 失败在途请求并记 <code>abort</code></td>
+              <td>AI 忙时 3.5 秒先看到“连接中断，正在重连…”，10 秒正式切换离线状态</td>
+            </tr>
+            <tr>
+              <td><b>3. 断网几秒后恢复（同进程重连）</b></td>
+              <td>Host 带相同的 <code>epoch</code> 发 <code>hello</code></td>
+              <td>Hub 在 <code>hello_ack</code> 返回 <code>ackUp</code>；Host 从 <code>ackUp + 1</code> 重放未确认事件，按 <code>relayAcks</code> 续传答卷分块</td>
+              <td>断网期间 AI 吐出的字自动补齐，正在跑的请求答案继续传完，不重跑</td>
+            </tr>
+            <tr>
+              <td><b>4. Host 进程重启（换了新 epoch）</b></td>
+              <td>Host 带全新的 <code>epoch</code> 和基线 <code>resume.up</code> 发 <code>hello</code></td>
+              <td>Hub 清空旧缓存、作废旧在途请求，先把 <code>subscribed{seq:baseline}</code> 排进扇出队列，再放行新事件</td>
+              <td>浏览器水位线自动对齐到新基线，并从历史接口拉取完整时间线</td>
+            </tr>
+            <tr>
+              <td><b>5. Hub 服务器重启（换了新 hubBoot）</b></td>
+              <td>Host 重连后在 <code>hello_ack</code> 里看到陌生的 <code>hubBoot</code></td>
+              <td>Host 立刻清空绑定旧 <code>hubBoot</code> 的 <code>relayOutbox</code> 和 <code>relayMemo</code></td>
+              <td>新 Hub 从 1 号重新编排 <code>reqId</code>，绝不会拿到旧 Hub 时代的残存答卷</td>
+            </tr>
+            <tr>
+              <td><b>6. 同一台 Host 新连接顶掉旧连接</b></td>
+              <td>Hub 收到同 <code>hostId</code> 的新握手 <code>attach</code></td>
+              <td>旧连接收到 <code>CloseSuperseded</code> 立即退出；若旧连接抢了新连接，新连接收到后<b>0 秒立刻重拨且不重新配对</b></td>
+              <td>毫秒级无缝切换，不会误删本地保存的有效 Token</td>
+            </tr>
+            <tr>
+              <td><b>7. 半路丢了一帧 events</b></td>
+              <td>Hub 收到后面的帧发现页码跳了（<code>seq &gt; acked + 1</code>）</td>
+              <td>后面的帧先停在等候室（最多 1500 帧），<code>ack</code> 停在缺口前；Host 10 秒 RTO 到点重传缺口帧</td>
+              <td>补上缺口的一瞬间，等候室里攒着的帧按顺序一口气吐出，绝不乱序</td>
+            </tr>
+            <tr>
+              <td><b>8. 乱序缺口太大，1500 个座位坐满了</b></td>
+              <td><code>Receiver.Accept</code> 返回 <code>ErrOverflow</code></td>
+              <td>以 <code>CloseOverflow</code> 关闭连接；Host 同 <code>epoch</code> 重连，从 Hub 的水位线老老实实按顺序重发</td>
+              <td>短暂重连后完整恢复，绝不跳过空洞丢消息</td>
+            </tr>
+            <tr>
+              <td><b>9. 断网太久，Host 待发日志超 16 MiB</b></td>
+              <td><code>outbox.enforceLocked</code> 发现超过软上限</td>
+              <td>把流式打字碎片（<code>chunk/thought</code>）原地变成 <code>trimmed</code>，保留关键控制事件</td>
+              <td>重连后状态立刻正确，被折叠的正文由历史接口补齐</td>
+            </tr>
+            <tr>
+              <td><b>10. 压缩包在网上传坏了 / 乱码</b></td>
+              <td>解压失败或 JSON 解析失败，返回 <code>ErrUnreadable</code></td>
+              <td>绝不跳过坏帧（跳过会漏页码）！立刻以 <code>CloseUnreadable</code> 断开，让对端重连从水位线重传</td>
+              <td>自动重传修复，不会少一段话</td>
+            </tr>
+            <tr>
+              <td><b>11. 浏览器狂发请求（超过 16 个在途）</b></td>
+              <td>Hub 检查该 Host 的 <code>pending</code> 达到 <code>maxPendingRelayPerHost = 16</code></td>
+              <td>第 17 个请求直接返回 HTTP <code>429 Too Many Requests</code>，保护内存（16 × 28MB）</td>
+              <td>提示请求繁忙，已有的 16 个请求照常完成</td>
+            </tr>
+            <tr>
+              <td><b>12. 大答卷的某个分块乱序或超预算</b></td>
+              <td>Hub 的 <code>acceptRespond</code> 检查每 Host 最多停泊 256 块 / 约 75 MiB</td>
+              <td>正常乱序先停泊等前一块；若超出停泊预算，<b>只把这一个请求报 502 并记 abort</b>，不断开会话</td>
+              <td>只有那一个超大请求报错，其他请求和实时打字毫发无损</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================== 附录 ==================== -->
+    <section class="lesson" id="sec-reference">
+      <div class="lesson-header">
+        <span class="lesson-num">APPENDIX</span>
+        <div>
+          <h2>附录：常量速查表、8 种标准分手码与源码导读</h2>
+          <p>读源码或排查线上日志时，随时回这里查数字和文件位置。</p>
+        </div>
+      </div>
+
+      <h3><span class="sec-tag">附录 A</span> 核心数字与常量一表通</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>分类</th>
+              <th>代码常量名</th>
+              <th>默认值</th>
+              <th>人话解释与为什么取这个值</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td rowspan="6"><b>心跳与判活</b></td>
+              <td class="mono">keepalive</td>
+              <td class="mono">5s</td>
+              <td>空闲时每 5 秒发一次 <code>hb</code>；同时也是 WebSocket Ping 保活周期</td>
+            </tr>
+            <tr>
+              <td class="mono">BusyKeepalive</td>
+              <td class="mono">1s</td>
+              <td>AI 正在干活（<code>busy=true</code>）时加密到 1 秒一拍，让前端能在 3.5 秒内察觉静默断网</td>
+            </tr>
+            <tr>
+              <td class="mono">ProbeAfter / ProbeTimeout</td>
+              <td class="mono">7s / 3s</td>
+              <td>7 秒没收到任何帧就发 <code>hb{probe}</code> 敲门；再等 3 秒没回音（合计 10 秒）判 <code>liveness</code> 断开</td>
+            </tr>
+            <tr>
+              <td class="mono">idle</td>
+              <td class="mono">20s</td>
+              <td>任何方向 20 秒没收到完整帧（且传输层无新读取活动），终极兜底判死（必须 ≥ 2×keepalive）</td>
+            </tr>
+            <tr>
+              <td class="mono">RTO (2 × keepalive)</td>
+              <td class="mono">10s</td>
+              <td>可靠帧发出去 10 秒还没收到 <code>ack</code>（且 Writer 不忙），触发小批量重传</td>
+            </tr>
+            <tr>
+              <td class="mono">AckDelay</td>
+              <td class="mono">20ms</td>
+              <td>收到可靠帧推进水位后，最多憋 20 毫秒就必须发出带新 <code>ack</code> 的帧</td>
+            </tr>
+            <tr>
+              <td rowspan="5"><b>体积与窗口</b></td>
+              <td class="mono">MaxFrame</td>
+              <td class="mono">8 MiB</td>
+              <td>单个逻辑帧最大体积；单条事件超限直接降级为 <code>trimmed</code></td>
+            </tr>
+            <tr>
+              <td class="mono">UnitSize / unitHeaderSize</td>
+              <td class="mono">32 KiB / 13 B</td>
+              <td>大帧切块单位；每发完 32 KiB 允许控制帧（<code>hb</code>）插队一次</td>
+            </tr>
+            <tr>
+              <td class="mono">ResumeWindow</td>
+              <td class="mono">1500 帧</td>
+              <td>接收方最多暂存 1500 个乱序帧等待补洞，超出则报 <code>overflow</code> 重连重放</td>
+            </tr>
+            <tr>
+              <td class="mono">outbox soft / hard</td>
+              <td class="mono">16 MiB / 64 MiB</td>
+              <td>Host 上行待发日志：超 16 MiB 把流式碎片变 <code>trimmed</code>；关键事件超 64 MiB 报 <code>overflow</code></td>
+            </tr>
+            <tr>
+              <td class="mono">minCompressSize / maxInflatedFrame</td>
+              <td class="mono">256 B / 32 MiB</td>
+              <td>小于 256 字节不压缩；解压输出超过 32 MiB 立即按损坏帧断开防内存炸弹</td>
+            </tr>
+            <tr>
+              <td rowspan="5"><b>中继请求 (Relay)</b></td>
+              <td class="mono">relayHealthWindow / relayProbeTimeout</td>
+              <td class="mono">2s / 1.5s</td>
+              <td>发请求前：2 秒内收到过帧免检；否则先敲门等 1.5 秒，不通直接回 503 且不发 <code>request</code></td>
+            </tr>
+            <tr>
+              <td class="mono">fastReadAckWindow / requestAckDeadline</td>
+              <td class="mono">5s / 15s</td>
+              <td>请求帧写完后等 Host <code>ack</code> 的期限：只读白名单 5 秒快速失败，有副作用请求 15 秒跨过一次重传</td>
+            </tr>
+            <tr>
+              <td class="mono">MaxRelayBody / relayChunkSize</td>
+              <td class="mono">28 MiB / 256 KiB</td>
+              <td>单个 HTTP 响应最大 28 MiB，按 256 KiB 原文切块（最多约 112 块）装进 <code>respond</code></td>
+            </tr>
+            <tr>
+              <td class="mono">relayOutboxMaxBytes</td>
+              <td class="mono">≈ 75 MiB</td>
+              <td>Host 进程级待确认答卷总预算（够装 2 份 28 MiB 的 base64 答卷）；超限仅当前请求回 502</td>
+            </tr>
+            <tr>
+              <td class="mono">host relayTimeout / Hub RelayTimeout</td>
+              <td class="mono">40m / 45m</td>
+              <td>请求被 Host 签收后，最长允许执行 40 分钟（Host 先超时返回具体错误，Hub 45 分钟兜底）</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><span class="sec-tag">附录 B</span> 8 种标准分手理由（<code>wire.CloseReason</code> 双传输映射表）</h3>
+      <p>协议里没有 JSON 格式的关闭帧，所有断开原因都通过 WebSocket 的 <code>(code, reason)</code> 或 QUIC 的 <code>ApplicationErrorCode</code> 传递（定义在 <code>acp-hub/wire/identity.go</code>）：</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>枚举名 (CloseReason)</th>
+              <th>WebSocket (Code / Reason)</th>
+              <th>QUIC 错误码</th>
+              <th>发生原因</th>
+              <th>Host 收到后的重连动作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono"><b>normal</b></td>
+              <td class="mono">1000 / "normal"</td>
+              <td class="mono">0</td>
+              <td>常规断开或普通网络读写中断</td>
+              <td>按 1s→2s→4s→8s→10s 退避重连（健康满 60s 重置为 1s）</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>shutdown</b></td>
+              <td class="mono">1000 / "shutdown"</td>
+              <td class="mono">8</td>
+              <td>服务优雅停机预留枚举</td>
+              <td>按退避重连</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>superseded</b></td>
+              <td class="mono">1000 / "superseded"</td>
+              <td class="mono">2</td>
+              <td>同一个 <code>hostId</code> 有新连接接入，顶掉了旧连接</td>
+              <td><b>0 秒等待立即重拨，且绝不重新配对</b>（保护有效 Token）</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>auth</b></td>
+              <td class="mono">1008 / "auth"</td>
+              <td class="mono">3</td>
+              <td>Token 无效或被管理员解除配对</td>
+              <td>若配置了配对码则清除旧 Token 重新配对一次；否则退避等待</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>protocol</b></td>
+              <td class="mono">1002 / "protocol version"</td>
+              <td class="mono">4</td>
+              <td>版本号不对、缺少必填字段或缺少 <code>transportUnits/relayAck</code> 能力</td>
+              <td>打印“请把 host 与 hub 升到同一版本”，退避重试</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>liveness</b></td>
+              <td class="mono">1008 / "liveness"</td>
+              <td class="mono">5</td>
+              <td>握手 10 秒超时、探针 7s+3s 无回音、或 20 秒 idle 超时</td>
+              <td>退避重连，同 <code>epoch</code> 自动按水位续传</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>overflow</b></td>
+              <td class="mono">1011 / "overflow"</td>
+              <td class="mono">10</td>
+              <td>接收等候室超 1500 帧、或关键事件超 64 MiB 硬上限</td>
+              <td>退避重连，从对端最新 <code>ack</code> 水位重新按序发送</td>
+            </tr>
+            <tr>
+              <td class="mono"><b>unreadable</b></td>
+              <td class="mono">1011 / "unreadable"</td>
+              <td class="mono">9</td>
+              <td>JSON 损坏、解压失败、分片偏移量对不上、或 <code>events</code> 批次内页码不连续</td>
+              <td>退避重连，从水位线重传完好副本（绝不跳过坏帧）</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><span class="sec-tag">附录 C</span> 源码阅读地图（按顺序读这 10 个文件就够了）</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>推荐阅读顺序</th>
+              <th>仓库与文件路径</th>
+              <th>文件里装的是什么</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>第 1 站（必读）</b></td>
+              <td class="mono">acp-hub/wire/PROTOCOL-V2.md</td>
+              <td>协议唯一真源文档：短短几百行把所有不变量和帧格式定死</td>
+            </tr>
+            <tr>
+              <td><b>第 2 站</b></td>
+              <td class="mono">acp-hub/wire/frame.go &amp; identity.go &amp; limits.go</td>
+              <td><code>Frame</code> 结构体、7 种帧严格校验、8 种 <code>CloseReason</code> 映射表与默认常量</td>
+            </tr>
+            <tr>
+              <td><b>第 3 站</b></td>
+              <td class="mono">acp-hub/wire/sender.go &amp; receiver.go &amp; unit.go</td>
+              <td>发送日志、接收连续水位与等候室、32 KiB <code>Unit</code> 切分与插队重组器</td>
+            </tr>
+            <tr>
+              <td><b>第 4 站</b></td>
+              <td class="mono">acp-host/internal/hub/session.go &amp; writer.go</td>
+              <td>Host 会话主循环（握手、心跳、20ms 延迟确认、探针）与单 Writer 优先级调度</td>
+            </tr>
+            <tr>
+              <td><b>第 5 站</b></td>
+              <td class="mono">acp-host/internal/hub/outbox.go &amp; client.go</td>
+              <td>Host 上行事件日志（16MB/64MB 软硬裁剪）、QUIC/WS 选路防抖与 <code>trimUnwatched</code> 观众过滤</td>
+            </tr>
+            <tr>
+              <td><b>第 6 站</b></td>
+              <td class="mono">acp-host/internal/hub/relay.go &amp; relay_outbox.go &amp; relay_lane.go</td>
+              <td>Host 侧中继执行、<code>(hubBoot, reqId)</code> 去重、256KiB 切块、75MiB 答卷账本与 QUIC 独立车道</td>
+            </tr>
+            <tr>
+              <td><b>第 7 站</b></td>
+              <td class="mono">acp-hub/internal/hub/session.go &amp; writer.go &amp; hub.go</td>
+              <td>Hub 侧会话循环、<code>audience</code> 原地合并、<code>noteWritten</code> 写完掐表、1.5s 预检拼车与分块重组</td>
+            </tr>
+            <tr>
+              <td><b>第 8 站</b></td>
+              <td class="mono">acp-host/internal/hub/transport_ws.go &amp; transport_quic.go<br>acp-hub/cmd/capri-hub/main.go</td>
+              <td>WebSocket 与 QUIC 两条物理通道如何适配成统一的 <code>Transport</code> 接口</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <div><b>Capri Host ↔ Hub 传输协议讲义（Session v2）</b></div>
+  <div style="margin-top:6px">直接基于 <code>acp-hub</code> 与 <code>acp-host</code> 源码整理 · 面向零背景读者的工程导读页</div>
+</footer>
+
+<div class="fab-bar" aria-label="快捷工具">
+  <button type="button" class="fab-btn" id="themeToggleBtn" aria-label="切换深浅色主题">🌓 切换主题</button>
+  <button type="button" class="fab-btn" id="backTopBtn" aria-label="回到顶部">↑ 顶部</button>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ── 1. 主题切换 ── */
+  var root = document.documentElement;
+  var THEME_KEY = "host-hub-lecture-theme";
+  try {
+    var saved = localStorage.getItem(THEME_KEY);
+    if (saved === "dark" || saved === "light") {
+      root.setAttribute("data-theme", saved);
+    } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      root.setAttribute("data-theme", "dark");
+    }
+  } catch (e) {}
+
+  var themeBtn = document.getElementById("themeToggleBtn");
+  if (themeBtn) {
+    themeBtn.addEventListener("click", function () {
+      var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+    });
+  }
+
+  var topBtn = document.getElementById("backTopBtn");
+  if (topBtn) {
+    topBtn.addEventListener("click", function () {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  }
+
+  /* ── 2. 顶部阅读进度条与目录高亮 ── */
+  var progressBar = document.getElementById("progressBar");
+  var tocLinks = Array.prototype.slice.call(document.querySelectorAll(".toc-list a"));
+  var sections = tocLinks.map(function (a) {
+    return document.querySelector(a.getAttribute("href"));
+  }).filter(Boolean);
+
+  function onScroll() {
+    var doc = document.documentElement;
+    var max = doc.scrollHeight - doc.clientHeight;
+    if (progressBar) {
+      progressBar.style.width = (max > 0 ? (doc.scrollTop / max) * 100 : 0) + "%";
+    }
+    var y = window.scrollY + 140;
+    var current = sections[0];
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i].offsetTop <= y) current = sections[i];
+    }
+    tocLinks.forEach(function (a) {
+      a.classList.toggle("active", current && a.getAttribute("href") === "#" + current.id);
+    });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  /* ── 3. 实验台 1：seq / ack / trimmed 水位线模拟器 ── */
+  var wmState = {
+    101: "none",
+    102: "none",
+    103: "none",
+    104: "none"
+  };
+  var wmSlotsEl = document.getElementById("wmSlots");
+  var wmStatusEl = document.getElementById("wmStatusText");
+  var wmExplainEl = document.getElementById("wmExplain");
+
+  function computeWatermark() {
+    var ack = 100;
+    for (var s = 101; s <= 104; s++) {
+      if (wmState[s] === "full" || wmState[s] === "trimmed") {
+        ack = s;
+      } else {
+        break;
+      }
+    }
+    return ack;
+  }
+
+  function renderWatermark(lastNote) {
+    var ack = computeWatermark();
+    if (wmStatusEl) {
+      wmStatusEl.textContent = "当前累计回执 ack = " + ack + "（1.." + ack + " 已连续收齐）";
+    }
+    if (wmSlotsEl) {
+      var html = '<div class="seq-slot acked"><span class="s-num">..100</span><span class="s-state">已收齐</span></div>';
+      for (var s = 101; s <= 104; s++) {
+        var st = wmState[s];
+        var cls = "";
+        var label = "未到达";
+        if (st === "full") {
+          if (s <= ack) { cls = "acked"; label = "已收齐应用"; }
+          else { cls = "parked"; label = "等候室暂存"; }
+        } else if (st === "trimmed") {
+          if (s <= ack) { cls = "trimmed"; label = "空纸条已齐"; }
+          else { cls = "parked"; label = "空纸条暂存"; }
+        }
+        html += '<div class="seq-slot ' + cls + '"><span class="s-num">seq ' + s + '</span><span class="s-state">' + label + '</span></div>';
+      }
+      wmSlotsEl.innerHTML = html;
+    }
+    if (wmExplainEl) {
+      wmExplainEl.innerHTML = lastNote;
+    }
+  }
+
+  Array.prototype.slice.call(document.querySelectorAll("[data-wm-act]")).forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var act = btn.getAttribute("data-wm-act");
+      var note = "";
+      if (act === "101") {
+        wmState[101] = "full";
+        note = "<b>收到 101 号：</b>因为 100 号之后紧挨着就是 101 号，没有缺口！水位线立刻推进到 <code>ack = " + computeWatermark() + "</code>，并在 20ms 内回执给发送方。";
+      } else if (act === "103") {
+        wmState[103] = "full";
+        var ackNow = computeWatermark();
+        if (ackNow < 102) {
+          note = "<b>收到 103 号（但 102 号还没到）：</b>注意！103 号不能直接往上交，也不能报 <code>ack = 103</code>（否则发送方以为 102 也到了，会把 102 从日志里删掉）。103 号先坐在<b>黄色等候室</b>里，<code>ack</code> 原地不动，死守在 <code>" + ackNow + "</code>。";
+        } else {
+          note = "<b>收到 103 号：</b>前面的 101、102 都齐了，水位线顺利推到 <code>ack = " + ackNow + "</code>。";
+        }
+      } else if (act === "104") {
+        wmState[104] = "full";
+        var ackNow2 = computeWatermark();
+        if (ackNow2 < 102) {
+          note = "<b>又收到 104 号（102 号依然没到）：</b>104 号也只能坐进<b>等候室</b>排在 103 后面。只要 102 这个洞没补上，水位线 <code>ack</code> 就一步也不准越雷池！";
+        } else {
+          note = "<b>收到 104 号：</b>前面的页码已连续，水位线推进到 <code>ack = " + ackNow2 + "</code>。";
+        }
+      } else if (act === "102-trimmed") {
+        if (wmState[101] === "none") wmState[101] = "full";
+        wmState[102] = "trimmed";
+        var ackNow3 = computeWatermark();
+        note = "<b>102 号以 <code>trimmed</code> 空纸条到达！</b>虽然 102 号属于没人看的后台对话、正文被撕掉了，但这张带 <code>seq: 102</code> 的空纸条把缺口补上了！等候室里憋着的帧瞬间连成一片，水位线一口气冲到 <code>ack = " + ackNow3 + "</code>！这就是“撕正文留页码”的威力。";
+      } else {
+        wmState = { 101: "none", 102: "none", 103: "none", 104: "none" };
+        note = "已重置：当前 1..100 号已连续收齐，点击上方按钮试试乱序到达和空纸条补洞。";
+      }
+      renderWatermark(note);
+    });
+  });
+  renderWatermark("已就绪：当前 1..100 号已连续收齐。建议按 ① → ② → ③ → ④ 的顺序点一遍！");
+
+  /* ── 4. 实验台 2：7 种信封解剖台 ── */
+  var frameExamples = {
+    hello: {
+      json: '{\n  "v": 2,\n  "type": "hello",\n  "epoch": 1482930192837465,\n  "token": "capri_host_9f8a7b...",\n  "resume": {\n    "up": 410,\n    "down": 17\n  },\n  "caps": {\n    "deflate": true,\n    "transportUnits": true,\n    "relayAck": true\n  }\n}',
+      notes: '<b>谁发给谁：</b>Host → Hub（连接刚建立的第一封信）<br><br>' +
+             '• <code>epoch</code>：Host 进程本次开机的随机编号。断网重连不变，进程重启才变。<br>' +
+             '• <code>resume.up</code>：如果是新开机（新 epoch），代表“我开机前本地事件总线已经用到第 410 号了，一会儿第一条实时事件是 411 号”；如果是同 epoch 重连，代表 Host 以为 Hub 收到了哪（但最终听 Hub 的）。<br>' +
+             '• <code>resume.down</code>：Host 已经处理到 Hub 发来的第 17 号下行帧了（同 epoch 重连时 Hub 不用重发 1..17）。<br>' +
+             '• <code>caps</code>：报上自己支持压缩（<code>deflate</code>）、32KB 分片（<code>transportUnits</code>）和答卷签收表（<code>relayAck</code>）。'
+    },
+    hello_ack: {
+      json: '{\n  "v": 2,\n  "type": "hello_ack",\n  "epoch": 1482930192837465,\n  "hubBoot": 900182736455,\n  "ackUp": 410,\n  "ackDown": 17,\n  "audience": {\n    "gen": 33,\n    "watchers": 2,\n    "all": false,\n    "sessions": ["s1"]\n  },\n  "liveness": { "keepalive": 5, "idle": 20 },\n  "limits": {\n    "maxFrame": 8388608,\n    "maxRelayBody": 29360128,\n    "resumeWindow": 1500\n  },\n  "caps": {\n    "deflate": true,\n    "transportUnits": true,\n    "relayAck": true\n  },\n  "relayAcks": [\n    { "reqId": "7", "chunk": 2 }\n  ]\n}',
+      notes: '<b>谁发给谁：</b>Hub → Host（握手回信，一锤定音）<br><br>' +
+             '• <code>hubBoot</code>：Hub 进程这一世的开机编号。如果变了，Host 会清空旧的中继答卷日志。<br>' +
+             '• <code>ackUp / ackDown</code>：Hub 拍板的权威水位！Host 收到后把 <code>outbox</code> 里 ≤ 410 的事件全删掉，从 411 开始重放。<br>' +
+             '• <code>audience</code>：握手这一刻的观众点名册，Host 立刻知道该传哪个对话的正文。<br>' +
+             '• <code>liveness / limits</code>：Hub 当场下发心跳秒数（5s/20s）和限额（8MB 帧 / 28MB 答卷 / 1500 乱序窗口），Host 不再自己瞎猜常量。<br>' +
+             '• <code>relayAcks</code>：告诉重连的 Host“7 号请求的答卷我已经收到第 2 块了，你从第 3 块接着发！”'
+    },
+    events: {
+      json: '{\n  "v": 2,\n  "type": "events",\n  "seq": 411,\n  "ack": 17,\n  "events": [\n    {"type":"chunk","sessionId":"s1","seq":411,"text":"你好"},\n    {"type":"trimmed","sessionId":"s2","seq":412},\n    {"type":"chunk","sessionId":"s1","seq":413,"text":"！"}\n  ]\n}',
+      notes: '<b>谁发给谁：</b>Host → Hub（可靠帧，占上行会话 <code>seq</code>）<br><br>' +
+             '• <b>极其重要的设计</b>：信封外面的 <code>seq: 411</code> 就是里面第一条事件的 <code>seq</code>！而且数组里的事件页码<b>必须严格连续</b>（411, 412, 413）。<br>' +
+             '• 看中间那条 <code>seq: 412</code>：它属于没人看的 <code>s2</code> 会话，正文被裁成了 <code>trimmed</code> 空纸条，从而保住了 411→412→413 的连续性。<br>' +
+             '• <code>ack: 17</code>：顺手捎带告诉 Hub：“你发给我的下行帧，1..17 号我全收齐了”。'
+    },
+    audience: {
+      json: '{\n  "v": 2,\n  "type": "audience",\n  "seq": 18,\n  "ack": 413,\n  "gen": 34,\n  "watchers": 2,\n  "all": false,\n  "sessions": ["s1", "s2"]\n}',
+      notes: '<b>谁发给谁：</b>Hub → Host（可靠帧，占下行会话 <code>seq</code>）<br><br>' +
+             '• 这是<b>绝对状态快照</b>（不是“新加了 s2”，而是“现在全名单就是 s1 和 s2”）。<br>' +
+             '• <code>gen: 34</code>：点名册的第 34 版。即使 Host 重启换了 <code>epoch</code>，<code>gen</code> 也不会清零。Host 只执行 <code>gen &gt;= lastGen</code> 的名册。<br>' +
+             '• 如果 <code>watchers: 0</code>（JSON 里为 0 时省略该键），Host 立刻暂停发送一切 <code>events</code>，只发心跳。'
+    },
+    request: {
+      json: '{\n  "v": 2,\n  "type": "request",\n  "seq": 19,\n  "ack": 413,\n  "reqId": "8",\n  "method": "POST",\n  "path": "/api/prompt",\n  "body": {\n    "sessionId": "s1",\n    "promptId": "p_01a2...",\n    "text": "帮我跑一下单元测试"\n  }\n}',
+      notes: '<b>谁发给谁：</b>Hub → Host（可靠帧，占下行会话 <code>seq</code>）<br><br>' +
+             '• 用户在网页上发消息或调接口，Hub 先过一遍 2 秒新鲜窗 / 1.5 秒敲门预检，通过后才生成这封信。<br>' +
+             '• 怎么证明 Host 收到了这封信？Host 收到后推进下行水位，并在 20ms 内发出一帧带 <code>ack: 19</code> 的帧。<br>' +
+             '• Host 按 <code>(hubBoot, reqId)</code> 记入备忘录 <code>relayMemo</code>，保证就算重传也绝不执行第二遍。'
+    },
+    respond: {
+      json: '{\n  "v": 2,\n  "type": "respond",\n  "ack": 19,\n  "reqId": "8",\n  "chunkSeq": 1,\n  "status": 200,\n  "chunk": "eyJvayI6dHJ1ZSwi...",\n  "encoding": "base64",\n  "more": true\n}',
+      notes: '<b>谁发给谁：</b>Host → Hub（中继面，<b>不占会话 seq！</b>）<br><br>' +
+             '• 注意它没有 <code>seq</code> 字段（<code>seq == 0</code>），这样大响应分块永远不会堵住 <code>events</code> 的页码流。<br>' +
+             '• 小于 256 KiB 的响应直接放 <code>body</code>（<code>chunkSeq: 1, more: false</code>）；大于 256 KiB 的响应切成多块 base64，每块递增 <code>chunkSeq</code>，最后一块 <code>more: false</code>。<br>' +
+             '• 它的送达不靠会话 <code>ack</code>，而靠 Hub 在 <code>hb</code> 里回传的 <code>relayAcks</code> 表。'
+    },
+    hb: {
+      json: '{\n  "v": 2,\n  "type": "hb",\n  "ack": 19,\n  "probe": 1201,\n  "probeAck": 1200,\n  "relayAcks": [\n    { "reqId": "8", "chunk": 1 },\n    { "reqId": "7", "chunk": 4, "done": true }\n  ],\n  "status": {\n    "ready": true,\n    "busy": true,\n    "booting": false,\n    "pendingCount": 0,\n    "port": 8765,\n    "version": "v0.5.1"\n  }\n}',
+      notes: '<b>谁发给谁：</b>Host ↔ Hub 双向互发（不占会话 <code>seq</code>，走 Writer 最高优控制槽）<br><br>' +
+             '• <b>一帧五用</b>：① 报活刷新 <code>LastSeen</code>；② 捎带 <code>ack</code> 回执；③ 同步 Host 的忙闲快照与版本号 <code>status</code>；④ 携带 7 秒静默敲门暗号 <code>probe / probeAck</code>；⑤ Hub 用 <code>relayAcks</code> 给 Host 的答卷分块打勾（<code>done: true</code> 代表 7 号答卷已全部收齐，Host 可以删日志了）。'
+    }
+  };
+
+  var frameJsonBox = document.getElementById("frameJsonBox");
+  var frameNotesBox = document.getElementById("frameNotesBox");
+  var frameBtns = Array.prototype.slice.call(document.querySelectorAll("[data-frame]"));
+
+  function selectFrame(key) {
+    var item = frameExamples[key] || frameExamples.hello;
+    if (frameJsonBox) frameJsonBox.textContent = item.json;
+    if (frameNotesBox) frameNotesBox.innerHTML = item.notes;
+    frameBtns.forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-frame") === key);
+    });
+  }
+  frameBtns.forEach(function (b) {
+    b.addEventListener("click", function () {
+      selectFrame(b.getAttribute("data-frame"));
+    });
+  });
+  selectFrame("hello");
+
+  /* ── 5. 实验台 3：Audience 裁剪模拟器 ── */
+  var audScenarios = {
+    none: {
+      frame: '{\n  "v": 2,\n  "type": "audience",\n  "seq": 21,\n  "ack": 520,\n  "gen": 40\n  // watchers 为 0 时省略，代表 0 个观众\n}',
+      behavior: '<b>🛑 暂停上行（省下 100% 实时流量）：</b><br>' +
+                '• Host 把 <code>outbox.paused</code> 设为 <code>true</code>。<br>' +
+                '• AI 产生的事件依然按顺序写进本地 <code>outbox</code>（超过 16MB 软上限时自动把打字碎片压成 <code>trimmed</code>），但 Writer 一帧 <code>events</code> 都不往外发！<br>' +
+                '• 心跳 <code>hb</code> 和中继答卷 <code>respond</code> 照常工作。等有人打开网页时，再从断点续传。'
+    },
+    s1: {
+      frame: '{\n  "v": 2,\n  "type": "audience",\n  "seq": 22,\n  "ack": 520,\n  "gen": 41,\n  "watchers": 1,\n  "all": false,\n  "sessions": ["s1", "s1-sub"]\n}',
+      behavior: '<b>✂️ 精准裁剪（只传 s1 和它的子代理）：</b><br>' +
+                '• <code>s1</code> 和它的子代理 <code>s1-sub</code>：所有打字碎片、思考过程、工具输出<b>全量发送</b>。<br>' +
+                '• 后台还在跑的 <code>s2</code>、<code>s3</code>：它们的 11 类正文事件（<code>chunk / thought / tool_call_update</code> 等）全部原地变成 20 字节的 <code>{"type":"trimmed","sessionId":"s2","seq":...}</code>。<br>' +
+                '• 但 <code>s2</code>、<code>s3</code> 的回合结束、报错、权限请求等<b>控制事件依然原样发送</b>，保证左侧会话列表的状态指示灯永远准确！'
+    },
+    s1s2: {
+      frame: '{\n  "v": 2,\n  "type": "audience",\n  "seq": 23,\n  "ack": 520,\n  "gen": 42,\n  "watchers": 2,\n  "all": false,\n  "sessions": ["s1", "s2"]\n}',
+      behavior: '<b>👥 多人并集（只要有一个人看，就发正文）：</b><br>' +
+                '• Hub 取所有在线浏览器观看会话的<b>并集</b>（排序去重后为 <code>["s1", "s2"]</code>）。<br>' +
+                '• Host 对 <code>s1</code> 和 <code>s2</code> 发送完整正文；仍然没人看的 <code>s3</code> 继续只发 <code>trimmed</code> 空纸条。'
+    },
+    all: {
+      frame: '{\n  "v": 2,\n  "type": "audience",\n  "seq": 24,\n  "ack": 520,\n  "gen": 43,\n  "watchers": 1,\n  "all": true\n}',
+      behavior: '<b>🌐 安全兜底（全量放行，不做任何裁剪）：</b><br>' +
+                '• 当有旧版网页没发过 <code>viewing</code> 声明，或者同时观看的会话超过 64 个、会话 ID 超过 128 字节时，Hub 会把 <code>all</code> 设为 <code>true</code>（且规定 <code>sessions</code> 必须为空）。<br>' +
+                '• Host 看到 <code>all: true</code> 后关闭裁剪器，所有会话的正文全部原样上传——<b>宁可多花带宽，绝不让观众看到空白页</b>。'
+    }
+  };
+
+  var audFrameOut = document.getElementById("audFrameOut");
+  var audBehaviorOut = document.getElementById("audBehaviorOut");
+  var audBtns = Array.prototype.slice.call(document.querySelectorAll("[data-aud-mode]"));
+
+  function selectAudienceMode(mode) {
+    var sc = audScenarios[mode] || audScenarios.s1;
+    if (audFrameOut) audFrameOut.textContent = sc.frame;
+    if (audBehaviorOut) audBehaviorOut.innerHTML = sc.behavior;
+    audBtns.forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-aud-mode") === mode);
+    });
+  }
+  audBtns.forEach(function (b) {
+    b.addEventListener("click", function () {
+      selectAudienceMode(b.getAttribute("data-aud-mode"));
+    });
+  });
+  selectAudienceMode("s1");
+
+  /* ── 6. 实验台 4：0~20 秒断线时钟 ── */
+  var clockSlider = document.getElementById("clockSlider");
+  var clockBadge = document.getElementById("clockReadoutBadge");
+  var clockHostText = document.getElementById("clockHostText");
+  var clockHubText = document.getElementById("clockHubText");
+  var clockFeText = document.getElementById("clockFeText");
+
+  function describeClock(t) {
+    if (t < 1.5) {
+      return {
+        host: "AI 正在跑任务（busy=true）。正常情况下每 1 秒发一帧忙心跳 hb；从 t=0s 起网络黑洞，发出的帧全部石沉大海。",
+        hub: "距离上次收到 Host 的帧才过了 " + t.toFixed(1) + " 秒（在 2 秒新鲜窗内）。此时如果有网页发请求，Hub 依然认为连接新鲜，免检直发。",
+        fe: "刚刚还在出字，用户肉眼看不出任何异常，界面显示“工作中…”。"
+      };
+    }
+    if (t < 2.0) {
+      return {
+        host: "第 1 秒的忙心跳没能送到 Hub。Host 自己的接收计时器也才走了 " + t.toFixed(1) + " 秒，继续往 outbox 攒事件。",
+        hub: "lastSeenAgeMs 约 " + Math.round(t * 1000) + "ms，仍在 2 秒新鲜窗内。",
+        fe: "已经将近 2 秒没收到新的打字事件了，静默计时器即将触发。"
+      };
+    }
+    if (t < 3.5) {
+      return {
+        host: "已经漏掉 2~3 拍忙心跳；如果用户此时在网页上点“发送消息”，Hub 会因为超过 2 秒没收到帧而启动 1.5 秒敲门预检！",
+        hub: "lastSeenAgeMs = " + Math.round(t * 1000) + "ms（已超 2s）。新来的网页请求不再免检，Hub 会先发 hb{probe} 敲门，敲不通直接回 503。",
+        fe: "busy 且满 2 秒没收到事件：浏览器悄悄调一次 GET /api/hosts 读取 lastSeenAgeMs，但因为还没满 3.5 秒（容忍 3 拍心跳抖动），暂不弹窗惊扰用户。"
+      };
+    }
+    if (t < 7.0) {
+      return {
+        host: "继续静默，自己在 7 秒时也会反过来向 Hub 发 probe 敲门。",
+        hub: "lastSeenAgeMs 已达 " + Math.round(t * 1000) + "ms。但 Hub 的会话层为了稳妥，还没到 7 秒 ProbeAfter，继续观察。",
+        fe: "查到 lastSeenAgeMs ≥ 3500ms！界面立刻温柔提示：“Host 连接中断，正在重连…”，同时每 1 秒复探一次（万一下一秒恢复就立刻撤掉提示）。"
+      };
+    }
+    if (t < 10.0) {
+      return {
+        host: "Host 侧同样满 7 秒没收到 Hub 的帧，也发出了自己的 hb{probe}，正在倒计时 3 秒等回音。",
+        hub: "满 7 秒无任何帧！Hub 会话循环发出 hb{probe: nonce}（走最高优控制槽），并按下 3 秒 ProbeTimeout 倒计时（还剩 " + (10 - t).toFixed(1) + " 秒判死）。",
+        fe: "继续显示“连接中断，正在重连…”，等待 Hub 的最终权威裁决。"
+      };
+    }
+    if (t < 20.0) {
+      return {
+        host: "Host 自己的 7s+3s 探针也超时了，以 CloseLiveness 关闭旧连接，进入 1s→2s→4s 退避重拨流程，准备带同一个 epoch 续传 outbox！",
+        hub: "第 10 秒（7s + 3s）探针无回音！Hub 权威宣判 CloseLiveness：立刻 detach 置 Online=false、把在途请求全部失败并记 abort 墓碑、向所有网页广播 hosts_changed！",
+        fe: "收到 hosts_changed 广播，确认 Host 正式离线。一旦 Host 重拨握手成功，又会立刻收到上线广播并无缝补齐断网期间的输出。"
+      };
+    }
+    return {
+      host: "早已在第 10 秒进入重连循环（20 秒 idle 只是防止任何极端情况下探针没跑时的终极安全网）。",
+      hub: "第 20 秒是 idle 终极兜底线：哪怕没有探针，任何方向 20 秒没有完整帧也必定在此刻关闭。",
+      fe: "处于明确的离线等待重连状态，用户发不出去幽灵请求，也不会对着假转圈干等。"
+    };
+  }
+
+  function updateClock(val) {
+    var t = parseFloat(val);
+    if (clockSlider) clockSlider.value = t;
+    if (clockBadge) clockBadge.textContent = "t = " + t.toFixed(1) + " 秒";
+    var info = describeClock(t);
+    if (clockHostText) clockHostText.textContent = info.host;
+    if (clockHubText) clockHubText.textContent = info.hub;
+    if (clockFeText) clockFeText.textContent = info.fe;
+  }
+
+  if (clockSlider) {
+    clockSlider.addEventListener("input", function () {
+      updateClock(clockSlider.value);
+    });
+  }
+  Array.prototype.slice.call(document.querySelectorAll("[data-clock-jump]")).forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      updateClock(btn.getAttribute("data-clock-jump"));
+    });
+  });
+  updateClock(0);
+})();
+</script>
+</body>
+</html>
